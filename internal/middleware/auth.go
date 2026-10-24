@@ -13,8 +13,9 @@ import (
 )
 
 type ctxKey string
+
 const (
-	CtxUserID    ctxKey = "user_id"
+	CtxUserID     ctxKey = "user_id"
 	CtxSessionJTI ctxKey = "session_jti"
 )
 
@@ -27,11 +28,20 @@ func RequireAuth(svc *auth.Service, jwtSecret string) func(http.Handler) http.Ha
 				return
 			}
 			claims, err := auth.ParseToken(jwtSecret, strings.TrimPrefix(h, "Bearer "))
-			if err != nil { writeErr(w, 401, "unauthorized", "invalid token"); return }
+			if err != nil {
+				writeErr(w, 401, "unauthorized", "invalid token")
+				return
+			}
 			jti, err := uuid.Parse(claims.ID)
-			if err != nil { writeErr(w, 401, "unauthorized", "bad jti"); return }
+			if err != nil {
+				writeErr(w, 401, "unauthorized", "bad jti")
+				return
+			}
 			userID, err := svc.ResolveSession(r.Context(), jti)
-			if err != nil { writeErr(w, 401, "session_revoked", "session expired or revoked"); return }
+			if err != nil {
+				writeErr(w, 401, "session_revoked", "session expired or revoked")
+				return
+			}
 			ctx := context.WithValue(r.Context(), CtxUserID, userID)
 			ctx = context.WithValue(ctx, CtxSessionJTI, jti)
 			next.ServeHTTP(w, r.WithContext(ctx))
@@ -40,11 +50,15 @@ func RequireAuth(svc *auth.Service, jwtSecret string) func(http.Handler) http.Ha
 }
 
 func UserID(ctx context.Context) uuid.UUID {
-	if v, ok := ctx.Value(CtxUserID).(uuid.UUID); ok { return v }
+	if v, ok := ctx.Value(CtxUserID).(uuid.UUID); ok {
+		return v
+	}
 	return uuid.Nil
 }
 func SessionJTI(ctx context.Context) uuid.UUID {
-	if v, ok := ctx.Value(CtxSessionJTI).(uuid.UUID); ok { return v }
+	if v, ok := ctx.Value(CtxSessionJTI).(uuid.UUID); ok {
+		return v
+	}
 	return uuid.Nil
 }
 

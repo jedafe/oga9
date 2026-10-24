@@ -13,25 +13,25 @@ import (
 )
 
 type Config struct {
-	Env           string
-	DatabaseURL   string
-	ValkeyAddr    string
-	JWTSecret     string
-	BaseDomain    string
-	ControlHost   string
-	APIPort       int
-	SessionTTL    time.Duration
-	SMTPHost      string
-	SMTPPort      int
-	GlitchTipDSN  string
+	Env            string
+	DatabaseURL    string
+	ValkeyAddr     string
+	JWTSecret      string
+	BaseDomain     string
+	ControlHost    string
+	APIPort        int
+	SessionTTL     time.Duration
+	SMTPHost       string
+	SMTPPort       int
+	GlitchTipDSN   string
 	MeilisearchURL string
 	MeilisearchKey string
-	S3Endpoint    string
-	S3Bucket      string
-	S3AccessKey   string
-	S3SecretKey   string
-	ImgproxyURL   string
-	BaseURL       string
+	S3Endpoint     string
+	S3Bucket       string
+	S3AccessKey    string
+	S3SecretKey    string
+	ImgproxyURL    string
+	BaseURL        string
 }
 
 func Load() (*Config, error) {
@@ -43,7 +43,7 @@ func Load() (*Config, error) {
 		BaseDomain:     env("OGA9_BASE_DOMAIN", "oga9.com"),
 		ControlHost:    env("OGA9_CONTROL_HOST", "control.oga9.com"),
 		APIPort:        envInt("OGA9_API_PORT", 8080),
-		SessionTTL:    envDur("OGA9_SESSION_TTL", 24*time.Hour),
+		SessionTTL:     envDur("OGA9_SESSION_TTL", 24*time.Hour),
 		SMTPHost:       env("OGA9_SMTP_HOST", "localhost"),
 		SMTPPort:       envInt("OGA9_SMTP_PORT", 1025),
 		GlitchTipDSN:   env("OGA9_GLITCHTIP_DSN", ""),
@@ -54,7 +54,7 @@ func Load() (*Config, error) {
 		S3AccessKey:    env("OGA9_S3_ACCESS_KEY", ""),
 		S3SecretKey:    env("OGA9_S3_SECRET_KEY", ""),
 		ImgproxyURL:    env("OGA9_IMGPROXY_URL", ""),
-		BaseURL:       env("OGA9_BASE_URL", "http://localhost:8080"),
+		BaseURL:        env("OGA9_BASE_URL", "http://localhost:8080"),
 	}
 	if cfg.JWTSecret == "change-me" && cfg.Env == "production" {
 		return nil, fmt.Errorf("OGA9_JWT_SECRET must be set in production")
@@ -103,15 +103,14 @@ func envInt(key string, fallback int) int {
 	return n
 }
 
-
 // OAuthProviders builds the configured provider map — a provider activates
 // only when its client id+secret env vars are set (§02).
 func (c *Config) OAuthProviders() map[string]auth.ProviderConfig {
 	defs := map[string]map[string]string{
 		"google": {
-			"auth":      "https://accounts.google.com/o/oauth2/v2/auth",
-			"token":     "https://oauth2.googleapis.com/token",
-			"userinfo":  "https://openidconnect.googleapis.com/v1/userinfo",
+			"auth":     "https://accounts.google.com/o/oauth2/v2/auth",
+			"token":    "https://oauth2.googleapis.com/token",
+			"userinfo": "https://openidconnect.googleapis.com/v1/userinfo",
 		},
 		"japaconnect": {}, // URLs required via env (ADR-021 endpoint TBD)
 	}

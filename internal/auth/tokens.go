@@ -3,12 +3,12 @@
 package auth
 
 import (
-	"github.com/google/uuid"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"github.com/google/uuid"
 	"strconv"
 	"strings"
 	"time"

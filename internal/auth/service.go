@@ -80,13 +80,31 @@ func ValidatePassword(pw string) error {
 	return nil
 }
 
-// EmitEvent appends to the domain-event outbox (§05). Best-effort until the
-// dispatcher lands in Phase 06 — emission must never block the request.
-func (s *Service) EmitEvent(ctx context.Context, name, aggType string, aggID uuid.UUID, payload map[string]any) {
+// emit appends to the domain-event outbox via the given query handle (§05).
+// Callers must pass the tx-scoped Queries so the event lands in the SAME
+// transaction as the state mutation (Rule 12 outbox contract).
+func emit(ctx context.Context, q *db.Queries, name, aggType string, aggID uuid.UUID, payload map[string]any) {
 	b, _ := json.Marshal(payload)
-	_ = s.q.EmitDomainEvent(ctx, db.EmitDomainEventParams{
+	_ = q.EmitDomainEvent(ctx, db.EmitDomainEventParams{
 		Name: name, AggregateType: aggType, AggregateID: toPg(aggID), Payload: b,
 	})
+}
+
+// EmitEvent is the fire-and-forget variant for non-mutating notifications.
+func (s *Service) EmitEvent(ctx context.Context, name, aggType string, aggID uuid.UUID, payload map[string]any) {
+	emit(ctx, s.q, name, aggType, aggID, payload)
+}
+
+func (s *Service) withTx(ctx context.Context, fn func(*db.Queries) error) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if err := fn(s.q.WithTx(tx)); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 func (s *Service) Register(ctx context.Context, email, password, displayName string) (*User, string, error) {
@@ -97,8 +115,17 @@ func (s *Service) Register(ctx context.Context, email, password, displayName str
 	if err != nil {
 		return nil, "", err
 	}
-	row, err := s.q.CreateUser(ctx, db.CreateUserParams{
-		Email: email, PasswordHash: pgText(hash), DisplayName: displayName,
+	var row db.CreateUserRow
+	err = s.withTx(ctx, func(q *db.Queries) error {
+		r, e := q.CreateUser(ctx, db.CreateUserParams{
+			Email: email, PasswordHash: pgText(hash), DisplayName: displayName,
+		})
+		if e != nil {
+			return e
+		}
+		row = r
+		emit(ctx, q, "UserRegistered", "user", fromPg(r.ID), map[string]any{"email": r.Email})
+		return nil
 	})
 	if err != nil {
 		var pgErr *pgconn.PgError
@@ -108,7 +135,6 @@ func (s *Service) Register(ctx context.Context, email, password, displayName str
 		return nil, "", err // real DB error → 500, never fake email_taken
 	}
 	u := &User{ID: fromPg(row.ID), Email: row.Email, DisplayName: row.DisplayName, IsVerified: row.IsVerified, Status: row.Status}
-	s.EmitEvent(ctx, "UserRegistered", "user", u.ID, map[string]any{"email": u.Email})
 	verifyToken, _ := SignActionToken(s.jwtSecret, u.ID.String(), "verify_email", 24*time.Hour)
 	return u, verifyToken, nil
 }
@@ -137,27 +163,35 @@ func (s *Service) Login(ctx context.Context, email, password, mfaCode, deviceLab
 		}
 	}
 	uid := fromPg(row.ID)
-	token, sessionID, err := s.createSession(ctx, uid, deviceLabel, ip, ua)
+	token, sessionID, err := s.createSession(ctx, uid, deviceLabel, ip, ua, "password")
 	if err != nil {
 		return "", uuid.Nil, err
 	}
-	s.EmitEvent(ctx, "UserLoggedIn", "user", uid, map[string]any{"provider": "password"})
 	return token, sessionID, nil
 }
 
 // createSession is the shared session-issuing tail of Login/OAuthCallback:
-// insert row → sign JWT keyed to jti → return session id.
-func (s *Service) createSession(ctx context.Context, userID uuid.UUID, deviceLabel, ip, ua string) (string, uuid.UUID, error) {
+// session row + UserLoggedIn event in one tx → sign JWT keyed to jti.
+func (s *Service) createSession(ctx context.Context, userID uuid.UUID, deviceLabel, ip, ua, provider string) (string, uuid.UUID, error) {
 	jti := uuid.New()
 	expires := time.Now().Add(s.tokenTTL)
 	addr, _ := netip.ParseAddr(ip)
-	sessID, err := s.q.CreateSession(ctx, db.CreateSessionParams{
-		UserID:      toPg(userID),
-		Jti:         toPg(jti),
-		DeviceLabel: pgText(deviceLabel),
-		Column4:     addr,
-		UserAgent:   pgText(ua),
-		ExpiresAt:   pgtype.Timestamptz{Time: expires, Valid: true},
+	var sessID pgtype.UUID
+	err := s.withTx(ctx, func(q *db.Queries) error {
+		id, e := q.CreateSession(ctx, db.CreateSessionParams{
+			UserID:      toPg(userID),
+			Jti:         toPg(jti),
+			DeviceLabel: pgText(deviceLabel),
+			Column4:     addr,
+			UserAgent:   pgText(ua),
+			ExpiresAt:   pgtype.Timestamptz{Time: expires, Valid: true},
+		})
+		if e != nil {
+			return e
+		}
+		sessID = id
+		emit(ctx, q, "UserLoggedIn", "user", userID, map[string]any{"provider": provider})
+		return nil
 	})
 	if err != nil {
 		return "", uuid.Nil, err
@@ -170,10 +204,12 @@ func (s *Service) createSession(ctx context.Context, userID uuid.UUID, deviceLab
 }
 
 func (s *Service) Logout(ctx context.Context, jti uuid.UUID) error {
-	if row, err := s.q.GetSessionByJTI(ctx, toPg(jti)); err == nil {
-		s.EmitEvent(ctx, "SessionRevoked", "session", fromPg(row.ID), map[string]any{"reason": "logout"})
-	}
-	return s.q.RevokeSessionByJTI(ctx, toPg(jti))
+	return s.withTx(ctx, func(q *db.Queries) error {
+		if row, err := q.GetSessionByJTI(ctx, toPg(jti)); err == nil {
+			emit(ctx, q, "SessionRevoked", "session", fromPg(row.ID), map[string]any{"reason": "logout"})
+		}
+		return q.RevokeSessionByJTI(ctx, toPg(jti))
+	})
 }
 
 // ResolveSession maps a JWT jti → userID, enforcing revocation + expiry (§02).
@@ -217,8 +253,10 @@ func (s *Service) VerifyEmail(ctx context.Context, token string) error {
 		return err
 	}
 	uid := uuid.MustParse(userID)
-	s.EmitEvent(ctx, "IdentityVerified", "user", uid, map[string]any{"method": "email_link"})
-	return s.q.SetUserVerified(ctx, toPg(uid))
+	return s.withTx(ctx, func(q *db.Queries) error {
+		emit(ctx, q, "IdentityVerified", "user", uid, map[string]any{"method": "email_link"})
+		return q.SetUserVerified(ctx, toPg(uid))
+	})
 }
 
 // ConsumeActionToken verifies a signed token and burns it (single-use,
@@ -248,12 +286,14 @@ func (s *Service) ResetPassword(ctx context.Context, token, newPassword string) 
 		return err
 	}
 	uid := uuid.MustParse(userID)
-	if err := s.q.UpdateUserPassword(ctx, db.UpdateUserPasswordParams{PasswordHash: pgText(hash), ID: toPg(uid)}); err != nil {
-		return err
-	}
-	// revoke all sessions on password reset (§02)
-	s.EmitEvent(ctx, "PasswordChanged", "user", uid, map[string]any{"via": "reset_link"})
-	return s.q.RevokeAllUserSessions(ctx, toPg(uid))
+	return s.withTx(ctx, func(q *db.Queries) error {
+		if err := q.UpdateUserPassword(ctx, db.UpdateUserPasswordParams{PasswordHash: pgText(hash), ID: toPg(uid)}); err != nil {
+			return err
+		}
+		// revoke all sessions on password reset (§02)
+		emit(ctx, q, "PasswordChanged", "user", uid, map[string]any{"via": "reset_link"})
+		return q.RevokeAllUserSessions(ctx, toPg(uid))
+	})
 }
 
 func (s *Service) SetupMFA(ctx context.Context, userID uuid.UUID, secret string) error {
@@ -293,8 +333,10 @@ func (s *Service) ListSessions(ctx context.Context, userID uuid.UUID) ([]Session
 }
 
 func (s *Service) RevokeSession(ctx context.Context, userID, sessionID uuid.UUID) error {
-	s.EmitEvent(ctx, "SessionRevoked", "session", sessionID, map[string]any{"reason": "revoked_by_user"})
-	return s.q.RevokeSessionByID(ctx, db.RevokeSessionByIDParams{ID: toPg(sessionID), UserID: toPg(userID)})
+	return s.withTx(ctx, func(q *db.Queries) error {
+		emit(ctx, q, "SessionRevoked", "session", sessionID, map[string]any{"reason": "revoked_by_user"})
+		return q.RevokeSessionByID(ctx, db.RevokeSessionByIDParams{ID: toPg(sessionID), UserID: toPg(userID)})
+	})
 }
 
 func (s *Service) LinkOAuthProvider(ctx context.Context, userID uuid.UUID, provider, subject string) error {

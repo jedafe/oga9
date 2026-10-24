@@ -15,6 +15,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jedafe/oga9/internal/db"
 	valkey "github.com/valkey-io/valkey-go"
 )
 
@@ -34,7 +35,9 @@ var ErrOAuthState = errors.New("oauth_state_invalid")
 func StartOAuth(ctx context.Context, vk valkey.Client, p ProviderConfig, redirectURI string) (string, error) {
 	state := uuid.NewString()
 	err := vk.Do(ctx, vk.B().Set().Key("oga9:oauth:state:"+state).Value("1").Nx().ExSeconds(600).Build()).Error()
-	if err != nil { return "", err }
+	if err != nil {
+		return "", err
+	}
 	q := url.Values{
 		"client_id":     {p.ClientID},
 		"redirect_uri":  {redirectURI},
@@ -56,7 +59,9 @@ type oidcUserinfo struct {
 // finds-or-provisions the user, links oauth_providers, and returns a session.
 func (s *Service) OAuthCallback(ctx context.Context, state, code, redirectURI string, p ProviderConfig, provider, deviceLabel, ip, ua string) (string, uuid.UUID, error) {
 	deleted, err := s.vk.Do(ctx, s.vk.B().Del().Key("oga9:oauth:state:"+state).Build()).AsInt64()
-	if err != nil || deleted != 1 { return "", uuid.Nil, ErrOAuthState }
+	if err != nil || deleted != 1 {
+		return "", uuid.Nil, ErrOAuthState
+	}
 
 	form := url.Values{
 		"grant_type":    {"authorization_code"},
@@ -68,7 +73,9 @@ func (s *Service) OAuthCallback(ctx context.Context, state, code, redirectURI st
 	req, _ := http.NewRequestWithContext(ctx, "POST", p.TokenURL, strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	resp, err := http.DefaultClient.Do(req)
-	if err != nil { return "", uuid.Nil, err }
+	if err != nil {
+		return "", uuid.Nil, err
+	}
 	defer resp.Body.Close()
 	var tok struct {
 		AccessToken string `json:"access_token"`
@@ -81,7 +88,9 @@ func (s *Service) OAuthCallback(ctx context.Context, state, code, redirectURI st
 	ureq, _ := http.NewRequestWithContext(ctx, "GET", p.UserinfoURL, nil)
 	ureq.Header.Set("Authorization", "Bearer "+tok.AccessToken)
 	uresp, err := http.DefaultClient.Do(ureq)
-	if err != nil { return "", uuid.Nil, err }
+	if err != nil {
+		return "", uuid.Nil, err
+	}
 	defer uresp.Body.Close()
 	var info oidcUserinfo
 	if err := json.NewDecoder(uresp.Body).Decode(&info); err != nil || info.Sub == "" {
@@ -89,17 +98,20 @@ func (s *Service) OAuthCallback(ctx context.Context, state, code, redirectURI st
 	}
 
 	userID, err := s.findOrProvisionOAuthUser(ctx, provider, info)
-	if err != nil { return "", uuid.Nil, err }
-	token, sessionID, err := s.createSession(ctx, userID, deviceLabel, ip, ua)
-	if err != nil { return "", uuid.Nil, err }
-	s.EmitEvent(ctx, "UserLoggedIn", "user", userID, map[string]any{"provider": provider})
-	return token, sessionID, nil
+	if err != nil {
+		return "", uuid.Nil, err
+	}
+	return s.createSession(ctx, userID, deviceLabel, ip, ua, provider)
 }
 
 func (s *Service) findOrProvisionOAuthUser(ctx context.Context, provider string, info oidcUserinfo) (uuid.UUID, error) {
 	userID, err := s.userByOAuthSubject(ctx, provider, info.Sub)
-	if err == nil { return userID, nil }
-	if err != pgx.ErrNoRows { return uuid.Nil, err }
+	if err == nil {
+		return userID, nil
+	}
+	if err != pgx.ErrNoRows {
+		return uuid.Nil, err
+	}
 
 	if info.Email != "" {
 		if id, e := s.UserIDByEmail(ctx, info.Email); e == nil {
@@ -107,11 +119,25 @@ func (s *Service) findOrProvisionOAuthUser(ctx context.Context, provider string,
 		}
 	}
 	if userID == uuid.Nil {
+		// new account: provision + emit + link in one tx (Rule 12)
 		display := info.Name
-		if display == "" { display = info.Email }
-		userID, err = s.createOAuthUser(ctx, info.Email, display, info.EmailVerified)
-		if err != nil { return uuid.Nil, err }
-		s.EmitEvent(ctx, "UserRegistered", "user", userID, map[string]any{"provider": provider})
+		if display == "" {
+			display = info.Email
+		}
+		err = s.withTx(ctx, func(q *db.Queries) error {
+			id, e := q.CreateOAuthUser(ctx, db.CreateOAuthUserParams{
+				Email: info.Email, DisplayName: display, IsVerified: info.EmailVerified,
+			})
+			if e != nil {
+				return e
+			}
+			userID = fromPg(id)
+			emit(ctx, q, "UserRegistered", "user", userID, map[string]any{"provider": provider})
+			return q.LinkOAuthProvider(ctx, db.LinkOAuthProviderParams{
+				UserID: toPg(userID), Provider: provider, ProviderSubject: info.Sub,
+			})
+		})
+		return userID, err
 	}
 	return userID, s.LinkOAuthProvider(ctx, userID, provider, info.Sub)
 }

@@ -53,7 +53,7 @@ func main() {
 		log.Fatalf("valkey: %v", err)
 	}
 	defer vk.Close()
-	
+
 	// Asynq server + scheduler (3-tier: critical/default/low — §08)
 	srv := asynq.NewServer(
 		asynq.RedisClientOpt{Addr: cfg.ValkeyAddr},
@@ -142,4 +142,3 @@ func main() {
 	scheduler.Shutdown()
 	httpSrv.Shutdown(shutdownCtx)
 }
-
