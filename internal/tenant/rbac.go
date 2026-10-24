@@ -257,6 +257,10 @@ func (s *Service) AddCommitteeMember(ctx context.Context, oc *OrgCtx, unitID, me
 		if err != nil || fromPg(m.OrganizationID) != oc.OrgID {
 			return ErrNotMember
 		}
+		u, err := q.GetUnit(ctx, toPg(unitID)) // committee unit must be ours
+		if err != nil || fromPg(u.OrganizationID) != oc.OrgID || u.Type != "committee" {
+			return ErrNotFound
+		}
 		userID = fromPg(m.UserID)
 		_, err = q.AddCommitteeMember(ctx, db.AddCommitteeMemberParams{
 			OrganizationID: toPg(oc.OrgID), OrgUnitID: toPg(unitID), MemberID: toPg(memberID), Role: role,
