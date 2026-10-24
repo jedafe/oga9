@@ -108,7 +108,7 @@ func (s *Service) Register(ctx context.Context, email, password, displayName str
 		return nil, "", err // real DB error → 500, never fake email_taken
 	}
 	u := &User{ID: fromPg(row.ID), Email: row.Email, DisplayName: row.DisplayName, IsVerified: row.IsVerified, Status: row.Status}
-	s.EmitEvent(ctx, "user.registered", "user", u.ID, map[string]any{"email": u.Email})
+	s.EmitEvent(ctx, "UserRegistered", "user", u.ID, map[string]any{"email": u.Email})
 	verifyToken, _ := SignActionToken(s.jwtSecret, u.ID.String(), "verify_email", 24*time.Hour)
 	return u, verifyToken, nil
 }
@@ -141,7 +141,7 @@ func (s *Service) Login(ctx context.Context, email, password, mfaCode, deviceLab
 	if err != nil {
 		return "", uuid.Nil, err
 	}
-	s.EmitEvent(ctx, "user.logged_in", "user", uid, map[string]any{"provider": "password"})
+	s.EmitEvent(ctx, "UserLoggedIn", "user", uid, map[string]any{"provider": "password"})
 	return token, sessionID, nil
 }
 
@@ -170,6 +170,9 @@ func (s *Service) createSession(ctx context.Context, userID uuid.UUID, deviceLab
 }
 
 func (s *Service) Logout(ctx context.Context, jti uuid.UUID) error {
+	if row, err := s.q.GetSessionByJTI(ctx, toPg(jti)); err == nil {
+		s.EmitEvent(ctx, "SessionRevoked", "session", fromPg(row.ID), map[string]any{"reason": "logout"})
+	}
 	return s.q.RevokeSessionByJTI(ctx, toPg(jti))
 }
 
@@ -213,7 +216,9 @@ func (s *Service) VerifyEmail(ctx context.Context, token string) error {
 	if err != nil {
 		return err
 	}
-	return s.q.SetUserVerified(ctx, toPg(uuid.MustParse(userID)))
+	uid := uuid.MustParse(userID)
+	s.EmitEvent(ctx, "IdentityVerified", "user", uid, map[string]any{"method": "email_link"})
+	return s.q.SetUserVerified(ctx, toPg(uid))
 }
 
 // ConsumeActionToken verifies a signed token and burns it (single-use,
@@ -247,6 +252,7 @@ func (s *Service) ResetPassword(ctx context.Context, token, newPassword string) 
 		return err
 	}
 	// revoke all sessions on password reset (§02)
+	s.EmitEvent(ctx, "PasswordChanged", "user", uid, map[string]any{"via": "reset_link"})
 	return s.q.RevokeAllUserSessions(ctx, toPg(uid))
 }
 
@@ -287,6 +293,7 @@ func (s *Service) ListSessions(ctx context.Context, userID uuid.UUID) ([]Session
 }
 
 func (s *Service) RevokeSession(ctx context.Context, userID, sessionID uuid.UUID) error {
+	s.EmitEvent(ctx, "SessionRevoked", "session", sessionID, map[string]any{"reason": "revoked_by_user"})
 	return s.q.RevokeSessionByID(ctx, db.RevokeSessionByIDParams{ID: toPg(sessionID), UserID: toPg(userID)})
 }
 

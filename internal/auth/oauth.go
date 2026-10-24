@@ -92,7 +92,7 @@ func (s *Service) OAuthCallback(ctx context.Context, state, code, redirectURI st
 	if err != nil { return "", uuid.Nil, err }
 	token, sessionID, err := s.createSession(ctx, userID, deviceLabel, ip, ua)
 	if err != nil { return "", uuid.Nil, err }
-	s.EmitEvent(ctx, "user.logged_in", "user", userID, map[string]any{"provider": provider})
+	s.EmitEvent(ctx, "UserLoggedIn", "user", userID, map[string]any{"provider": provider})
 	return token, sessionID, nil
 }
 
@@ -111,7 +111,7 @@ func (s *Service) findOrProvisionOAuthUser(ctx context.Context, provider string,
 		if display == "" { display = info.Email }
 		userID, err = s.createOAuthUser(ctx, info.Email, display, info.EmailVerified)
 		if err != nil { return uuid.Nil, err }
-		s.EmitEvent(ctx, "user.registered", "user", userID, map[string]any{"provider": provider})
+		s.EmitEvent(ctx, "UserRegistered", "user", userID, map[string]any{"provider": provider})
 	}
 	return userID, s.LinkOAuthProvider(ctx, userID, provider, info.Sub)
 }
