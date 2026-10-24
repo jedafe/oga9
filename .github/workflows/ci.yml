@@ -1,0 +1,52 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: oga9
+          POSTGRES_PASSWORD: oga9
+          POSTGRES_DB: oga9
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U oga9"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+      valkey:
+        image: valkey/valkey:8-alpine
+        ports: ["6379:6379"]
+    env:
+      OGA9_TEST_DATABASE_URL: postgres://oga9:oga9@localhost:5432/oga9?sslmode=disable
+      OGA9_TEST_VALKEY_ADDR: localhost:6379
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+      - name: fmt check
+        run: test -z "$(gofmt -l cmd internal)"
+      - name: vet
+        run: go vet ./...
+      - name: build
+        run: go build ./...
+      - name: apply migrations
+        run: |
+          for f in db/migrations/*.up.sql; do
+            psql "$OGA9_TEST_DATABASE_URL" -v ON_ERROR_STOP=1 -f "$f"
+          done
+      - name: sqlc generated files in sync
+        run: |
+          go install github.com/sqlc-dev/sqlc/cmd/sqlc@v1.29.0
+          sqlc generate
+          git diff --exit-code internal/db
+      - name: test
+        run: go test ./... -count=1
