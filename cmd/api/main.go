@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -90,7 +91,7 @@ func main() {
 	})
 	// §02 identity: auth service + handlers
 	mail := mailer.New(cfg.SMTPHost, cfg.SMTPPort)
-	authSvc := auth.NewService(pool, vk, cfg.JWTSecret, 24*time.Hour)
+	authSvc := auth.NewService(pool, vk, cfg.JWTSecret, cfg.SessionTTL)
 	authH := handler.NewAuthHandler(authSvc, mail, cfg.JWTSecret)
 	mfaH := handler.NewMFAHandler(authSvc)
 	oauthH := handler.NewOAuthHandler(authSvc)
@@ -122,7 +123,7 @@ func main() {
 		})
 	})
 
-	httpSrv := &http.Server{Addr: ":" + itoa(cfg.APIPort), Handler: r}
+	httpSrv := &http.Server{Addr: ":" + strconv.Itoa(cfg.APIPort), Handler: r}
 	go func() {
 		log.Printf("api listening on :%d (env=%s)", cfg.APIPort, cfg.Env)
 		if err := httpSrv.ListenAndServe(); err != http.ErrServerClosed {
@@ -142,16 +143,3 @@ func main() {
 	httpSrv.Shutdown(shutdownCtx)
 }
 
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	var b [20]byte
-	i := len(b)
-	for n > 0 {
-		i--
-		b[i] = byte('0' + n%10)
-		n /= 10
-	}
-	return string(b[i:])
-}

@@ -4,6 +4,7 @@ package handler
 import (
 	"encoding/json"
 	"net"
+	"time"
 	"errors"
 	"net/http"
 
@@ -97,7 +98,7 @@ func (h *AuthHandler) ForgotPassword(w http.ResponseWriter, r *http.Request) {
 	// Always 200 — don't leak account existence (§02)
 	uid, _ := h.svc.UserIDByEmail(r.Context(), req.Email)
 	if uid != "" {
-		token, _ := auth.SignActionToken(h.secret, uid, "password_reset", 3600000000000)
+		token, _ := auth.SignActionToken(h.secret, uid, "password_reset", time.Hour)
 		h.mailer.Send(req.Email, "OGA9 password reset", "Reset: "+token)
 	}
 	writeData(w, 200, map[string]any{"sent": true})

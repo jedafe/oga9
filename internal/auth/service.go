@@ -86,11 +86,11 @@ var (
 )
 
 type User struct {
-	ID        uuid.UUID
-	Email     string
-	DisplayName string
-	IsVerified bool
-	Status    string
+	ID        uuid.UUID `json:"user_id"`
+	Email     string    `json:"email"`
+	DisplayName string  `json:"display_name"`
+	IsVerified bool     `json:"is_verified"`
+	Status    string    `json:"status"`
 }
 
 func (s *Service) Register(ctx context.Context, email, password, displayName string) (*User, string, error) {
@@ -155,14 +155,14 @@ func (s *Service) GetUser(ctx context.Context, id uuid.UUID) (*User, error) {
 	err := s.pool.QueryRow(ctx,
 		`SELECT id, email, display_name, is_verified, status FROM users WHERE id=$1`, id).
 		Scan(&u.ID, &u.Email, &u.DisplayName, &u.IsVerified, &u.Status)
-	if err != nil { return nil, errors.New("user_not_found") }
+	if err == pgx.ErrNoRows { return nil, errors.New("user_not_found") }
+	if err != nil { return nil, err }
 	return &u, nil
 }
 
-func (s *Service) VerifyEmail(ctx context.Context, token string) error {
-	jti, userID, err := VerifyActionToken(s.jwtSecret, token, "verify_email")
+func (s *Service) VerifyEmail(ctx context.Context, token string) error { // single-use via ConsumeActionToken
+	userID, err := s.ConsumeActionToken(ctx, token, "verify_email")
 	if err != nil { return err }
-	_ = jti // single-use marker handled by Valkey in handler layer
 	_, err = s.pool.Exec(ctx, `UPDATE users SET is_verified=true WHERE id=$1`, userID)
 	return err
 }

@@ -17,6 +17,7 @@ type Config struct {
 	BaseDomain    string
 	ControlHost   string
 	APIPort       int
+	SessionTTL    time.Duration
 	SMTPHost      string
 	SMTPPort      int
 	GlitchTipDSN  string
@@ -38,6 +39,7 @@ func Load() (*Config, error) {
 		BaseDomain:     env("OGA9_BASE_DOMAIN", "oga9.com"),
 		ControlHost:    env("OGA9_CONTROL_HOST", "control.oga9.com"),
 		APIPort:        envInt("OGA9_API_PORT", 8080),
+		SessionTTL:    envDur("OGA9_SESSION_TTL", 24*time.Hour),
 		SMTPHost:       env("OGA9_SMTP_HOST", "localhost"),
 		SMTPPort:       envInt("OGA9_SMTP_PORT", 1025),
 		GlitchTipDSN:   env("OGA9_GLITCHTIP_DSN", ""),
@@ -72,6 +74,18 @@ func mustEnv(key string) string {
 	return v
 }
 
+func envDur(key string, fallback time.Duration) time.Duration {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return fallback
+	}
+	return d
+}
+
 func envInt(key string, fallback int) int {
 	v := os.Getenv(key)
 	if v == "" {
@@ -84,4 +98,3 @@ func envInt(key string, fallback int) int {
 	return n
 }
 
-var _ = time.Second // keep time import for future duration helpers
