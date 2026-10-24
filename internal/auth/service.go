@@ -9,16 +9,71 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	valkey "github.com/valkey-io/valkey-go"
 )
 
 type Service struct {
 	pool     *pgxpool.Pool
+	vk       valkey.Client
 	jwtSecret string
 	tokenTTL time.Duration
 }
 
-func NewService(pool *pgxpool.Pool, jwtSecret string, tokenTTL time.Duration) *Service {
-	return &Service{pool: pool, jwtSecret: jwtSecret, tokenTTL: tokenTTL}
+func NewService(pool *pgxpool.Pool, vk valkey.Client, jwtSecret string, tokenTTL time.Duration) *Service {
+	return &Service{pool: pool, vk: vk, jwtSecret: jwtSecret, tokenTTL: tokenTTL}
+}
+
+// ConsumeActionToken verifies a signed token and burns it (single-use,
+// oga9:auth:used_token:{jti} SET NX EX).
+func (s *Service) ConsumeActionToken(ctx context.Context, token, purpose string) (string, error) {
+	jti, userID, err := VerifyActionToken(s.jwtSecret, token, purpose)
+	if err != nil { return "", err }
+	key := "oga9:auth:used_token:" + jti
+	ok, err := s.vk.Do(ctx, s.vk.B().Set().Key(key).Value("1").Nx().ExSeconds(86400).Build()).AsBool()
+	if err != nil || !ok { return "", errors.New("token_used") }
+	return userID, nil
+}
+
+func (s *Service) ResetPassword(ctx context.Context, token, newPassword string) error {
+	userID, err := s.ConsumeActionToken(ctx, token, "password_reset")
+	if err != nil { return err }
+	hash, err := HashPassword(newPassword)
+	if err != nil { return err }
+	_, err = s.pool.Exec(ctx, `UPDATE users SET password_hash=$1 WHERE id=$2`, hash, userID)
+	if err != nil { return err }
+	// revoke all sessions on password reset
+	_, _ = s.pool.Exec(ctx, `UPDATE user_sessions SET revoked_at=now() WHERE user_id=$1 AND revoked_at IS NULL`, userID)
+	return nil
+}
+
+func (s *Service) UserIDByEmail(ctx context.Context, email string) (string, error) {
+	var id string
+	err := s.pool.QueryRow(ctx, `SELECT id FROM users WHERE email=$1`, email).Scan(&id)
+	return id, err
+}
+
+func (s *Service) SetupMFA(ctx context.Context, userID uuid.UUID, secret string) error {
+	_, err := s.pool.Exec(ctx, `UPDATE users SET mfa_secret=$1 WHERE id=$2`, secret, userID)
+	return err
+}
+
+func (s *Service) HasMFA(ctx context.Context, userID uuid.UUID) (bool, error) {
+	var has bool
+	err := s.pool.QueryRow(ctx, `SELECT mfa_secret IS NOT NULL FROM users WHERE id=$1`, userID).Scan(&has)
+	return has, err
+}
+
+func (s *Service) MFASecret(ctx context.Context, userID uuid.UUID) (string, error) {
+	var sec string
+	err := s.pool.QueryRow(ctx, `SELECT mfa_secret::text FROM users WHERE id=$1`, userID).Scan(&sec)
+	return sec, err
+}
+
+func (s *Service) LinkOAuthProvider(ctx context.Context, userID uuid.UUID, provider, subject string) error {
+	_, err := s.pool.Exec(ctx,
+		`INSERT INTO oauth_providers (user_id, provider, provider_subject) VALUES ($1,$2,$3)
+		 ON CONFLICT (provider, provider_subject) DO NOTHING`, userID, provider, subject)
+	return err
 }
 
 var (

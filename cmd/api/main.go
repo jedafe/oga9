@@ -52,8 +52,7 @@ func main() {
 		log.Fatalf("valkey: %v", err)
 	}
 	defer vk.Close()
-	_ = vk
-
+	
 	// Asynq server + scheduler (3-tier: critical/default/low — §08)
 	srv := asynq.NewServer(
 		asynq.RedisClientOpt{Addr: cfg.ValkeyAddr},
@@ -91,8 +90,10 @@ func main() {
 	})
 	// §02 identity: auth service + handlers
 	mail := mailer.New(cfg.SMTPHost, cfg.SMTPPort)
-	authSvc := auth.NewService(pool, cfg.JWTSecret, 24*time.Hour)
+	authSvc := auth.NewService(pool, vk, cfg.JWTSecret, 24*time.Hour)
 	authH := handler.NewAuthHandler(authSvc, mail, cfg.JWTSecret)
+	mfaH := handler.NewMFAHandler(authSvc)
+	oauthH := handler.NewOAuthHandler(authSvc)
 
 	r.Route("/api/v1", func(r chi.Router) {
 		r.Get("/", func(w http.ResponseWriter, r *http.Request) {
@@ -106,6 +107,8 @@ func main() {
 		r.Post("/auth/verify/{token}", authH.VerifyEmail)
 		r.Post("/auth/password/forgot", authH.ForgotPassword)
 		r.Post("/auth/password/reset", authH.ResetPassword)
+		r.Get("/auth/oauth/{provider}/start", oauthH.Start)
+		r.Get("/auth/oauth/{provider}/callback", oauthH.Callback)
 
 		// authed
 		r.Group(func(r chi.Router) {
@@ -114,6 +117,8 @@ func main() {
 			r.Get("/me", authH.Me)
 			r.Get("/me/sessions", authH.Sessions)
 			r.Delete("/me/sessions/{session_id}", authH.RevokeSession)
+			r.Post("/auth/mfa/setup", mfaH.Setup)
+			r.Post("/auth/mfa/confirm", mfaH.Confirm)
 		})
 	})
 

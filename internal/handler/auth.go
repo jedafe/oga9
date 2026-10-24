@@ -95,8 +95,11 @@ func (h *AuthHandler) ForgotPassword(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "validation_failed", "email required"); return
 	}
 	// Always 200 — don't leak account existence (§02)
-	token, _ := auth.SignActionToken(h.secret, "lookup:"+req.Email, "password_reset", 3600000000000)
-	h.mailer.Send(req.Email, "OGA9 password reset", "Reset: "+token)
+	uid, _ := h.svc.UserIDByEmail(r.Context(), req.Email)
+	if uid != "" {
+		token, _ := auth.SignActionToken(h.secret, uid, "password_reset", 3600000000000)
+		h.mailer.Send(req.Email, "OGA9 password reset", "Reset: "+token)
+	}
 	writeData(w, 200, map[string]any{"sent": true})
 }
 
@@ -109,8 +112,10 @@ func (h *AuthHandler) ResetPassword(w http.ResponseWriter, r *http.Request) {
 	if err := decode(r, &req); err != nil || req.Token == "" || req.NewPassword == "" {
 		writeErr(w, 400, "validation_failed", "token and new password required"); return
 	}
-	// TODO(§02): consume single-use token + update password_hash via svc.ResetPassword
-	writeData(w, 501, map[string]any{"implemented": false, "note": "password reset lands with token-consume task"})
+	if err := h.svc.ResetPassword(r.Context(), req.Token, req.NewPassword); err != nil {
+		writeErr(w, 400, "invalid_token", "reset link invalid, used, or expired"); return
+	}
+	writeData(w, 200, map[string]any{"reset": true})
 }
 
 func (h *AuthHandler) Me(w http.ResponseWriter, r *http.Request) {
