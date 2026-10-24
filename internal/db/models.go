@@ -10,6 +10,18 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+type AuditEvents struct {
+	ID             pgtype.UUID        `json:"id"`
+	TenantID       pgtype.UUID        `json:"tenant_id"`
+	OrganizationID pgtype.UUID        `json:"organization_id"`
+	ActorID        pgtype.UUID        `json:"actor_id"`
+	Action         string             `json:"action"`
+	TargetType     pgtype.Text        `json:"target_type"`
+	TargetID       pgtype.UUID        `json:"target_id"`
+	Context        []byte             `json:"context"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+}
+
 type DomainEvents struct {
 	ID            pgtype.UUID        `json:"id"`
 	Name          string             `json:"name"`
