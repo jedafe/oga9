@@ -75,7 +75,7 @@ func TestOrgLifecycleFlow(t *testing.T) {
 	if _, err := svc.CreateOrg(ctx, member, "Hijack", "hj"+uuid.NewString()[:6], "union", "union", "NG", "X", "x@t.co", org.TenantID); err != ErrNoTenant {
 		t.Fatalf("foreign tenant_id should be rejected, got %v", err)
 	}
-	if !svc.HasPermission(ctx, owner, oc.TenantID, "org.structure.manage") {
+	if !svc.HasPermission(ctx, owner, org.ID, "org.structure.manage") {
 		t.Fatal("creator missing org.structure.manage")
 	}
 	if _, err := svc.ResolveOrgCtx(ctx, stranger, org.ID); err != ErrNotMember {
@@ -124,10 +124,13 @@ func TestOrgLifecycleFlow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("member ctx: %v", err)
 	}
-	if !svc.HasPermission(ctx, member, moc.TenantID, "org.members.view") {
+	if moc.OrgID != org.ID {
+		t.Fatal("member ctx org mismatch")
+	}
+	if !svc.HasPermission(ctx, member, org.ID, "org.members.view") {
 		t.Fatal("accepted member missing org.members.view")
 	}
-	if svc.HasPermission(ctx, member, moc.TenantID, "org.structure.manage") {
+	if svc.HasPermission(ctx, member, org.ID, "org.structure.manage") {
 		t.Fatal("member should not have admin node")
 	}
 

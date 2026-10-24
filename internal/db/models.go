@@ -22,6 +22,15 @@ type AuditEvents struct {
 	CreatedAt      pgtype.Timestamptz `json:"created_at"`
 }
 
+type CommitteeMemberships struct {
+	ID             pgtype.UUID        `json:"id"`
+	OrganizationID pgtype.UUID        `json:"organization_id"`
+	OrgUnitID      pgtype.UUID        `json:"org_unit_id"`
+	MemberID       pgtype.UUID        `json:"member_id"`
+	Role           string             `json:"role"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+}
+
 type CustomFieldGroups struct {
 	ID             pgtype.UUID        `json:"id"`
 	OrganizationID pgtype.UUID        `json:"organization_id"`
@@ -85,6 +94,19 @@ type OauthProviders struct {
 	CreatedAt       pgtype.Timestamptz `json:"created_at"`
 }
 
+type OfficerAppointments struct {
+	ID             pgtype.UUID        `json:"id"`
+	OrganizationID pgtype.UUID        `json:"organization_id"`
+	TermID         pgtype.UUID        `json:"term_id"`
+	PositionID     pgtype.UUID        `json:"position_id"`
+	MemberID       pgtype.UUID        `json:"member_id"`
+	BranchID       pgtype.UUID        `json:"branch_id"`
+	CommitteeID    pgtype.UUID        `json:"committee_id"`
+	StartsAt       pgtype.Date        `json:"starts_at"`
+	EndsAt         pgtype.Date        `json:"ends_at"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+}
+
 type OrgBranding struct {
 	OrganizationID pgtype.UUID `json:"organization_id"`
 	LogoMediaID    pgtype.UUID `json:"logo_media_id"`
@@ -106,6 +128,16 @@ type OrgInvitations struct {
 	Token          pgtype.UUID        `json:"token"`
 	Status         string             `json:"status"`
 	ExpiresAt      pgtype.Timestamptz `json:"expires_at"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+}
+
+type OrgPositions struct {
+	ID             pgtype.UUID        `json:"id"`
+	OrganizationID pgtype.UUID        `json:"organization_id"`
+	Name           string             `json:"name"`
+	Slug           string             `json:"slug"`
+	IsExecutive    bool               `json:"is_executive"`
+	Seats          int32              `json:"seats"`
 	CreatedAt      pgtype.Timestamptz `json:"created_at"`
 }
 
@@ -199,6 +231,11 @@ type Plans struct {
 	Sort              int32       `json:"sort"`
 }
 
+type PositionPermissions struct {
+	PositionID pgtype.UUID `json:"position_id"`
+	Permission string      `json:"permission"`
+}
+
 type RolePermissions struct {
 	RoleID     pgtype.UUID `json:"role_id"`
 	Permission string      `json:"permission"`
@@ -219,6 +256,15 @@ type Tenants struct {
 	Status       string             `json:"status"`
 	OwnerOrgID   pgtype.UUID        `json:"owner_org_id"`
 	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+}
+
+type Terms struct {
+	ID             pgtype.UUID `json:"id"`
+	OrganizationID pgtype.UUID `json:"organization_id"`
+	Label          string      `json:"label"`
+	StartsAt       pgtype.Date `json:"starts_at"`
+	EndsAt         pgtype.Date `json:"ends_at"`
+	IsCurrent      bool        `json:"is_current"`
 }
 
 type UserGroups struct {

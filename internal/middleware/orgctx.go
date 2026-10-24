@@ -49,7 +49,7 @@ func RequireOrgPermission(svc *tenant.Service, node string) func(http.Handler) h
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			oc := OrgCtx(r.Context())
-			if oc == nil || !svc.HasPermission(r.Context(), oc.UserID, oc.TenantID, node) {
+			if oc == nil || !svc.HasPermission(r.Context(), oc.UserID, oc.OrgID, node) {
 				httpx.WriteErr(w, 403, "forbidden", "missing permission "+node)
 				return
 			}

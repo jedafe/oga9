@@ -5,6 +5,20 @@ entries reference engineering phases in `.oos/roadmaps/ROADMAP-BACKEND.md`.
 
 ## [Unreleased]
 
+### Added — Phase 04 (RBAC & Positions)
+- Group-5 migrations: org_positions, position_permissions, terms
+  (+`one_current_term` partial index), officer_appointments,
+  committee_memberships (§03)
+- Org-scoped permission resolver: role grants (tenant) ∪ active
+  current-term position grants; `_branch`/`_committee` suffix resolution
+  via appointment scope columns; cached `oga9:perm:{user}:{org}` (5 min)
+- `InvalidatePermCache` + Rule 6 triggers wired: role assign on
+  org-create/invite-accept, appointment, committee add/remove, term close
+- Term manager: `CloseTerm` ends open appointments → `AppointmentEnded`
+  events; `AppointOfficer` emits `LeaderAppointed`; `TermStarted` on
+  term create (all same-tx, sourced per catalog)
+
+
 ### Added — docs surface
 -  — SvelteKit SSR public docs app (port 3012, docs.oga9.com),
   markdown-driven content pipeline + nav tree, japa  pattern

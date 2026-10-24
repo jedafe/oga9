@@ -9,6 +9,7 @@ import (
 	"errors"
 	"net/mail"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -58,6 +59,7 @@ func pgText(s string) pgtype.Text { return pgtype.Text{String: s, Valid: s != ""
 func pgUUIDPtr(u uuid.UUID) pgtype.UUID {
 	return pgtype.UUID{Bytes: u, Valid: u != uuid.Nil}
 }
+func pgDate(t time.Time) pgtype.Date { return pgtype.Date{Time: t, Valid: !t.IsZero()} }
 
 // OrgCtx is the verified (user, org, membership) context injected into
 // request scope by ResolveOrgCtx (Rule 24).
@@ -109,13 +111,21 @@ func (s *Service) InvalidateOrgCtx(ctx context.Context, userID, orgID uuid.UUID)
 	_ = s.vk.Do(ctx, s.vk.B().Del().Key("oga9:tenant_ctx:"+userID.String()+":"+orgID.String()).Build())
 }
 
-// HasPermission resolves user→tenant role→permission node (Rule 20: nodes,
-// never position names).
-func (s *Service) HasPermission(ctx context.Context, userID, tenantID uuid.UUID, node string) bool {
-	ok, err := s.q.HasPermission(ctx, db.HasPermissionParams{
-		UserID: toPg(userID), TenantID: toPg(tenantID), Node: node,
-	})
-	return err == nil && ok
+// HasPermission moved to rbac.go (org-scoped resolver, Phase 04).
+
+// HasTenantRole reports whether the user holds the named role in the tenant —
+// used by tenant resolution where org context doesn't exist yet.
+func (s *Service) HasTenantRole(ctx context.Context, userID, tenantID uuid.UUID, slug string) bool {
+	admins, err := s.q.ListOrgAdminTenants(ctx, toPg(userID))
+	if err != nil {
+		return false
+	}
+	for _, t := range admins {
+		if fromPg(t) == tenantID {
+			return slug == "org_admin" // the only tenant-role check in use
+		}
+	}
+	return false
 }
 
 // UpdateOrgProfile moved to ops.go
@@ -217,7 +227,7 @@ type templateSeed struct {
 // tenant must be created inside the org's tx.
 func (s *Service) resolveOrgTenant(ctx context.Context, userID, requested uuid.UUID) (uuid.UUID, bool, error) {
 	if requested != uuid.Nil {
-		if !s.HasPermission(ctx, userID, requested, "org.admin.settings") {
+		if !s.HasTenantRole(ctx, userID, requested, "org_admin") {
 			return uuid.Nil, false, ErrNoTenant // no admin rights there (or tenant unknown)
 		}
 		if _, err := s.q.GetTenant(ctx, toPg(requested)); err != nil {
@@ -362,8 +372,9 @@ func (s *Service) CreateOrg(ctx context.Context, userID uuid.UUID, name, slug, t
 		}
 		return nil
 	})
-	if err != nil {
-		return nil, err
+	if err == nil {
+		s.InvalidatePermCache(ctx, userID, orgID) // Rule 6: org_admin grant
+		s.InvalidateOrgCtx(ctx, userID, orgID)
 	}
 	return s.GetOrg(ctx, orgID)
 }

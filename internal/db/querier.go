@@ -11,11 +11,16 @@ import (
 )
 
 type Querier interface {
+	AddCommitteeMember(ctx context.Context, arg AddCommitteeMemberParams) (pgtype.UUID, error)
+	AppointOfficer(ctx context.Context, arg AppointOfficerParams) (pgtype.UUID, error)
 	ArchiveUnit(ctx context.Context, id pgtype.UUID) (pgtype.UUID, error)
+	AssignPositionPermission(ctx context.Context, arg AssignPositionPermissionParams) error
 	AssignRoleBySlug(ctx context.Context, arg AssignRoleBySlugParams) error
 	CloneTenantRolePermissions(ctx context.Context, tenantID pgtype.UUID) error
 	// Instantiate system role templates into tenant-scoped roles at org creation.
 	CloneTenantRoles(ctx context.Context, tenantID pgtype.UUID) error
+	// Closes the current term; appointments lose their is_current backing.
+	CloseTerm(ctx context.Context, arg CloseTermParams) error
 	// Atomic single-use burn: removes the hash and returns the row in one
 	// statement — concurrent logins can't both consume the same code.
 	ConsumeRecoveryCode(ctx context.Context, arg ConsumeRecoveryCodeParams) (pgtype.UUID, error)
@@ -27,11 +32,13 @@ type Querier interface {
 	CreateMembership(ctx context.Context, arg CreateMembershipParams) (pgtype.UUID, error)
 	CreateOAuthUser(ctx context.Context, arg CreateOAuthUserParams) (pgtype.UUID, error)
 	CreateOrg(ctx context.Context, arg CreateOrgParams) (CreateOrgRow, error)
+	CreatePosition(ctx context.Context, arg CreatePositionParams) (pgtype.UUID, error)
 	CreateSession(ctx context.Context, arg CreateSessionParams) (pgtype.UUID, error)
 	// Ref: oga9-engineering/sections/04-tenancy-organizations.md, 10-organization-core.md
 	// sqlc queries for tenants, organizations, memberships, units, settings,
 	// invitations, branding (Phase 03).
 	CreateTenant(ctx context.Context, arg CreateTenantParams) (pgtype.UUID, error)
+	CreateTerm(ctx context.Context, arg CreateTermParams) (pgtype.UUID, error)
 	CreateUnit(ctx context.Context, arg CreateUnitParams) (pgtype.UUID, error)
 	// Ref: oga9-engineering/sections/02-identity-authentication-sessions.md
 	// sqlc queries for users, sessions, oauth links (Phase 02).
@@ -39,6 +46,10 @@ type Querier interface {
 	// Ref: oga9-engineering/sections/05-domain-events-infrastructure.md
 	// Outbox + audit queries (Phase 02 emission, Phase 05 dispatch).
 	EmitDomainEvent(ctx context.Context, arg EmitDomainEventParams) error
+	EndAppointment(ctx context.Context, arg EndAppointmentParams) (EndAppointmentRow, error)
+	// Ends every open appointment of the term; RETURNING rows feed
+	// AppointmentEnded events + permission-cache invalidation.
+	EndTermAppointments(ctx context.Context, termID pgtype.UUID) ([]EndTermAppointmentsRow, error)
 	GetBranding(ctx context.Context, organizationID pgtype.UUID) (GetBrandingRow, error)
 	GetInvitationByToken(ctx context.Context, token pgtype.UUID) (GetInvitationByTokenRow, error)
 	GetMFASecret(ctx context.Context, id pgtype.UUID) ([]byte, error)
@@ -72,9 +83,20 @@ type Querier interface {
 	ListUnits(ctx context.Context, organizationID pgtype.UUID) ([]ListUnitsRow, error)
 	ListUserOrgs(ctx context.Context, userID pgtype.UUID) ([]ListUserOrgsRow, error)
 	ListUserSessions(ctx context.Context, userID pgtype.UUID) ([]ListUserSessionsRow, error)
+	RemoveCommitteeMember(ctx context.Context, arg RemoveCommitteeMemberParams) (pgtype.UUID, error)
+	// Ref: oga9-engineering/sections/03-rbac-positions.md (Phase 04)
+	// RBAC + positions: permission resolution (group+direct+position+scope union),
+	// positions, terms, officer appointments, committee memberships.
+	// Union: tenant-scoped role grants + position grants via active
+	// appointments in the org's current term. _branch/_committee nodes are
+	// suffixed base nodes — resolved in Go against scoped grants.
+	ResolveOrgPermissions(ctx context.Context, arg ResolveOrgPermissionsParams) ([]string, error)
 	RevokeAllUserSessions(ctx context.Context, userID pgtype.UUID) ([]pgtype.UUID, error)
 	RevokeSessionByID(ctx context.Context, arg RevokeSessionByIDParams) (pgtype.UUID, error)
 	RevokeSessionByJTI(ctx context.Context, jti pgtype.UUID) (pgtype.UUID, error)
+	// Position grants carrying a branch or committee scope — feeds _branch /
+	// _committee suffix resolution.
+	ScopedPositionNodes(ctx context.Context, arg ScopedPositionNodesParams) ([]ScopedPositionNodesRow, error)
 	// Org-scoped: an invitation id alone must not grant cross-org mutation.
 	SetInvitationStatus(ctx context.Context, arg SetInvitationStatusParams) (pgtype.UUID, error)
 	SetJapaconnectUserID(ctx context.Context, arg SetJapaconnectUserIDParams) error
@@ -88,6 +110,7 @@ type Querier interface {
 	UpdateUserPassword(ctx context.Context, arg UpdateUserPasswordParams) error
 	UpsertBranding(ctx context.Context, arg UpsertBrandingParams) error
 	UpsertOrgSetting(ctx context.Context, arg UpsertOrgSettingParams) error
+	UserCommitteeUnits(ctx context.Context, arg UserCommitteeUnitsParams) ([]pgtype.UUID, error)
 	UserRequiresMFA(ctx context.Context, userID pgtype.UUID) (bool, error)
 }
 

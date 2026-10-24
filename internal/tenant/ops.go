@@ -356,6 +356,7 @@ func (s *Service) AcceptInvitation(ctx context.Context, userID uuid.UUID, token 
 			map[string]any{"invitation_id": fromPg(inv.ID), "org_id": orgID, "user_id": userID})
 	})
 	s.InvalidateOrgCtx(ctx, userID, orgID)
+	s.InvalidatePermCache(ctx, userID, orgID) // Rule 6: role grant on accept
 	return orgID, err
 }
 
