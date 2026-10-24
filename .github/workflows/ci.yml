@@ -44,7 +44,7 @@ jobs:
           done
       - name: sqlc generated files in sync
         run: |
-          go install github.com/sqlc-dev/sqlc/cmd/sqlc@v1.29.0
+          go install github.com/sqlc-dev/sqlc/cmd/sqlc@v1.31.1
           sqlc generate
           git diff --exit-code internal/db
       - name: test
