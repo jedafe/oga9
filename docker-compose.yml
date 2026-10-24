@@ -1,0 +1,60 @@
+# Ref: oga9-engineering/sections/01-foundation-tech-stack.md
+# MVP profile: postgres, valkey, mailpit, glitchtip
+# Full profile adds: meilisearch, seaweedfs, imgproxy, livekit (phased)
+services:
+  postgres:
+    image: pgvector/pgvector:pg18
+    environment:
+      POSTGRES_DB: oga9
+      POSTGRES_USER: oga9
+      POSTGRES_PASSWORD: oga9
+    ports: ["5432:5432"]
+    volumes: [pgdata:/var/lib/postgresql/data]
+
+  valkey:
+    image: valkey/valkey:8
+    ports: ["6379:6379"]
+
+  mailpit:
+    image: axllent/mailpit:latest
+    ports: ["1025:1025", "8025:8025"]
+
+  glitchtip:
+    image: glitchtip/glitchtip:latest
+    profiles: ["mvp", "full"]
+    environment:
+      GLITCHTIP_DOMAIN: http://localhost:8000
+      DATABASE_URL: postgres://oga9:oga9@postgres:5432/glitchtip
+      SECRET_KEY: dev-glitchtip-key
+      EMAIL_URL: smtp://mailpit:1025
+      DEFAULT_FROM_EMAIL: glitchtip@oga9.local
+    ports: ["8000:8000"]
+    depends_on: [postgres, mailpit]
+
+  meilisearch:
+    image: getmeili/meilisearch:v1.45
+    profiles: ["full"]
+    environment:
+      MEILI_MASTER_KEY: oga9-master-key
+      MEILI_ENV: development
+    ports: ["7700:7700"]
+
+  seaweedfs:
+    image: chrislusf/seaweedfs:latest
+    profiles: ["full"]
+    command: server -s3 -filer -master.volumeSizeLimitMB=1000
+    ports: ["8333:8333", "23646:23646"]
+
+  imgproxy:
+    image: darthsim/imgproxy:latest
+    profiles: ["full"]
+    ports: ["8099:8080"]
+
+  livekit:
+    image: livekit/livekit-server:latest
+    profiles: ["full"]
+    command: --dev --bind 0.0.0.0
+    ports: ["7880:7880", "7881:7881", "7882:7882/udp"]
+
+volumes:
+  pgdata:

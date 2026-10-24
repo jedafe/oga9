@@ -1,0 +1,16 @@
+# Ref: oga9-engineering/sections/01-foundation-tech-stack.md
+# Generated output -> internal/db/ — never hand-edit (Rule 2)
+version: "2"
+sql:
+  - engine: "postgresql"
+    queries: "db/queries"
+    schema: "db/migrations"
+    gen:
+      go:
+        package: "db"
+        out: "internal/db"
+        sql_package: "pgx/v5"
+        emit_json_tags: true
+        emit_prepared_queries: true
+        emit_interface: true
+        emit_exact_table_names: true
