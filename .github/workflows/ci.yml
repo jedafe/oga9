@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:18-alpine
+        image: pgvector/pgvector:pg18
         env:
           POSTGRES_USER: oga9
           POSTGRES_PASSWORD: oga9
