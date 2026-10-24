@@ -18,7 +18,11 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	valkey "github.com/valkey-io/valkey-go"
 
+	"github.com/jedafe/oga9/internal/auth"
 	"github.com/jedafe/oga9/internal/config"
+	"github.com/jedafe/oga9/internal/handler"
+	"github.com/jedafe/oga9/internal/mailer"
+	"github.com/jedafe/oga9/internal/middleware"
 )
 
 func main() {
@@ -85,10 +89,31 @@ func main() {
 		w.Header().Set("Content-Type", "application/json")
 		w.Write([]byte(`{"status":"ok"}`))
 	})
+	// §02 identity: auth service + handlers
+	mail := mailer.New(cfg.SMTPHost, cfg.SMTPPort)
+	authSvc := auth.NewService(pool, cfg.JWTSecret, 24*time.Hour)
+	authH := handler.NewAuthHandler(authSvc, mail, cfg.JWTSecret)
+
 	r.Route("/api/v1", func(r chi.Router) {
 		r.Get("/", func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			w.Write([]byte(`{"data":{"service":"oga9","version":"0.0.1"}}`))
+		})
+
+		// public auth
+		r.Post("/auth/register", authH.Register)
+		r.Post("/auth/login", authH.Login)
+		r.Post("/auth/verify/{token}", authH.VerifyEmail)
+		r.Post("/auth/password/forgot", authH.ForgotPassword)
+		r.Post("/auth/password/reset", authH.ResetPassword)
+
+		// authed
+		r.Group(func(r chi.Router) {
+			r.Use(middleware.RequireAuth(authSvc, cfg.JWTSecret))
+			r.Post("/auth/logout", authH.Logout)
+			r.Get("/me", authH.Me)
+			r.Get("/me/sessions", authH.Sessions)
+			r.Delete("/me/sessions/{session_id}", authH.RevokeSession)
 		})
 	})
 
