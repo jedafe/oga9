@@ -8,6 +8,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	valkey "github.com/valkey-io/valkey-go"
 )
@@ -101,7 +102,11 @@ func (s *Service) Register(ctx context.Context, email, password, displayName str
 		 RETURNING id, email, display_name, is_verified, status`,
 		email, hash, displayName).Scan(&u.ID, &u.Email, &u.DisplayName, &u.IsVerified, &u.Status)
 	if err != nil {
-		return nil, "", ErrEmailTaken
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			return nil, "", ErrEmailTaken
+		}
+		return nil, "", err   // real DB error → 500, never fake email_taken
 	}
 	verifyToken, _ := SignActionToken(s.jwtSecret, u.ID.String(), "verify_email", 24*time.Hour)
 	return &u, verifyToken, nil
@@ -113,7 +118,8 @@ func (s *Service) Login(ctx context.Context, email, password, deviceLabel, ip, u
 	err = s.pool.QueryRow(ctx,
 		`SELECT id, email, display_name, is_verified, status, password_hash FROM users WHERE email=$1`,
 		email).Scan(&u.ID, &u.Email, &u.DisplayName, &u.IsVerified, &u.Status, &hash)
-	if err != nil { return "", uuid.Nil, ErrBadCredentials }
+	if err == pgx.ErrNoRows { return "", uuid.Nil, ErrBadCredentials }
+	if err != nil { return "", uuid.Nil, err }   // real DB error → 500
 	if u.Status != "active" { return "", uuid.Nil, ErrUserSuspended }
 	if hash == "" || !CheckPassword(hash, password) { return "", uuid.Nil, ErrBadCredentials }
 
