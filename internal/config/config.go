@@ -4,12 +4,13 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"os"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/jedafe/oga9/internal/auth"
-	"strconv"
-	"time"
 )
 
 type Config struct {
@@ -33,6 +34,7 @@ type Config struct {
 	ImgproxyURL    string
 	BaseURL        string
 	MailFrom       string
+	TrustedProxies []*net.IPNet
 }
 
 func Load() (*Config, error) {
@@ -57,6 +59,13 @@ func Load() (*Config, error) {
 		ImgproxyURL:    env("OGA9_IMGPROXY_URL", ""),
 		MailFrom:       env("OGA9_MAIL_FROM", "noreply@oga9.com"),
 		BaseURL:        env("OGA9_BASE_URL", "http://localhost:8080"),
+	}
+	for _, c := range strings.Split(env("OGA9_TRUSTED_PROXIES", ""), ",") {
+		if c = strings.TrimSpace(c); c != "" {
+			if _, n, err := net.ParseCIDR(c); err == nil {
+				cfg.TrustedProxies = append(cfg.TrustedProxies, n)
+			}
+		}
 	}
 	if cfg.JWTSecret == "change-me" && cfg.Env == "production" {
 		return nil, fmt.Errorf("OGA9_JWT_SECRET must be set in production")

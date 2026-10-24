@@ -14,7 +14,9 @@ type Mailer struct {
 }
 
 func New(host string, port int, from string) *Mailer {
-	if from == "" { from = "noreply@localhost" }
+	if from == "" {
+		from = "noreply@localhost"
+	}
 	return &Mailer{host: host, port: port, from: from}
 }
 

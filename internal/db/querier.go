@@ -18,7 +18,9 @@ type Querier interface {
 	CreateUser(ctx context.Context, arg CreateUserParams) (CreateUserRow, error)
 	EmitDomainEvent(ctx context.Context, arg EmitDomainEventParams) error
 	GetMFASecret(ctx context.Context, id pgtype.UUID) (string, error)
+	GetRecoveryCodes(ctx context.Context, id pgtype.UUID) ([]byte, error)
 	GetSessionByJTI(ctx context.Context, jti pgtype.UUID) (GetSessionByJTIRow, error)
+	GetUserAuthState(ctx context.Context, id pgtype.UUID) (GetUserAuthStateRow, error)
 	GetUserByEmail(ctx context.Context, email string) (GetUserByEmailRow, error)
 	GetUserByID(ctx context.Context, id pgtype.UUID) (GetUserByIDRow, error)
 	GetUserByOAuthSubject(ctx context.Context, arg GetUserByOAuthSubjectParams) (pgtype.UUID, error)
@@ -29,6 +31,7 @@ type Querier interface {
 	RevokeSessionByID(ctx context.Context, arg RevokeSessionByIDParams) error
 	RevokeSessionByJTI(ctx context.Context, jti pgtype.UUID) error
 	SetMFASecret(ctx context.Context, arg SetMFASecretParams) error
+	SetRecoveryCodes(ctx context.Context, arg SetRecoveryCodesParams) error
 	SetUserVerified(ctx context.Context, id pgtype.UUID) error
 	UpdateUserPassword(ctx context.Context, arg UpdateUserPasswordParams) error
 }

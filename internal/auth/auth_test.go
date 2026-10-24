@@ -98,9 +98,12 @@ func TestRegisterLoginLogoutFlow(t *testing.T) {
 	ctx := context.Background()
 	email := "it-" + uuid.NewString()[:8] + "@oga9.test"
 
-	u, _, err := s.Register(ctx, email, "password1", "IT User")
+	u, verifyTok, err := s.Register(ctx, email, "password1", "IT User")
 	if err != nil {
 		t.Fatalf("register: %v", err)
+	}
+	if err := s.VerifyEmail(ctx, verifyTok); err != nil {
+		t.Fatalf("verify: %v", err)
 	}
 	if u.Email != email {
 		t.Fatal("email mismatch")
@@ -144,8 +147,11 @@ func TestMFALoginEnforcement(t *testing.T) {
 	s := testSvc(t)
 	ctx := context.Background()
 	email := "mfa-" + uuid.NewString()[:8] + "@oga9.test"
-	u, _, err := s.Register(ctx, email, "password1", "MFA User")
+	u, verifyTok, err := s.Register(ctx, email, "password1", "MFA User")
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.VerifyEmail(ctx, verifyTok); err != nil {
 		t.Fatal(err)
 	}
 
@@ -153,7 +159,7 @@ func TestMFALoginEnforcement(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.SetupMFA(ctx, u.ID, key.Secret()); err != nil {
+	if _, err := s.SetupMFA(ctx, u.ID, key.Secret()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -184,5 +190,57 @@ func TestActionTokenSingleUse(t *testing.T) {
 	}
 	if _, err := s.ConsumeActionToken(ctx, tok, "password_reset"); err == nil {
 		t.Fatal("token reused — single-use not enforced")
+	}
+}
+
+func TestUnverifiedLoginBlocked(t *testing.T) {
+	s := testSvc(t)
+	ctx := context.Background()
+	email := "uv-" + uuid.NewString()[:8] + "@oga9.test"
+	if _, _, err := s.Register(ctx, email, "password1", "UV"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.Login(ctx, email, "password1", "", "", "127.0.0.1", "ua"); err != ErrEmailNotVerified {
+		t.Fatalf("expected email_not_verified, got %v", err)
+	}
+}
+
+func TestMFARecoveryAndDisable(t *testing.T) {
+	s := testSvc(t)
+	ctx := context.Background()
+	email := "rc-" + uuid.NewString()[:8] + "@oga9.test"
+	u, vt, err := s.Register(ctx, email, "password1", "RC")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.VerifyEmail(ctx, vt); err != nil {
+		t.Fatal(err)
+	}
+
+	key, _ := totp.Generate(totp.GenerateOpts{Issuer: "T", AccountName: email})
+	codes, err := s.SetupMFA(ctx, u.ID, key.Secret())
+	if err != nil || len(codes) != 8 {
+		t.Fatalf("setup: %v codes=%d", err, len(codes))
+	}
+
+	// recovery code works at login, once
+	if _, _, err = s.Login(ctx, email, "password1", codes[0], "", "127.0.0.1", "ua"); err != nil {
+		t.Fatalf("recovery login: %v", err)
+	}
+	if _, _, err = s.Login(ctx, email, "password1", codes[0], "", "127.0.0.1", "ua"); err != ErrMFACode {
+		t.Fatalf("recovery reuse should fail, got %v", err)
+	}
+
+	// disable needs password + live code
+	if err := s.DisableMFA(ctx, u.ID, "wrongpw1", "000000"); err != ErrBadCredentials {
+		t.Fatalf("bad password: %v", err)
+	}
+	live, _ := totp.GenerateCode(key.Secret(), time.Now())
+	if err := s.DisableMFA(ctx, u.ID, "password1", live); err != nil {
+		t.Fatalf("disable: %v", err)
+	}
+	// password-only login works again
+	if _, _, err = s.Login(ctx, email, "password1", "", "", "127.0.0.1", "ua"); err != nil {
+		t.Fatalf("post-disable login: %v", err)
 	}
 }

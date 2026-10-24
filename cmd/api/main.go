@@ -24,6 +24,7 @@ import (
 	"github.com/jedafe/oga9/internal/handler"
 	"github.com/jedafe/oga9/internal/mailer"
 	"github.com/jedafe/oga9/internal/middleware"
+	"github.com/jedafe/oga9/internal/tasks"
 )
 
 func main() {
@@ -78,7 +79,6 @@ func main() {
 
 	r := chi.NewRouter()
 	r.Use(chimiddleware.RequestID)
-	r.Use(chimiddleware.RealIP)
 	r.Use(chimiddleware.Recoverer)
 
 	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
@@ -91,11 +91,17 @@ func main() {
 	})
 	// §02 identity: auth service + handlers
 	mail := mailer.New(cfg.SMTPHost, cfg.SMTPPort, cfg.MailFrom)
+	queue := asynq.NewClient(asynq.RedisClientOpt{Addr: cfg.ValkeyAddr})
+	defer queue.Close()
+	for taskType, h := range tasks.Handlers(mail) {
+		mux.HandleFunc(taskType, h)
+	}
 	authSvc := auth.NewService(pool, vk, cfg.JWTSecret, cfg.SessionTTL)
-	authH := handler.NewAuthHandler(authSvc, mail, cfg.JWTSecret)
+	authH := handler.NewAuthHandler(authSvc, queue, cfg.JWTSecret)
 	mfaH := handler.NewMFAHandler(authSvc)
 	oauthH := handler.NewOAuthHandler(authSvc, vk, cfg.OAuthProviders(), cfg.BaseURL)
 
+	r.Use(middleware.ResolveIP(cfg.TrustedProxies))
 	r.Route("/api/v1", func(r chi.Router) {
 		r.Get("/", func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
@@ -106,6 +112,7 @@ func main() {
 		r.With(middleware.RateLimit(vk, "register", 5, time.Minute)).Post("/auth/register", authH.Register)
 		r.With(middleware.RateLimit(vk, "login", 10, time.Minute)).Post("/auth/login", authH.Login)
 		r.Post("/auth/verify/{token}", authH.VerifyEmail)
+		r.With(middleware.RateLimit(vk, "resend", 3, time.Minute)).Post("/auth/verify/resend", authH.ResendVerification)
 		r.With(middleware.RateLimit(vk, "forgot", 3, time.Minute)).Post("/auth/password/forgot", authH.ForgotPassword)
 		r.With(middleware.RateLimit(vk, "reset", 5, time.Minute)).Post("/auth/password/reset", authH.ResetPassword)
 		r.With(middleware.RateLimit(vk, "oauth", 20, time.Minute)).Get("/auth/oauth/{provider}/start", oauthH.Start)
@@ -120,6 +127,7 @@ func main() {
 			r.Delete("/me/sessions/{session_id}", authH.RevokeSession)
 			r.Post("/auth/mfa/setup", mfaH.Setup)
 			r.Post("/auth/mfa/confirm", mfaH.Confirm)
+			r.Post("/auth/mfa/disable", mfaH.Disable)
 		})
 	})
 

@@ -1,8 +1,11 @@
 // Ref: oga9-engineering/sections/02-identity-authentication-sessions.md
-// TOTP MFA — setup generates secret + otpauth URL, confirm validates code.
+// TOTP MFA lifecycle — setup stages a server-side secret (never trust the
+// client), confirm validates + issues recovery codes, disable needs password
+// + a live code so a hijacked session can't strip MFA.
 package handler
 
 import (
+	"errors"
 	"net/http"
 
 	"github.com/jedafe/oga9/internal/auth"
@@ -30,6 +33,10 @@ func (h *MFAHandler) Setup(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, "internal_error", "totp generation failed")
 		return
 	}
+	if err := h.svc.StageMFASecret(r.Context(), userID, key.Secret()); err != nil {
+		writeErr(w, 500, "internal_error", "mfa staging failed")
+		return
+	}
 	writeData(w, 200, map[string]any{
 		"secret": key.Secret(), "otpauth_url": key.URL(),
 		"note": "confirm with POST /auth/mfa/confirm + code to activate",
@@ -37,23 +44,62 @@ func (h *MFAHandler) Setup(w http.ResponseWriter, r *http.Request) {
 }
 
 type mfaConfirmReq struct {
-	Secret string `json:"secret"`
-	Code   string `json:"code"`
+	Code string `json:"code"`
 }
 
 func (h *MFAHandler) Confirm(w http.ResponseWriter, r *http.Request) {
 	var req mfaConfirmReq
-	if err := decode(w, r, &req); err != nil || req.Secret == "" || req.Code == "" {
-		writeErr(w, 400, "validation_failed", "secret and code required")
+	userID := middleware.UserID(r.Context())
+	if err := decode(w, r, &req); err != nil || req.Code == "" {
+		writeErr(w, 400, "validation_failed", "code required")
 		return
 	}
-	if !totp.Validate(req.Code, req.Secret) {
+	secret, err := h.svc.PendingMFASecret(r.Context(), userID)
+	if err != nil || secret == "" {
+		writeErr(w, 400, "mfa_not_staged", "call mfa/setup first")
+		return
+	}
+	if !totp.Validate(req.Code, secret) {
 		writeErr(w, 400, "invalid_code", "TOTP code invalid")
 		return
 	}
-	if err := h.svc.SetupMFA(r.Context(), middleware.UserID(r.Context()), req.Secret); err != nil {
+	codes, err := h.svc.SetupMFA(r.Context(), userID, secret)
+	if err != nil {
 		writeErr(w, 500, "internal_error", "mfa save failed")
 		return
 	}
-	writeData(w, 200, map[string]any{"mfa_enabled": true})
+	h.svc.ClearPendingMFA(r.Context(), userID)
+	// recovery codes are returned ONCE — store them offline.
+	writeData(w, 200, map[string]any{"mfa_enabled": true, "recovery_codes": codes})
+}
+
+type mfaDisableReq struct {
+	Password string `json:"password"`
+	Code     string `json:"code"`
+}
+
+func (h *MFAHandler) Disable(w http.ResponseWriter, r *http.Request) {
+	var req mfaDisableReq
+	if err := decode(w, r, &req); err != nil || req.Password == "" || req.Code == "" {
+		writeErr(w, 400, "validation_failed", "password and code required")
+		return
+	}
+	err := h.svc.DisableMFA(r.Context(), middleware.UserID(r.Context()), req.Password, req.Code)
+	if errors.Is(err, auth.ErrBadCredentials) {
+		writeErr(w, 401, "invalid_credentials", "password incorrect")
+		return
+	}
+	if errors.Is(err, auth.ErrMFACode) {
+		writeErr(w, 401, "invalid_mfa_code", "code incorrect")
+		return
+	}
+	if errors.Is(err, auth.ErrMFANotEnabled) {
+		writeErr(w, 409, "mfa_not_enabled", "mfa not enabled")
+		return
+	}
+	if err != nil {
+		writeErr(w, 500, "internal_error", "disable failed")
+		return
+	}
+	writeData(w, 200, map[string]any{"mfa_enabled": false})
 }

@@ -5,6 +5,8 @@ package auth
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net/mail"
@@ -23,15 +25,17 @@ import (
 )
 
 var (
-	ErrEmailTaken     = errors.New("email_taken")
-	ErrBadCredentials = errors.New("invalid_credentials")
-	ErrUserSuspended  = errors.New("user_suspended")
-	ErrSessionRevoked = errors.New("session_revoked")
-	ErrWeakPassword   = errors.New("weak_password")
-	ErrMFARequired    = errors.New("mfa_required")
-	ErrMFACode        = errors.New("invalid_mfa_code")
-	ErrUserNotFound   = errors.New("user_not_found")
-	ErrInvalidEmail   = errors.New("invalid_email")
+	ErrEmailTaken       = errors.New("email_taken")
+	ErrBadCredentials   = errors.New("invalid_credentials")
+	ErrUserSuspended    = errors.New("user_suspended")
+	ErrSessionRevoked   = errors.New("session_revoked")
+	ErrWeakPassword     = errors.New("weak_password")
+	ErrMFARequired      = errors.New("mfa_required")
+	ErrMFACode          = errors.New("invalid_mfa_code")
+	ErrUserNotFound     = errors.New("user_not_found")
+	ErrInvalidEmail     = errors.New("invalid_email")
+	ErrEmailNotVerified = errors.New("email_not_verified")
+	ErrMFANotEnabled    = errors.New("mfa_not_enabled")
 )
 
 type User struct {
@@ -158,13 +162,20 @@ func (s *Service) Login(ctx context.Context, email, password, mfaCode, deviceLab
 	if !row.PasswordHash.Valid || !CheckPassword(row.PasswordHash.String, password) {
 		return "", uuid.Nil, ErrBadCredentials
 	}
+	// §02 flow: register → verify → login. Unverified accounts get no session.
+	if !row.IsVerified {
+		return "", uuid.Nil, ErrEmailNotVerified
+	}
 	// §02: MFA-enabled accounts must present a valid TOTP code at login.
 	if row.MfaSecret != "" {
 		if mfaCode == "" {
 			return "", uuid.Nil, ErrMFARequired
 		}
 		if !totp.Validate(mfaCode, row.MfaSecret) {
-			return "", uuid.Nil, ErrMFACode
+			// fall back to one-time recovery code (consumed on use)
+			if ok, err := s.ConsumeRecoveryCode(ctx, fromPg(row.ID), mfaCode); err != nil || !ok {
+				return "", uuid.Nil, ErrMFACode
+			}
 		}
 	}
 	uid := fromPg(row.ID)
@@ -315,9 +326,76 @@ func (s *Service) ClearPendingMFA(ctx context.Context, userID uuid.UUID) {
 	_ = s.vk.Do(ctx, s.vk.B().Del().Key("oga9:mfa:pending:"+userID.String()).Build())
 }
 
-// SetupMFA writes the confirmed secret to the user row.
-func (s *Service) SetupMFA(ctx context.Context, userID uuid.UUID, secret string) error {
-	return s.q.SetMFASecret(ctx, db.SetMFASecretParams{MfaSecret: []byte(secret), ID: toPg(userID)})
+// SetupMFA writes the confirmed secret + issues one-time recovery codes
+// (sha256(code+userID) hashes only — the plaintext is returned once, never stored).
+func (s *Service) SetupMFA(ctx context.Context, userID uuid.UUID, secret string) (codes []string, err error) {
+	codes = make([]string, 8)
+	hashes := make([]string, 8)
+	for i := range codes {
+		codes[i] = uuid.NewString()[:13] // e.g. "a1b2c3d4-e5f6-"
+		hashes[i] = recoveryHash(codes[i], userID)
+	}
+	b, _ := json.Marshal(hashes)
+	err = s.withTx(ctx, func(q *db.Queries) error {
+		if e := q.SetMFASecret(ctx, db.SetMFASecretParams{MfaSecret: []byte(secret), ID: toPg(userID)}); e != nil {
+			return e
+		}
+		return q.SetRecoveryCodes(ctx, db.SetRecoveryCodesParams{MfaRecoveryCodes: b, ID: toPg(userID)})
+	})
+	return codes, err
+}
+
+func recoveryHash(code string, userID uuid.UUID) string {
+	h := sha256.Sum256([]byte(code + ":" + userID.String()))
+	return hex.EncodeToString(h[:])
+}
+
+// ConsumeRecoveryCode burns a matching one-time code. Returns false if no match.
+func (s *Service) ConsumeRecoveryCode(ctx context.Context, userID uuid.UUID, code string) (bool, error) {
+	raw, err := s.q.GetRecoveryCodes(ctx, toPg(userID))
+	if err != nil {
+		return false, err
+	}
+	var codes []string
+	_ = json.Unmarshal(raw, &codes)
+	target := recoveryHash(code, userID)
+	out := codes[:0]
+	matched := false
+	for _, c := range codes {
+		if c == target {
+			matched = true
+			continue
+		}
+		out = append(out, c)
+	}
+	if !matched {
+		return false, nil
+	}
+	b, _ := json.Marshal(out)
+	return true, s.q.SetRecoveryCodes(ctx, db.SetRecoveryCodesParams{MfaRecoveryCodes: b, ID: toPg(userID)})
+}
+
+// DisableMFA requires the account password + a live TOTP or recovery code.
+func (s *Service) DisableMFA(ctx context.Context, userID uuid.UUID, password, code string) error {
+	row, err := s.q.GetUserAuthState(ctx, toPg(userID))
+	if err != nil {
+		return err
+	}
+	if row.MfaSecret == "" {
+		return ErrMFANotEnabled
+	}
+	if !row.PasswordHash.Valid || !CheckPassword(row.PasswordHash.String, password) {
+		return ErrBadCredentials
+	}
+	if !totp.Validate(code, row.MfaSecret) {
+		if ok, e := s.ConsumeRecoveryCode(ctx, userID, code); e != nil || !ok {
+			return ErrMFACode
+		}
+	}
+	return s.withTx(ctx, func(q *db.Queries) error {
+		emit(ctx, q, "SessionRevoked", "user", userID, userID, map[string]any{"reason": "mfa_disabled"})
+		return q.SetMFASecret(ctx, db.SetMFASecretParams{MfaSecret: nil, ID: toPg(userID)})
+	})
 }
 
 func (s *Service) MFASecret(ctx context.Context, userID uuid.UUID) (string, error) {

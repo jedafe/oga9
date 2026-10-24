@@ -2,27 +2,37 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
-	"net"
 	"net/http"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+	"github.com/hibiken/asynq"
 	"github.com/jedafe/oga9/internal/auth"
-	"github.com/jedafe/oga9/internal/mailer"
 	"github.com/jedafe/oga9/internal/middleware"
+	"github.com/jedafe/oga9/internal/tasks"
 )
 
 type AuthHandler struct {
 	svc    *auth.Service
-	mailer *mailer.Mailer
+	queue  *asynq.Client
 	secret string
 }
 
-func NewAuthHandler(svc *auth.Service, m *mailer.Mailer, secret string) *AuthHandler {
-	return &AuthHandler{svc: svc, mailer: m, secret: secret}
+func NewAuthHandler(svc *auth.Service, q *asynq.Client, secret string) *AuthHandler {
+	return &AuthHandler{svc: svc, queue: q, secret: secret}
+}
+
+// enqueueMail is fire-and-forget (Rule 8): queue the mail task, never block.
+func (h *AuthHandler) enqueueMail(ctx context.Context, taskType, to, subject, body string) {
+	t, err := tasks.NewEmailTask(taskType, tasks.SendEmailPayload{To: to, Subject: subject, Body: body})
+	if err != nil {
+		return
+	}
+	_, _ = h.queue.EnqueueContext(ctx, t)
 }
 
 func writeData(w http.ResponseWriter, status int, data any) {
@@ -67,8 +77,8 @@ func (h *AuthHandler) Register(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, "internal_error", "registration failed")
 		return
 	}
-	h.mailer.Send(u.Email, "Verify your OGA9 account",
-		"Verify: "+verifyToken) // TODO(§02): branded template + link
+	h.enqueueMail(r.Context(), tasks.TypeSendVerification, u.Email,
+		"Verify your OGA9 account", "Verify: "+verifyToken)
 	writeData(w, 201, map[string]any{"user_id": u.ID, "email": u.Email, "display_name": u.DisplayName})
 }
 
@@ -85,7 +95,7 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "validation_failed", "email+password required")
 		return
 	}
-	ip, _, _ := net.SplitHostPort(r.RemoteAddr)
+	ip := middleware.ClientIPFrom(r.Context())
 	token, sessionID, err := h.svc.Login(r.Context(), req.Email, req.Password, req.MFACode, req.DeviceLabel, ip, r.UserAgent())
 	if errors.Is(err, auth.ErrBadCredentials) {
 		writeErr(w, 401, "invalid_credentials", "email or password incorrect")
@@ -146,7 +156,8 @@ func (h *AuthHandler) ForgotPassword(w http.ResponseWriter, r *http.Request) {
 	uid, _ := h.svc.UserIDByEmail(r.Context(), req.Email)
 	if uid != "" {
 		token, _ := auth.SignActionToken(h.secret, uid, "password_reset", time.Hour)
-		h.mailer.Send(req.Email, "OGA9 password reset", "Reset: "+token)
+		h.enqueueMail(r.Context(), tasks.TypeSendPasswordReset, req.Email,
+			"OGA9 password reset", "Reset: "+token)
 	}
 	writeData(w, 200, map[string]any{"sent": true})
 }
@@ -181,7 +192,9 @@ func (h *AuthHandler) Me(w http.ResponseWriter, r *http.Request) {
 func (h *AuthHandler) Sessions(w http.ResponseWriter, r *http.Request) {
 	sessions, err := h.svc.ListSessions(r.Context(), middleware.UserID(r.Context()))
 	jti := middleware.SessionJTI(r.Context())
-	for i := range sessions { sessions[i].Current = sessions[i].JTI == jti }
+	for i := range sessions {
+		sessions[i].Current = sessions[i].JTI == jti
+	}
 	if err != nil {
 		writeErr(w, 500, "internal_error", "could not list sessions")
 		return
@@ -200,4 +213,22 @@ func (h *AuthHandler) RevokeSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeData(w, 200, map[string]any{"revoked": true})
+}
+
+// ResendVerification re-sends the verify email for unverified accounts.
+// Always 200 — don't leak account existence (same contract as forgot).
+func (h *AuthHandler) ResendVerification(w http.ResponseWriter, r *http.Request) {
+	var req forgotReq
+	if err := decode(w, r, &req); err != nil || req.Email == "" {
+		writeErr(w, 400, "validation_failed", "email required")
+		return
+	}
+	if uid, _ := h.svc.UserIDByEmail(r.Context(), req.Email); uid != "" {
+		if u, _ := h.svc.GetUser(r.Context(), uuid.MustParse(uid)); u != nil && !u.IsVerified {
+			token, _ := auth.SignActionToken(h.secret, uid, "verify_email", 24*time.Hour)
+			h.enqueueMail(r.Context(), tasks.TypeSendVerification, u.Email,
+				"Verify your OGA9 account", "Verify: "+token)
+		}
+	}
+	writeData(w, 200, map[string]any{"sent": true})
 }

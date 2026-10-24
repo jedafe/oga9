@@ -128,6 +128,17 @@ func (q *Queries) GetMFASecret(ctx context.Context, id pgtype.UUID) (string, err
 	return mfa_secret, err
 }
 
+const getRecoveryCodes = `-- name: GetRecoveryCodes :one
+SELECT mfa_recovery_codes FROM users WHERE id = $1
+`
+
+func (q *Queries) GetRecoveryCodes(ctx context.Context, id pgtype.UUID) ([]byte, error) {
+	row := q.db.QueryRow(ctx, getRecoveryCodes, id)
+	var mfa_recovery_codes []byte
+	err := row.Scan(&mfa_recovery_codes)
+	return mfa_recovery_codes, err
+}
+
 const getSessionByJTI = `-- name: GetSessionByJTI :one
 SELECT id, user_id, revoked_at, expires_at FROM user_sessions WHERE jti = $1
 `
@@ -147,6 +158,33 @@ func (q *Queries) GetSessionByJTI(ctx context.Context, jti pgtype.UUID) (GetSess
 		&i.UserID,
 		&i.RevokedAt,
 		&i.ExpiresAt,
+	)
+	return i, err
+}
+
+const getUserAuthState = `-- name: GetUserAuthState :one
+SELECT id, password_hash, convert_from(mfa_secret, 'UTF8')::text AS mfa_secret,
+       status, is_verified
+FROM users WHERE id = $1
+`
+
+type GetUserAuthStateRow struct {
+	ID           pgtype.UUID `json:"id"`
+	PasswordHash pgtype.Text `json:"password_hash"`
+	MfaSecret    string      `json:"mfa_secret"`
+	Status       string      `json:"status"`
+	IsVerified   bool        `json:"is_verified"`
+}
+
+func (q *Queries) GetUserAuthState(ctx context.Context, id pgtype.UUID) (GetUserAuthStateRow, error) {
+	row := q.db.QueryRow(ctx, getUserAuthState, id)
+	var i GetUserAuthStateRow
+	err := row.Scan(
+		&i.ID,
+		&i.PasswordHash,
+		&i.MfaSecret,
+		&i.Status,
+		&i.IsVerified,
 	)
 	return i, err
 }
@@ -341,6 +379,20 @@ type SetMFASecretParams struct {
 
 func (q *Queries) SetMFASecret(ctx context.Context, arg SetMFASecretParams) error {
 	_, err := q.db.Exec(ctx, setMFASecret, arg.MfaSecret, arg.ID)
+	return err
+}
+
+const setRecoveryCodes = `-- name: SetRecoveryCodes :exec
+UPDATE users SET mfa_recovery_codes = $2 WHERE id = $1
+`
+
+type SetRecoveryCodesParams struct {
+	ID               pgtype.UUID `json:"id"`
+	MfaRecoveryCodes []byte      `json:"mfa_recovery_codes"`
+}
+
+func (q *Queries) SetRecoveryCodes(ctx context.Context, arg SetRecoveryCodesParams) error {
+	_, err := q.db.Exec(ctx, setRecoveryCodes, arg.ID, arg.MfaRecoveryCodes)
 	return err
 }
 

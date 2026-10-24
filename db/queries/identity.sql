@@ -70,3 +70,14 @@ SELECT user_id FROM oauth_providers WHERE provider = $1 AND provider_subject = $
 -- name: EmitDomainEvent :exec
 INSERT INTO domain_events (name, aggregate_type, aggregate_id, payload)
 VALUES ($1, $2, $3, $4);
+
+-- name: GetRecoveryCodes :one
+SELECT mfa_recovery_codes FROM users WHERE id = $1;
+
+-- name: SetRecoveryCodes :exec
+UPDATE users SET mfa_recovery_codes = $2 WHERE id = $1;
+
+-- name: GetUserAuthState :one
+SELECT id, password_hash, convert_from(mfa_secret, 'UTF8')::text AS mfa_secret,
+       status, is_verified
+FROM users WHERE id = $1;

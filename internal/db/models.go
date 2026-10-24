@@ -130,4 +130,5 @@ type Users struct {
 	Status            string             `json:"status"`
 	CreatedAt         pgtype.Timestamptz `json:"created_at"`
 	DeletedAt         pgtype.Timestamptz `json:"deleted_at"`
+	MfaRecoveryCodes  []byte             `json:"mfa_recovery_codes"`
 }
