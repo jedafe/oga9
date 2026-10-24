@@ -16,8 +16,14 @@ type Querier interface {
 	CloneTenantRolePermissions(ctx context.Context, tenantID pgtype.UUID) error
 	// Instantiate system role templates into tenant-scoped roles at org creation.
 	CloneTenantRoles(ctx context.Context, tenantID pgtype.UUID) error
+	// Atomic single-use burn: removes the hash and returns the row in one
+	// statement — concurrent logins can't both consume the same code.
+	ConsumeRecoveryCode(ctx context.Context, arg ConsumeRecoveryCodeParams) (pgtype.UUID, error)
 	CountTenantOrgs(ctx context.Context, tenantID pgtype.UUID) (int64, error)
+	CreateCustomField(ctx context.Context, arg CreateCustomFieldParams) error
+	CreateCustomFieldGroup(ctx context.Context, arg CreateCustomFieldGroupParams) (pgtype.UUID, error)
 	CreateInvitation(ctx context.Context, arg CreateInvitationParams) (CreateInvitationRow, error)
+	// joined_at marks actual joining — 'applied' states haven't joined yet (ADR-014).
 	CreateMembership(ctx context.Context, arg CreateMembershipParams) (pgtype.UUID, error)
 	CreateOAuthUser(ctx context.Context, arg CreateOAuthUserParams) (pgtype.UUID, error)
 	CreateOrg(ctx context.Context, arg CreateOrgParams) (CreateOrgRow, error)
@@ -46,6 +52,7 @@ type Querier interface {
 	// Platform-level settings (Rule 3: hot-reloadable via GetSetting).
 	GetSystemSetting(ctx context.Context, key string) ([]byte, error)
 	GetTemplate(ctx context.Context, slug string) ([]byte, error)
+	GetTenant(ctx context.Context, id pgtype.UUID) (GetTenantRow, error)
 	GetUnit(ctx context.Context, id pgtype.UUID) (GetUnitRow, error)
 	GetUserAuthState(ctx context.Context, id pgtype.UUID) (GetUserAuthStateRow, error)
 	GetUserByEmail(ctx context.Context, email string) (GetUserByEmailRow, error)
@@ -55,6 +62,9 @@ type Querier interface {
 	HasPermission(ctx context.Context, arg HasPermissionParams) (bool, error)
 	InsertAuditEvent(ctx context.Context, arg InsertAuditEventParams) error
 	LinkOAuthProvider(ctx context.Context, arg LinkOAuthProviderParams) error
+	// Tenants where the caller holds the org_admin role — the server-side
+	// "my tenant" resolution for POST /orgs (Rule 24).
+	ListOrgAdminTenants(ctx context.Context, userID pgtype.UUID) ([]pgtype.UUID, error)
 	ListOrgSettings(ctx context.Context, organizationID pgtype.UUID) ([]ListOrgSettingsRow, error)
 	ListPendingInvitations(ctx context.Context, organizationID pgtype.UUID) ([]ListPendingInvitationsRow, error)
 	ListPublicOrgs(ctx context.Context) ([]ListPublicOrgsRow, error)
@@ -62,10 +72,11 @@ type Querier interface {
 	ListUnits(ctx context.Context, organizationID pgtype.UUID) ([]ListUnitsRow, error)
 	ListUserOrgs(ctx context.Context, userID pgtype.UUID) ([]ListUserOrgsRow, error)
 	ListUserSessions(ctx context.Context, userID pgtype.UUID) ([]ListUserSessionsRow, error)
-	RevokeAllUserSessions(ctx context.Context, userID pgtype.UUID) error
+	RevokeAllUserSessions(ctx context.Context, userID pgtype.UUID) ([]pgtype.UUID, error)
 	RevokeSessionByID(ctx context.Context, arg RevokeSessionByIDParams) (pgtype.UUID, error)
-	RevokeSessionByJTI(ctx context.Context, jti pgtype.UUID) error
-	SetInvitationStatus(ctx context.Context, arg SetInvitationStatusParams) error
+	RevokeSessionByJTI(ctx context.Context, jti pgtype.UUID) (pgtype.UUID, error)
+	// Org-scoped: an invitation id alone must not grant cross-org mutation.
+	SetInvitationStatus(ctx context.Context, arg SetInvitationStatusParams) (pgtype.UUID, error)
 	SetJapaconnectUserID(ctx context.Context, arg SetJapaconnectUserIDParams) error
 	SetMFASecret(ctx context.Context, arg SetMFASecretParams) error
 	SetRecoveryCodes(ctx context.Context, arg SetRecoveryCodesParams) error

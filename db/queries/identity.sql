@@ -52,16 +52,18 @@ FROM user_sessions
 WHERE user_id = $1 AND revoked_at IS NULL AND expires_at > now()
 ORDER BY created_at DESC;
 
--- name: RevokeSessionByJTI :exec
-UPDATE user_sessions SET revoked_at = now() WHERE jti = $1 AND revoked_at IS NULL;
+-- name: RevokeSessionByJTI :one
+UPDATE user_sessions SET revoked_at = now() WHERE jti = $1 AND revoked_at IS NULL
+RETURNING id;
 
 -- name: RevokeSessionByID :one
 UPDATE user_sessions SET revoked_at = now()
 WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL
-RETURNING id;
+RETURNING jti;
 
--- name: RevokeAllUserSessions :exec
-UPDATE user_sessions SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL;
+-- name: RevokeAllUserSessions :many
+UPDATE user_sessions SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL
+RETURNING jti;
 
 -- name: LinkOAuthProvider :exec
 INSERT INTO oauth_providers (user_id, provider, provider_subject)
@@ -79,6 +81,19 @@ SELECT mfa_recovery_codes FROM users WHERE id = $1;
 
 -- name: SetRecoveryCodes :exec
 UPDATE users SET mfa_recovery_codes = $2 WHERE id = $1;
+
+-- name: ConsumeRecoveryCode :one
+-- Atomic single-use burn: removes the hash and returns the row in one
+-- statement — concurrent logins can't both consume the same code.
+UPDATE users SET mfa_recovery_codes =
+  COALESCE(
+    (SELECT jsonb_agg(e) FROM jsonb_array_elements_text(mfa_recovery_codes) e
+     WHERE e <> sqlc.arg(hash)::text),
+    '[]'::jsonb)
+WHERE id = sqlc.arg(id)::uuid
+  AND EXISTS (SELECT 1 FROM jsonb_array_elements_text(mfa_recovery_codes) x
+              WHERE x = sqlc.arg(hash)::text)
+RETURNING id;
 
 -- name: GetUserAuthState :one
 SELECT id, password_hash, mfa_secret, status, is_verified

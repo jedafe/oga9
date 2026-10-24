@@ -279,10 +279,10 @@ func TestActionTokenSingleUse(t *testing.T) {
 	s := testSvc(t)
 	ctx := context.Background()
 	tok, _ := SignActionToken("test-secret", "uid-x", "password_reset", time.Hour)
-	if _, err := s.ConsumeActionToken(ctx, tok, "password_reset"); err != nil {
+	if _, _, err := s.ConsumeActionToken(ctx, tok, "password_reset"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.ConsumeActionToken(ctx, tok, "password_reset"); err == nil {
+	if _, _, err := s.ConsumeActionToken(ctx, tok, "password_reset"); err == nil {
 		t.Fatal("token reused — single-use not enforced")
 	}
 }
@@ -350,7 +350,7 @@ func TestEmitAbortsTxOnFailure(t *testing.T) {
 		if e := q.SetUserVerified(ctx, toPg(uuid.New())); e != nil {
 			return e
 		}
-		return emit(ctx, q, "UserRegistered", "user", uuid.New(), uuid.New(),
+		return emit(ctx, q, "UserRegistered", "user", uuid.New(), uuid.New(), false,
 			map[string]any{"bad": func() {}})
 	})
 	if err == nil {

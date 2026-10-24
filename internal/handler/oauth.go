@@ -3,13 +3,18 @@
 package handler
 
 import (
+	"context"
 	"errors"
+	"log"
 	"net/http"
+	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/hibiken/asynq"
 	"github.com/jedafe/oga9/internal/auth"
 	"github.com/jedafe/oga9/internal/httpx"
 	"github.com/jedafe/oga9/internal/middleware"
+	"github.com/jedafe/oga9/internal/tasks"
 	valkey "github.com/valkey-io/valkey-go"
 )
 
@@ -18,10 +23,12 @@ type OAuthHandler struct {
 	vk        valkey.Client
 	providers map[string]auth.ProviderConfig
 	baseURL   string
+	queue     *asynq.Client
+	secret    string
 }
 
-func NewOAuthHandler(svc *auth.Service, vk valkey.Client, providers map[string]auth.ProviderConfig, baseURL string) *OAuthHandler {
-	return &OAuthHandler{svc: svc, vk: vk, providers: providers, baseURL: baseURL}
+func NewOAuthHandler(svc *auth.Service, vk valkey.Client, providers map[string]auth.ProviderConfig, baseURL string, queue *asynq.Client, secret string) *OAuthHandler {
+	return &OAuthHandler{svc: svc, vk: vk, providers: providers, baseURL: baseURL, queue: queue, secret: secret}
 }
 
 func (h *OAuthHandler) provider(w http.ResponseWriter, r *http.Request) (auth.ProviderConfig, string, bool) {
@@ -77,7 +84,24 @@ func (h *OAuthHandler) Callback(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(err, auth.ErrUserSuspended):
 			httpx.WriteErr(w, 403, "user_suspended", "account suspended")
 		case errors.Is(err, auth.ErrEmailNotVerified):
-			httpx.WriteErr(w, 403, "email_not_verified", "verify your email before logging in")
+			// Provider didn't verify the address — send the standard
+			// verification link so the account isn't stranded.
+			if res != nil && res.Email != "" {
+				if uid, _ := h.svc.UserIDByEmail(r.Context(), res.Email); uid != "" {
+					token, _ := auth.SignActionToken(h.secret, uid, "verify_email", 24*time.Hour)
+					t, terr := tasks.NewEmailTask(tasks.TypeSendVerification,
+						tasks.SendEmailPayload{To: res.Email, Subject: "Verify your OGA9 account",
+							Body: "Verify your account: " + h.baseURL + "/api/v1/auth/verify/" + token})
+					if terr == nil {
+						if _, err := h.queue.EnqueueContext(context.WithoutCancel(r.Context()), t); err != nil {
+							log.Printf("mail enqueue failed (%s → %s): %v", tasks.TypeSendVerification, res.Email, err)
+						}
+					}
+				}
+			}
+			httpx.WriteErr(w, 403, "email_not_verified", "verify your email — a verification link was sent")
+		case errors.Is(err, auth.ErrOAuthNoEmail):
+			httpx.WriteErr(w, 400, "oauth_email_missing", "provider returned no email address")
 		default:
 			httpx.WriteErr(w, 401, "oauth_failed", "provider authentication failed")
 		}

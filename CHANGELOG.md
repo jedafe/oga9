@@ -93,3 +93,53 @@ entries reference engineering phases in `.oos/roadmaps/ROADMAP-BACKEND.md`.
 - `.env.example` missing half the vars config reads → complete
 - compose services lacked profiles → `mvp`/`full` on postgres/valkey/mailpit
 - `/health` ignored Valkey → pings both dependencies
+- `createOrgReq`/`inviteReq` missing json tags → snake_case keys never
+  unmarshalled; `POST /orgs` was unreachable (tagged now)
+- `plan_capabilities` under-seeded → paid plans lacked the cumulative
+  starter+ capabilities; reseeding migration 000009 (all plans get
+  org_core/members/events_meetings/comms_documents)
+- Invitation revoke unscoped → cross-org mutation by id; `SetInvitationStatus`
+  now requires `organization_id`, returns row only on pending→status flip,
+  and `InvitationRevoked` emits only on real revokes (404 otherwise)
+- `domain_events` drifted from §05 → migration 000045 adds `organization_id`
+  (+ payload backfill) and `sourced`, renames `name`→`event_type`,
+  `published_at`→`dispatched_at`; emitters now pass sourced flags and
+  documented payload keys per the domain-events catalog
+- Accepting an invite for an existing member → 500 on unique violation →
+  idempotent accept (consumes invite, keeps membership); concurrent accepts
+  guarded by pending-status flip
+- Org settings whitelist drifted from catalog → synced all keys + pattern
+  keys (`org.welfare.cap.{kind}_minor`, `org.welfare.once_per.{kind}_days`)
+- OAuth accounts with provider-unverified email stranded → still provisioned
+  + linked, verification link sent via `identity:send_verification`;
+  providers returning no email rejected (`oauth_email_missing`)
+- JWT sub vs session user unchecked → `resolveSessionToken` asserts
+  `sub == session.user_id`
+- `SessionRevoked` emitted on already-revoked logouts → emits only on
+  actual revoke
+- Verify/reset token burn outlived tx rollback → burn released on tx failure
+- Recovery-code consume raced (read-modify-write) → atomic single UPDATE
+  (`ConsumeRecoveryCode` query)
+- `joined_at` set on `applied` memberships → NULL until `active`
+- `member_no_hint`/request fields silently dropped → tagged
+- Mail enqueue failures silent → logged; mail bodies now carry real
+  `OGA9_BASE_URL` links; SMTP auth via `OGA9_SMTP_USERNAME/PASSWORD`
+- mfa gate nonce reusable after `mfa/confirm` → consumed on enrollment
+- `billing_email` stored `Name <a@b>` verbatim → normalized to `addr.Address`
+- custom_field_groups/fields/values missing → migrations 000062–64;
+  template `seed.field_groups` instantiate at org create (source='template')
+- Template `units`/`positions`/`committees`/`contribution_types` never
+  instantiated → units loop removed (labels ≠ units); deferred parts listed
+  in `TemplateInstantiated` payload for module-phase consumers
+- compose missing `api` service (roadmap 00.05) → added to `mvp`/`full`
+- `make lint` swallowed gofmt failures → fails build like CI
+- §02 session denylist unimplemented → `oga9:auth:deny:{jti}` (catalogued)
+  checked in `ResolveSession` before the row lookup; set on logout,
+  per-session revoke, and password-reset mass revoke
+  (`RevokeSessionByID`/`RevokeAllUserSessions` now RETURN jti)
+- `POST /orgs` provisioned a throwaway tenant per org → now attaches to the
+  caller's administered tenant (server-side via `org_admin` role, Rule 24);
+  first org provisions the tenant (billing_email required only then);
+  optional `tenant_id` verified against admin rights (`no_administered_tenant`
+  403), ambiguous multi-tenant callers get `tenant_required` 400;
+  `limit.organizations` intentionally unenforced until Phase 07 entitlements

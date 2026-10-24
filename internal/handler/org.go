@@ -29,6 +29,10 @@ func orgErr(w http.ResponseWriter, err error) {
 		httpx.WriteErr(w, 409, "slug_taken", "org slug already in use for this tenant")
 	case errors.Is(err, tenant.ErrLimitExceeded):
 		httpx.WriteErr(w, 402, "limit_exceeded", "organization limit reached for this plan")
+	case errors.Is(err, tenant.ErrTenantRequired):
+		httpx.WriteErr(w, 400, "tenant_required", "you administer multiple tenants — send tenant_id")
+	case errors.Is(err, tenant.ErrNoTenant):
+		httpx.WriteErr(w, 403, "forbidden", "no admin rights on the requested tenant")
 	case errors.Is(err, tenant.ErrUnitNotFound):
 		httpx.WriteErr(w, 404, "unit_not_found", "unit not found")
 	case errors.Is(err, tenant.ErrUnitDependents):
@@ -43,6 +47,10 @@ func orgErr(w http.ResponseWriter, err error) {
 		httpx.WriteErr(w, 400, "validation_failed", "value must be valid json")
 	case errors.Is(err, tenant.ErrInviteNoContact):
 		httpx.WriteErr(w, 400, "validation_failed", "email or phone required")
+	case errors.Is(err, tenant.ErrInviteNotFound):
+		httpx.WriteErr(w, 404, "invitation_not_found", "no pending invitation with that id")
+	case errors.Is(err, tenant.ErrForbidden):
+		httpx.WriteErr(w, 403, "forbidden", "invitation is not addressed to this account")
 	case errors.Is(err, tenant.ErrInviteDead):
 		httpx.WriteErr(w, 410, "invitation_expired", "invitation is expired, revoked, or used")
 	default:
@@ -51,17 +59,24 @@ func orgErr(w http.ResponseWriter, err error) {
 }
 
 type createOrgReq struct {
-	Name, Slug, TemplateSlug, OrgType, Country, City, BillingEmail string
+	Name         string    `json:"name"`
+	Slug         string    `json:"slug"`
+	TemplateSlug string    `json:"template_slug"`
+	OrgType      string    `json:"org_type"`
+	Country      string    `json:"country"`
+	City         string    `json:"city"`
+	BillingEmail string    `json:"billing_email"`
+	TenantID     uuid.UUID `json:"tenant_id"`
 }
 
 func (h *OrgHandler) Create(w http.ResponseWriter, r *http.Request) {
 	var req createOrgReq
-	if err := httpx.Decode(w, r, &req); err != nil || req.Name == "" || req.Slug == "" || req.TemplateSlug == "" || req.BillingEmail == "" {
-		httpx.WriteErr(w, 400, "validation_failed", "name, slug, template_slug and billing_email required")
+	if err := httpx.Decode(w, r, &req); err != nil || req.Name == "" || req.Slug == "" || req.TemplateSlug == "" {
+		httpx.WriteErr(w, 400, "validation_failed", "name, slug and template_slug required")
 		return
 	}
 	org, err := h.svc.CreateOrg(r.Context(), middleware.UserID(r.Context()),
-		req.Name, req.Slug, req.TemplateSlug, req.OrgType, req.Country, req.City, req.BillingEmail)
+		req.Name, req.Slug, req.TemplateSlug, req.OrgType, req.Country, req.City, req.BillingEmail, req.TenantID)
 	if err != nil {
 		orgErr(w, err)
 		return
@@ -206,7 +221,10 @@ func (h *OrgHandler) SetSetting(w http.ResponseWriter, r *http.Request) {
 }
 
 type inviteReq struct {
-	Email, Phone, MemberNoHint, Category string
+	Email        string `json:"email"`
+	Phone        string `json:"phone"`
+	MemberNoHint string `json:"member_no_hint"`
+	Category     string `json:"category"`
 }
 
 func (h *OrgHandler) Invite(w http.ResponseWriter, r *http.Request) {

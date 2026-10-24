@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"net/mail"
-	"strconv"
 	"strings"
 
 	"github.com/google/uuid"
@@ -36,6 +35,8 @@ var (
 	ErrTemplateNotFound = errors.New("template_not_found")
 	ErrSlugTaken        = errors.New("slug_taken")
 	ErrLimitExceeded    = errors.New("limit_exceeded")
+	ErrTenantRequired   = errors.New("tenant_required")
+	ErrNoTenant         = errors.New("no_administered_tenant")
 )
 
 type Service struct {
@@ -120,18 +121,23 @@ func (s *Service) HasPermission(ctx context.Context, userID, tenantID uuid.UUID,
 // UpdateOrgProfile moved to ops.go
 
 // emit appends an outbox event inside the org's mutation tx (Rule 12).
-func emit(ctx context.Context, q *db.Queries, tenantID uuid.UUID, name, aggType string, aggID, actorID uuid.UUID, payload map[string]any) error {
+// `sourced` marks ADR-004 replayable events per the domain-events catalog;
+// documented payload keys are supplied by each call site (actor_id and
+// aggregate_id are injected automatically).
+func emit(ctx context.Context, q *db.Queries, tenantID, orgID uuid.UUID, name, aggType string, aggID, actorID uuid.UUID, sourced bool, payload map[string]any) error {
 	if payload == nil {
 		payload = map[string]any{}
 	}
 	payload["actor_id"] = actorID
+	payload["aggregate_id"] = aggID
 	b, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}
 	return q.EmitDomainEvent(ctx, db.EmitDomainEventParams{
-		Name: name, AggregateType: aggType, AggregateID: toPg(aggID),
-		TenantID: toPg(tenantID), ActorID: toPg(actorID), Payload: b,
+		EventType: name, AggregateType: aggType, AggregateID: toPg(aggID),
+		TenantID: toPg(tenantID), OrganizationID: toPg(orgID), ActorID: toPg(actorID),
+		Payload: b, Sourced: sourced,
 	})
 }
 
@@ -186,43 +192,98 @@ func (s *Service) ListTemplates(ctx context.Context) ([]db.ListTemplatesRow, err
 type templateSeed struct {
 	Rules map[string]json.RawMessage `json:"rules"`
 	Theme map[string]any             `json:"theme"`
-	Units []struct {
+	// level_labels are org-defined tier names for hq depth — descriptive
+	// metadata for the unit tree UI, not units to create.
+	LevelLabels []string `json:"level_labels"`
+	FieldGroups []struct {
+		Slug       string `json:"slug"`
 		Name       string `json:"name"`
-		Type       string `json:"type"`
-		LevelLabel string `json:"level_label"`
-	} `json:"units"`
-	// positions/committees/contribution_types/field_groups land with their
-	// modules (Phases 04/08/12) — recorded in seed for the instantiator.
+		EntityType string `json:"entity_type"`
+		Fields     []struct {
+			Key      string `json:"key"`
+			Label    string `json:"label"`
+			Kind     string `json:"kind"`
+			Required bool   `json:"required"`
+		} `json:"fields"`
+	} `json:"field_groups"`
+	// positions/committees/contribution_types instantiate with their owning
+	// modules (Phases 04/09/12) — the org keeps template_slug for backfill.
 }
 
-// CreateOrg provisions tenant + org + creator membership + org_admin role +
-// template instantiation in one tx (§10: creator becomes first member).
-func (s *Service) CreateOrg(ctx context.Context, userID uuid.UUID, name, slug, templateSlug, orgType, country, city, billingEmail string) (*Org, error) {
-	if _, err := mail.ParseAddress(billingEmail); err != nil {
-		return nil, ErrBadValue
+// resolveOrgTenant picks the tenant the org lands under — server-side from
+// the caller's org_admin role assignments (Rule 24: a request-supplied
+// tenant_id is honoured only after verifying the caller administers it).
+// Returns provision=true when the caller administers nothing yet and a
+// tenant must be created inside the org's tx.
+func (s *Service) resolveOrgTenant(ctx context.Context, userID, requested uuid.UUID) (uuid.UUID, bool, error) {
+	if requested != uuid.Nil {
+		if !s.HasPermission(ctx, userID, requested, "org.admin.settings") {
+			return uuid.Nil, false, ErrNoTenant // no admin rights there (or tenant unknown)
+		}
+		if _, err := s.q.GetTenant(ctx, toPg(requested)); err != nil {
+			return uuid.Nil, false, ErrNoTenant
+		}
+		return requested, false, nil
 	}
+	admins, err := s.q.ListOrgAdminTenants(ctx, toPg(userID))
+	if err != nil {
+		return uuid.Nil, false, err
+	}
+	switch len(admins) {
+	case 0:
+		return uuid.Nil, true, nil // first org → provision the tenant
+	case 1:
+		return fromPg(admins[0]), false, nil
+	default:
+		return uuid.Nil, false, ErrTenantRequired // ambiguous — send tenant_id
+	}
+}
+
+// CreateOrg creates an organization under the caller's administered tenant
+// (provisioning one on first create), then membership + org_admin role +
+// template instantiation in one tx (§10: creator becomes first member).
+// limit.organizations is intentionally unenforced until the Phase 07
+// entitlement service lands.
+func (s *Service) CreateOrg(ctx context.Context, userID uuid.UUID, name, slug, templateSlug, orgType, country, city, billingEmail string, requestedTenant uuid.UUID) (*Org, error) {
 	slug = strings.ToLower(strings.TrimSpace(slug))
 	if slug == "" || len(name) == 0 {
 		return nil, ErrBadValue
 	}
+	tenantID, provision, err := s.resolveOrgTenant(ctx, userID, requestedTenant)
+	if err != nil {
+		return nil, err
+	}
+	if provision {
+		addr, err := mail.ParseAddress(billingEmail)
+		if err != nil {
+			return nil, ErrBadValue
+		}
+		billingEmail = addr.Address // normalize "Name <a@b>" like registration
+	}
 	var seed templateSeed
 	var orgID uuid.UUID
-	err := s.withTx(ctx, func(q *db.Queries) error {
+	err = s.withTx(ctx, func(q *db.Queries) error {
 		ts, err := q.GetTemplate(ctx, templateSlug)
 		if err != nil {
 			return ErrTemplateNotFound
 		}
 		_ = json.Unmarshal(ts, &seed)
 
-		tid, err := q.CreateTenant(ctx, db.CreateTenantParams{
-			Name: name, Slug: slug + "-" + uuid.NewString()[:8], BillingEmail: billingEmail,
-		})
-		if err != nil {
-			return err
-		}
-		tenantID := fromPg(tid)
-		if n, err := q.CountTenantOrgs(ctx, tid); err == nil && n > 0 {
-			return ErrLimitExceeded // limit.organizations resolved by entitlements (Phase 07)
+		if provision {
+			tid, err := q.CreateTenant(ctx, db.CreateTenantParams{
+				Name: name, Slug: slug + "-" + uuid.NewString()[:8], BillingEmail: billingEmail,
+			})
+			if err != nil {
+				return err
+			}
+			tenantID = fromPg(tid)
+			// clone the system role templates into the new tenant
+			if err := q.CloneTenantRoles(ctx, tid); err != nil {
+				return err
+			}
+			if err := q.CloneTenantRolePermissions(ctx, tid); err != nil {
+				return err
+			}
 		}
 		var o db.CreateOrgRow
 		o, err = q.CreateOrg(ctx, db.CreateOrgParams{
@@ -237,8 +298,10 @@ func (s *Service) CreateOrg(ctx context.Context, userID uuid.UUID, name, slug, t
 			return err
 		}
 		orgID = fromPg(o.ID)
-		if err := q.SetTenantOwnerOrg(ctx, db.SetTenantOwnerOrgParams{ID: tid, OwnerOrgID: toPg(orgID)}); err != nil {
-			return err
+		if provision {
+			if err := q.SetTenantOwnerOrg(ctx, db.SetTenantOwnerOrgParams{ID: toPg(tenantID), OwnerOrgID: toPg(orgID)}); err != nil {
+				return err
+			}
 		}
 		if _, err := q.CreateMembership(ctx, db.CreateMembershipParams{
 			OrganizationID: toPg(orgID), UserID: toPg(userID),
@@ -246,14 +309,8 @@ func (s *Service) CreateOrg(ctx context.Context, userID uuid.UUID, name, slug, t
 		}); err != nil {
 			return err
 		}
-		if err := q.CloneTenantRoles(ctx, tid); err != nil {
-			return err
-		}
-		if err := q.CloneTenantRolePermissions(ctx, tid); err != nil {
-			return err
-		}
 		if err := q.AssignRoleBySlug(ctx, db.AssignRoleBySlugParams{
-			UserID: toPg(userID), TenantID: tid, GrantedBy: toPg(userID), Slug: "org_admin",
+			UserID: toPg(userID), TenantID: toPg(tenantID), GrantedBy: toPg(userID), Slug: "org_admin",
 		}); err != nil {
 			return err
 		}
@@ -264,16 +321,23 @@ func (s *Service) CreateOrg(ctx context.Context, userID uuid.UUID, name, slug, t
 				return err
 			}
 		}
-		for i, u := range seed.Units {
-			if !map[string]bool{"hq": true, "branch": true, "chapter": true, "committee": true, "wing": true}[u.Type] {
-				continue
-			}
-			if _, err := q.CreateUnit(ctx, db.CreateUnitParams{
-				OrganizationID: toPg(orgID), ParentUnitID: pgUUIDPtr(uuid.Nil),
-				Type: u.Type, LevelLabel: pgText(u.LevelLabel), Name: u.Name,
-				Slug: u.Type + "-" + strconv.Itoa(i),
-			}); err != nil {
+		// template-seeded custom field groups/fields (ADR-022, source='template')
+		for _, g := range seed.FieldGroups {
+			gid, err := q.CreateCustomFieldGroup(ctx, db.CreateCustomFieldGroupParams{
+				OrganizationID: toPg(orgID), EntityType: g.EntityType, Name: g.Name,
+				Slug: g.Slug, Source: "template",
+			})
+			if err != nil {
 				return err
+			}
+			for _, f := range g.Fields {
+				if err := q.CreateCustomField(ctx, db.CreateCustomFieldParams{
+					GroupID: gid, OrganizationID: toPg(orgID), EntityType: g.EntityType,
+					Key: f.Key, Label: f.Label, Kind: f.Kind, Required: f.Required,
+					Source: "template",
+				}); err != nil {
+					return err
+				}
 			}
 		}
 		if seed.Theme != nil {
@@ -284,12 +348,16 @@ func (s *Service) CreateOrg(ctx context.Context, userID uuid.UUID, name, slug, t
 				return err
 			}
 		}
-		if err := emit(ctx, q, tenantID, "OrganizationCreated", "organization", orgID, userID,
-			map[string]any{"organization_id": orgID, "tenant_id": tenantID, "template_slug": templateSlug}); err != nil {
+		if err := emit(ctx, q, tenantID, orgID, "OrganizationCreated", "organization", orgID, userID, true,
+			map[string]any{"org_id": orgID, "organization_id": orgID, "tenant_id": tenantID, "template_slug": templateSlug}); err != nil {
 			return err
 		}
-		if err := emit(ctx, q, tenantID, "TemplateInstantiated", "organization", orgID, userID,
-			map[string]any{"organization_id": orgID, "template_slug": templateSlug}); err != nil {
+		// positions/committees/contribution_types instantiate with their
+		// modules — the deferred list lets Phase 04/09/12 consumers finish
+		// instantiation from this event (template_slug is also on the org).
+		if err := emit(ctx, q, tenantID, orgID, "TemplateInstantiated", "organization", orgID, userID, false,
+			map[string]any{"org_id": orgID, "organization_id": orgID, "template_slug": templateSlug,
+				"deferred": []string{"positions", "committees", "contribution_types"}}); err != nil {
 			return err
 		}
 		return nil

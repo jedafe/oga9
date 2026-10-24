@@ -54,11 +54,13 @@ type User struct {
 
 // LoginResult carries the session on success; on ErrMFARequired /
 // ErrMFASetupRequired it carries MFAToken so the client can complete the
-// gate via /auth/mfa/complete or /auth/mfa/setup+confirm.
+// gate via /auth/mfa/complete or /auth/mfa/setup+confirm. On
+// ErrEmailNotVerified (OAuth) it carries Email for the resend path.
 type LoginResult struct {
 	Token     string
 	SessionID uuid.UUID
 	MFAToken  string
+	Email     string
 }
 
 type Service struct {
@@ -108,25 +110,23 @@ func ValidatePassword(pw string) error {
 // emit appends to the domain-event outbox via the tx-scoped query handle
 // (§05). Rule 12 + error-handling-go: the event lands in the SAME transaction
 // as the state mutation and an append failure aborts the mutation — callers
-// must propagate the returned error, never swallow it.
-func emit(ctx context.Context, q *db.Queries, name, aggType string, aggID, actorID uuid.UUID, payload map[string]any) error {
+// must propagate the returned error, never swallow it. Identity events are
+// platform-scoped: tenant_id/organization_id stay NULL. `sourced` marks
+// ADR-004 replayable events per the domain-events catalog.
+func emit(ctx context.Context, q *db.Queries, name, aggType string, aggID, actorID uuid.UUID, sourced bool, payload map[string]any) error {
 	if payload == nil {
 		payload = map[string]any{}
 	}
 	payload["actor_id"] = actorID
+	payload["aggregate_id"] = aggID
 	b, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}
 	return q.EmitDomainEvent(ctx, db.EmitDomainEventParams{
-		Name: name, AggregateType: aggType, AggregateID: toPg(aggID),
-		ActorID: toPg(actorID), Payload: b,
+		EventType: name, AggregateType: aggType, AggregateID: toPg(aggID),
+		ActorID: toPg(actorID), Payload: b, Sourced: sourced,
 	})
-}
-
-// EmitEvent is the non-tx variant for notification-grade emits.
-func (s *Service) EmitEvent(ctx context.Context, name, aggType string, aggID uuid.UUID, payload map[string]any) error {
-	return emit(ctx, s.q, name, aggType, aggID, aggID, payload)
 }
 
 func (s *Service) withTx(ctx context.Context, fn func(*db.Queries) error) error {
@@ -176,7 +176,8 @@ func (s *Service) Register(ctx context.Context, email, password, displayName str
 			return e
 		}
 		row = r
-		return emit(ctx, q, "UserRegistered", "user", fromPg(r.ID), fromPg(r.ID), map[string]any{"email": r.Email})
+		return emit(ctx, q, "UserRegistered", "user", fromPg(r.ID), fromPg(r.ID), false,
+			map[string]any{"user_id": fromPg(r.ID), "email": r.Email})
 	})
 	if err != nil {
 		var pgErr *pgconn.PgError
@@ -268,7 +269,8 @@ func (s *Service) createSession(ctx context.Context, userID uuid.UUID, deviceLab
 			return e
 		}
 		sessID = id
-		return emit(ctx, q, "UserLoggedIn", "user", userID, userID, map[string]any{"provider": provider})
+		return emit(ctx, q, "UserLoggedIn", "user", userID, userID, false,
+			map[string]any{"user_id": userID, "provider": provider})
 	})
 	if err != nil {
 		return "", uuid.Nil, err
@@ -280,20 +282,45 @@ func (s *Service) createSession(ctx context.Context, userID uuid.UUID, deviceLab
 	return token, fromPg(sessID), nil
 }
 
+// Logout revokes the session row; SessionRevoked emits only when a live
+// session was actually revoked (idempotent — no phantom events).
 func (s *Service) Logout(ctx context.Context, jti uuid.UUID) error {
-	return s.withTx(ctx, func(q *db.Queries) error {
-		if row, err := q.GetSessionByJTI(ctx, toPg(jti)); err == nil {
-			if err := emit(ctx, q, "SessionRevoked", "session", fromPg(row.ID), fromPg(row.UserID), map[string]any{"reason": "logout"}); err != nil {
-				return err
-			}
+	err := s.withTx(ctx, func(q *db.Queries) error {
+		row, err := q.GetSessionByJTI(ctx, toPg(jti))
+		if err != nil {
+			return nil // unknown session — logout stays idempotent
 		}
-		return q.RevokeSessionByJTI(ctx, toPg(jti))
+		if _, err := q.RevokeSessionByJTI(ctx, toPg(jti)); err != nil {
+			if err == pgx.ErrNoRows {
+				return nil // already revoked
+			}
+			return err
+		}
+		return emit(ctx, q, "SessionRevoked", "session", fromPg(row.ID), fromPg(row.UserID), false,
+			map[string]any{"session_id": fromPg(row.ID), "reason": "logout"})
 	})
+	if err == nil {
+		s.denySession(ctx, jti)
+	}
+	return err
+}
+
+// denySession marks a jti on the revoked-session denylist
+// (oga9:auth:deny:{jti}, 24h — covers the default session TTL). The DB row
+// stays the source of truth; this is the §02 denylist fast path so revoked
+// tokens skip the join entirely.
+func (s *Service) denySession(ctx context.Context, jti uuid.UUID) {
+	_ = s.vk.Do(ctx, s.vk.B().Set().Key("oga9:auth:deny:"+jti.String()).Value("1").ExSeconds(86400).Build()).Error()
 }
 
 // ResolveSession maps a JWT jti → userID, enforcing revocation + expiry +
 // account status (a suspended account's live sessions die immediately).
+// The Valkey denylist is checked first — a revoked token never reaches
+// Postgres.
 func (s *Service) ResolveSession(ctx context.Context, jti uuid.UUID) (uuid.UUID, error) {
+	if err := s.vk.Do(ctx, s.vk.B().Get().Key("oga9:auth:deny:"+jti.String()).Build()).Error(); err == nil {
+		return uuid.Nil, ErrSessionRevoked
+	}
 	row, err := s.q.GetSessionByJTI(ctx, toPg(jti))
 	if err == pgx.ErrNoRows {
 		return uuid.Nil, ErrSessionRevoked
@@ -331,55 +358,80 @@ func (s *Service) UserIDByEmail(ctx context.Context, email string) (string, erro
 
 // VerifyEmail consumes the single-use signed token and marks the user verified.
 func (s *Service) VerifyEmail(ctx context.Context, token string) error {
-	userID, err := s.ConsumeActionToken(ctx, token, "verify_email")
+	jti, userID, err := s.ConsumeActionToken(ctx, token, "verify_email")
 	if err != nil {
 		return err
 	}
 	uid := uuid.MustParse(userID)
-	return s.withTx(ctx, func(q *db.Queries) error {
-		if err := emit(ctx, q, "IdentityVerified", "user", uid, uid, map[string]any{"method": "email_link"}); err != nil {
+	err = s.withTx(ctx, func(q *db.Queries) error {
+		if err := q.SetUserVerified(ctx, toPg(uid)); err != nil {
 			return err
 		}
-		return q.SetUserVerified(ctx, toPg(uid))
+		return emit(ctx, q, "IdentityVerified", "user", uid, uid, true,
+			map[string]any{"user_id": uid, "method": "email_link"})
 	})
+	if err != nil {
+		s.releaseActionToken(ctx, jti) // burned but tx failed — allow retry
+	}
+	return err
 }
 
 // ConsumeActionToken verifies a signed token and burns it (single-use,
-// oga9:auth:used_token:{jti} SET NX EX).
-func (s *Service) ConsumeActionToken(ctx context.Context, token, purpose string) (string, error) {
+// oga9:auth:used_token:{jti} SET NX EX). Returns the token jti so callers can
+// release the burn if the guarded mutation fails.
+func (s *Service) ConsumeActionToken(ctx context.Context, token, purpose string) (string, string, error) {
 	jti, userID, err := VerifyActionToken(s.jwtSecret, token, purpose)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	ok, err := s.vk.Do(ctx, s.vk.B().Set().Key("oga9:auth:used_token:"+jti).Value("1").Nx().ExSeconds(86400).Build()).AsBool()
 	if err != nil || !ok {
-		return "", errors.New("token_used")
+		return "", "", errors.New("token_used")
 	}
-	return userID, nil
+	return jti, userID, nil
+}
+
+// releaseActionToken un-burns a token when the tx it guarded rolled back —
+// a transient failure must not strand a still-valid token.
+func (s *Service) releaseActionToken(ctx context.Context, jti string) {
+	_ = s.vk.Do(ctx, s.vk.B().Del().Key("oga9:auth:used_token:"+jti).Build()).Error()
 }
 
 func (s *Service) ResetPassword(ctx context.Context, token, newPassword string) error {
 	if err := ValidatePassword(newPassword); err != nil {
 		return err
 	}
-	userID, err := s.ConsumeActionToken(ctx, token, "password_reset")
+	jti, userID, err := s.ConsumeActionToken(ctx, token, "password_reset")
 	if err != nil {
 		return err
 	}
 	hash, err := HashPassword(newPassword)
 	if err != nil {
+		s.releaseActionToken(ctx, jti)
 		return err
 	}
 	uid := uuid.MustParse(userID)
-	return s.withTx(ctx, func(q *db.Queries) error {
+	var revokedJTIs []pgtype.UUID
+	err = s.withTx(ctx, func(q *db.Queries) error {
 		if err := q.UpdateUserPassword(ctx, db.UpdateUserPasswordParams{PasswordHash: pgText(hash), ID: toPg(uid)}); err != nil {
 			return err
 		}
-		if err := q.RevokeAllUserSessions(ctx, toPg(uid)); err != nil {
+		jtis, err := q.RevokeAllUserSessions(ctx, toPg(uid))
+		if err != nil {
 			return err
 		}
-		return emit(ctx, q, "PasswordChanged", "user", uid, uid, map[string]any{"via": "reset_link"})
+		revokedJTIs = jtis
+		return emit(ctx, q, "PasswordChanged", "user", uid, uid, false,
+			map[string]any{"user_id": uid, "via": "reset_link"})
 	})
+	if err != nil {
+		s.releaseActionToken(ctx, jti)
+		return err
+	}
+	for _, j := range revokedJTIs {
+		s.denySession(ctx, fromPg(j))
+	}
+	return nil
 }
 
 // StageMFASecret parks a TOTP secret in Valkey (oga9:mfa:pending:{user_id},
@@ -434,6 +486,10 @@ func (s *Service) ResolveMFAGate(ctx context.Context, nonce string) (uuid.UUID, 
 func (s *Service) dropMFAGate(ctx context.Context, nonce string) {
 	_ = s.vk.Do(ctx, s.vk.B().Del().Key("oga9:auth:mfa_gate:"+nonce).Build())
 }
+
+// DropMFAGate consumes a gate nonce after it served its purpose
+// (mfa/confirm finished enrollment for a gated login).
+func (s *Service) DropMFAGate(ctx context.Context, nonce string) { s.dropMFAGate(ctx, nonce) }
 
 // ConsumeMFAGate reads + burns a gate nonce (single-use at completion).
 func (s *Service) ConsumeMFAGate(ctx context.Context, nonce string) (mfaGate, error) {
@@ -519,7 +575,7 @@ func (s *Service) SetupMFA(ctx context.Context, userID uuid.UUID, secret string)
 		if e := q.SetRecoveryCodes(ctx, db.SetRecoveryCodesParams{MfaRecoveryCodes: b, ID: toPg(userID)}); e != nil {
 			return e
 		}
-		return emit(ctx, q, "MFAEnabled", "user", userID, userID, nil)
+		return emit(ctx, q, "MFAEnabled", "user", userID, userID, false, map[string]any{"user_id": userID})
 	})
 	return codes, err
 }
@@ -537,29 +593,17 @@ func recoveryHash(code string, userID uuid.UUID) string {
 	return hex.EncodeToString(h[:])
 }
 
-// ConsumeRecoveryCode burns a matching one-time code. Returns false if no match.
+// ConsumeRecoveryCode burns a matching one-time code atomically (single
+// UPDATE) — concurrent logins can't both redeem the same code. Returns
+// false if no match.
 func (s *Service) ConsumeRecoveryCode(ctx context.Context, userID uuid.UUID, code string) (bool, error) {
-	raw, err := s.q.GetRecoveryCodes(ctx, toPg(userID))
-	if err != nil {
-		return false, err
-	}
-	var codes []string
-	_ = json.Unmarshal(raw, &codes)
-	target := recoveryHash(code, userID)
-	out := codes[:0]
-	matched := false
-	for _, c := range codes {
-		if c == target {
-			matched = true
-			continue
-		}
-		out = append(out, c)
-	}
-	if !matched {
+	_, err := s.q.ConsumeRecoveryCode(ctx, db.ConsumeRecoveryCodeParams{
+		ID: toPg(userID), Hash: recoveryHash(code, userID),
+	})
+	if err == pgx.ErrNoRows {
 		return false, nil
 	}
-	b, _ := json.Marshal(out)
-	return true, s.q.SetRecoveryCodes(ctx, db.SetRecoveryCodesParams{MfaRecoveryCodes: b, ID: toPg(userID)})
+	return err == nil, err
 }
 
 // DisableMFA requires the account password + a live TOTP or recovery code;
@@ -585,7 +629,7 @@ func (s *Service) DisableMFA(ctx context.Context, userID uuid.UUID, password, co
 		if err := q.SetRecoveryCodes(ctx, db.SetRecoveryCodesParams{MfaRecoveryCodes: []byte("[]"), ID: toPg(userID)}); err != nil {
 			return err
 		}
-		return emit(ctx, q, "MFADisabled", "user", userID, userID, map[string]any{})
+		return emit(ctx, q, "MFADisabled", "user", userID, userID, false, map[string]any{"user_id": userID})
 	})
 }
 
@@ -630,16 +674,23 @@ func (s *Service) ListSessions(ctx context.Context, userID uuid.UUID) ([]Session
 // only when a row was actually revoked (no phantom events).
 func (s *Service) RevokeSession(ctx context.Context, userID, sessionID uuid.UUID) (bool, error) {
 	revoked := false
+	var jti pgtype.UUID
 	err := s.withTx(ctx, func(q *db.Queries) error {
-		if _, err := q.RevokeSessionByID(ctx, db.RevokeSessionByIDParams{ID: toPg(sessionID), UserID: toPg(userID)}); err != nil {
+		j, err := q.RevokeSessionByID(ctx, db.RevokeSessionByIDParams{ID: toPg(sessionID), UserID: toPg(userID)})
+		if err != nil {
 			if err == pgx.ErrNoRows {
 				return nil // nothing to revoke — not an error
 			}
 			return err
 		}
+		jti = j
 		revoked = true
-		return emit(ctx, q, "SessionRevoked", "session", sessionID, userID, map[string]any{"reason": "revoked_by_user"})
+		return emit(ctx, q, "SessionRevoked", "session", sessionID, userID, false,
+			map[string]any{"session_id": sessionID, "reason": "revoked_by_user"})
 	})
+	if revoked {
+		s.denySession(ctx, fromPg(jti))
+	}
 	return revoked, err
 }
 

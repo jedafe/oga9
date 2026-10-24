@@ -1,7 +1,23 @@
 # Ref: oga9-engineering/sections/01-foundation-tech-stack.md
-# MVP profile: postgres, valkey, mailpit, glitchtip
+# MVP profile: api, postgres, valkey, mailpit, glitchtip
 # Full profile adds: meilisearch, seaweedfs, imgproxy, livekit (phased)
 services:
+  api:
+    image: golang:1.26
+    profiles: ["mvp", "full"]
+    working_dir: /src
+    volumes: [.:/src]
+    command: go run ./cmd/api
+    environment:
+      OGA9_ENV: development
+      OGA9_DATABASE_URL: postgres://oga9:oga9@postgres:5432/oga9?sslmode=disable
+      OGA9_VALKEY_ADDR: valkey:6379
+      OGA9_JWT_SECRET: change-me
+      OGA9_SMTP_HOST: mailpit
+      OGA9_BASE_URL: http://localhost:8080
+    ports: ["8080:8080"]
+    depends_on: [postgres, valkey]
+
   postgres:
     image: pgvector/pgvector:pg18
     profiles: ["mvp", "full"]

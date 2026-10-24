@@ -27,6 +27,8 @@ type Config struct {
 	SessionTTL     time.Duration
 	SMTPHost       string
 	SMTPPort       int
+	SMTPUser       string
+	SMTPPass       string
 	GlitchTipDSN   string
 	MeilisearchURL string
 	MeilisearchKey string
@@ -59,6 +61,8 @@ func Load() (*Config, error) {
 		SessionTTL:     envDur(&errs, "OGA9_SESSION_TTL", 24*time.Hour),
 		SMTPHost:       env("OGA9_SMTP_HOST", "localhost"),
 		SMTPPort:       envInt(&errs, "OGA9_SMTP_PORT", 1025),
+		SMTPUser:       env("OGA9_SMTP_USERNAME", ""),
+		SMTPPass:       env("OGA9_SMTP_PASSWORD", ""),
 		GlitchTipDSN:   env("OGA9_GLITCHTIP_DSN", ""),
 		MeilisearchURL: env("OGA9_MEILISEARCH_URL", ""),
 		MeilisearchKey: env("OGA9_MEILISEARCH_KEY", ""),

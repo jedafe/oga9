@@ -13,30 +13,35 @@ import (
 
 const emitDomainEvent = `-- name: EmitDomainEvent :exec
 
-INSERT INTO domain_events (name, aggregate_type, aggregate_id, tenant_id, actor_id, payload)
+INSERT INTO domain_events (event_type, aggregate_type, aggregate_id, tenant_id, organization_id, actor_id, payload, sourced)
 VALUES ($1, $2, $3,
-        $4, $5, $6)
+        $4, $5, $6,
+        $7, $8)
 `
 
 type EmitDomainEventParams struct {
-	Name          string      `json:"name"`
-	AggregateType string      `json:"aggregate_type"`
-	AggregateID   pgtype.UUID `json:"aggregate_id"`
-	TenantID      pgtype.UUID `json:"tenant_id"`
-	ActorID       pgtype.UUID `json:"actor_id"`
-	Payload       []byte      `json:"payload"`
+	EventType      string      `json:"event_type"`
+	AggregateType  string      `json:"aggregate_type"`
+	AggregateID    pgtype.UUID `json:"aggregate_id"`
+	TenantID       pgtype.UUID `json:"tenant_id"`
+	OrganizationID pgtype.UUID `json:"organization_id"`
+	ActorID        pgtype.UUID `json:"actor_id"`
+	Payload        []byte      `json:"payload"`
+	Sourced        bool        `json:"sourced"`
 }
 
 // Ref: oga9-engineering/sections/05-domain-events-infrastructure.md
 // Outbox + audit queries (Phase 02 emission, Phase 05 dispatch).
 func (q *Queries) EmitDomainEvent(ctx context.Context, arg EmitDomainEventParams) error {
 	_, err := q.db.Exec(ctx, emitDomainEvent,
-		arg.Name,
+		arg.EventType,
 		arg.AggregateType,
 		arg.AggregateID,
 		arg.TenantID,
+		arg.OrganizationID,
 		arg.ActorID,
 		arg.Payload,
+		arg.Sourced,
 	)
 	return err
 }

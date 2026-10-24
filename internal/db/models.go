@@ -22,18 +22,59 @@ type AuditEvents struct {
 	CreatedAt      pgtype.Timestamptz `json:"created_at"`
 }
 
+type CustomFieldGroups struct {
+	ID             pgtype.UUID        `json:"id"`
+	OrganizationID pgtype.UUID        `json:"organization_id"`
+	EntityType     string             `json:"entity_type"`
+	Name           string             `json:"name"`
+	Slug           string             `json:"slug"`
+	SortOrder      int32              `json:"sort_order"`
+	Visibility     string             `json:"visibility"`
+	Source         string             `json:"source"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+}
+
+type CustomFieldValues struct {
+	ID             pgtype.UUID        `json:"id"`
+	FieldID        pgtype.UUID        `json:"field_id"`
+	OrganizationID pgtype.UUID        `json:"organization_id"`
+	EntityID       pgtype.UUID        `json:"entity_id"`
+	Value          []byte             `json:"value"`
+	UpdatedAt      pgtype.Timestamptz `json:"updated_at"`
+}
+
+type CustomFields struct {
+	ID             pgtype.UUID        `json:"id"`
+	GroupID        pgtype.UUID        `json:"group_id"`
+	OrganizationID pgtype.UUID        `json:"organization_id"`
+	EntityType     string             `json:"entity_type"`
+	Key            string             `json:"key"`
+	Label          string             `json:"label"`
+	HelpText       pgtype.Text        `json:"help_text"`
+	Kind           string             `json:"kind"`
+	Required       bool               `json:"required"`
+	Options        []byte             `json:"options"`
+	Validation     []byte             `json:"validation"`
+	SortOrder      int32              `json:"sort_order"`
+	Visibility     string             `json:"visibility"`
+	Source         string             `json:"source"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+}
+
 type DomainEvents struct {
-	ID            pgtype.UUID        `json:"id"`
-	Name          string             `json:"name"`
-	AggregateType string             `json:"aggregate_type"`
-	AggregateID   pgtype.UUID        `json:"aggregate_id"`
-	TenantID      pgtype.UUID        `json:"tenant_id"`
-	ActorID       pgtype.UUID        `json:"actor_id"`
-	Payload       []byte             `json:"payload"`
-	OccurredAt    pgtype.Timestamptz `json:"occurred_at"`
-	PublishedAt   pgtype.Timestamptz `json:"published_at"`
-	Attempts      int32              `json:"attempts"`
-	LastError     pgtype.Text        `json:"last_error"`
+	ID             pgtype.UUID        `json:"id"`
+	EventType      string             `json:"event_type"`
+	AggregateType  string             `json:"aggregate_type"`
+	AggregateID    pgtype.UUID        `json:"aggregate_id"`
+	TenantID       pgtype.UUID        `json:"tenant_id"`
+	ActorID        pgtype.UUID        `json:"actor_id"`
+	Payload        []byte             `json:"payload"`
+	OccurredAt     pgtype.Timestamptz `json:"occurred_at"`
+	DispatchedAt   pgtype.Timestamptz `json:"dispatched_at"`
+	Attempts       int32              `json:"attempts"`
+	LastError      pgtype.Text        `json:"last_error"`
+	OrganizationID pgtype.UUID        `json:"organization_id"`
+	Sourced        bool               `json:"sourced"`
 }
 
 type OauthProviders struct {

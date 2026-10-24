@@ -29,6 +29,8 @@ func bearerToken(r *http.Request) (string, bool) {
 }
 
 // resolveSessionToken parses a Bearer JWT and validates the live session row.
+// The session row's user must match the token subject — a mismatched
+// jti/sub pairing (however unlikely) resolves to nobody.
 func resolveSessionToken(r *http.Request, svc *auth.Service, jwtSecret, token string) (context.Context, bool) {
 	claims, err := auth.ParseToken(jwtSecret, token)
 	if err != nil {
@@ -40,6 +42,9 @@ func resolveSessionToken(r *http.Request, svc *auth.Service, jwtSecret, token st
 	}
 	userID, err := svc.ResolveSession(r.Context(), jti)
 	if err != nil {
+		return nil, false
+	}
+	if claims.Subject != userID.String() {
 		return nil, false
 	}
 	ctx := context.WithValue(r.Context(), CtxUserID, userID)
@@ -85,7 +90,7 @@ func RequireAuthOrMFAGate(svc *auth.Service, jwtSecret string) func(http.Handler
 				return
 			}
 			ctx := context.WithValue(r.Context(), CtxUserID, userID)
-			ctx = context.WithValue(ctx, CtxMFAGate, true)
+			ctx = context.WithValue(ctx, CtxMFAGate, token) // nonce — consumed on successful confirm
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
@@ -103,7 +108,10 @@ func SessionJTI(ctx context.Context) uuid.UUID {
 	}
 	return uuid.Nil
 }
-func ViaMFAGate(ctx context.Context) bool {
-	v, _ := ctx.Value(CtxMFAGate).(bool)
+
+// MFAGateNonce returns the gate nonce when the request authenticated via an
+// mfa_token rather than a full session (empty otherwise).
+func MFAGateNonce(ctx context.Context) string {
+	v, _ := ctx.Value(CtxMFAGate).(string)
 	return v
 }

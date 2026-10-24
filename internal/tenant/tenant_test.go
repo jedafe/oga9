@@ -55,13 +55,25 @@ func TestOrgLifecycleFlow(t *testing.T) {
 	member := mkUser(t, pool, memberEmail)
 	stranger := mkUser(t, pool, "stg"+uuid.NewString()[:8]+"@test.oga9")
 
-	org, err := svc.CreateOrg(ctx, owner, "Test Union", "tu"+uuid.NewString()[:6], "union", "union", "NG", "Lagos", "owner@test.oga9")
+	org, err := svc.CreateOrg(ctx, owner, "Test Union", "tu"+uuid.NewString()[:6], "union", "union", "NG", "Lagos", "owner@test.oga9", uuid.Nil)
 	if err != nil {
 		t.Fatalf("create org: %v", err)
 	}
 	oc, err := svc.ResolveOrgCtx(ctx, owner, org.ID)
 	if err != nil {
 		t.Fatalf("resolve ctx: %v", err)
+	}
+	// second org by the same owner attaches to their administered tenant
+	org2same, err := svc.CreateOrg(ctx, owner, "Owner Second", "os"+uuid.NewString()[:6], "union", "union", "NG", "Enugu", "", uuid.Nil)
+	if err != nil {
+		t.Fatalf("create second org: %v", err)
+	}
+	if org2same.TenantID != org.TenantID {
+		t.Fatal("second org should attach to the caller's existing tenant")
+	}
+	// a foreign tenant_id is verified server-side — member can't use it
+	if _, err := svc.CreateOrg(ctx, member, "Hijack", "hj"+uuid.NewString()[:6], "union", "union", "NG", "X", "x@t.co", org.TenantID); err != ErrNoTenant {
+		t.Fatalf("foreign tenant_id should be rejected, got %v", err)
 	}
 	if !svc.HasPermission(ctx, owner, oc.TenantID, "org.structure.manage") {
 		t.Fatal("creator missing org.structure.manage")
@@ -119,10 +131,33 @@ func TestOrgLifecycleFlow(t *testing.T) {
 		t.Fatal("member should not have admin node")
 	}
 
+	// cross-org invite revoke must not reach another org's invitation
+	inv2, err := svc.CreateInvitation(ctx, oc, "gone-"+uuid.NewString()[:8]+"@test.oga9", "", "", "floor")
+	if err != nil {
+		t.Fatalf("invite2: %v", err)
+	}
+	org2, err := svc.CreateOrg(ctx, stranger, "Other Club", "oc"+uuid.NewString()[:6], "social-club", "social", "NG", "Abuja", "stg@test.oga9", uuid.Nil)
+	if err != nil {
+		t.Fatalf("create org2: %v", err)
+	}
+	oc2, err := svc.ResolveOrgCtx(ctx, stranger, org2.ID)
+	if err != nil {
+		t.Fatalf("resolve ctx2: %v", err)
+	}
+	if err := svc.RevokeInvitation(ctx, oc2, inv2.ID); err != ErrInviteNotFound {
+		t.Fatalf("cross-org revoke should be invitation_not_found, got %v", err)
+	}
+	if err := svc.RevokeInvitation(ctx, oc, inv2.ID); err != nil {
+		t.Fatalf("own-org revoke: %v", err)
+	}
+	if err := svc.RevokeInvitation(ctx, oc, inv2.ID); err != ErrInviteNotFound {
+		t.Fatalf("revoking a revoked invite should be 404, got %v", err)
+	}
+
 	// events recorded
 	var n int
 	if err := pool.QueryRow(ctx,
-		"SELECT count(*) FROM domain_events WHERE name IN ('OrganizationCreated','TemplateInstantiated','MemberInvited','InvitationAccepted') AND occurred_at > $1",
+		"SELECT count(*) FROM domain_events WHERE event_type IN ('OrganizationCreated','TemplateInstantiated','MemberInvited','InvitationAccepted') AND occurred_at > $1",
 		time.Now().Add(-time.Minute)).Scan(&n); err != nil || n < 4 {
 		t.Fatalf("expected org events in outbox, got %d (err %v)", n, err)
 	}

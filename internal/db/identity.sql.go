@@ -11,6 +11,32 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const consumeRecoveryCode = `-- name: ConsumeRecoveryCode :one
+UPDATE users SET mfa_recovery_codes =
+  COALESCE(
+    (SELECT jsonb_agg(e) FROM jsonb_array_elements_text(mfa_recovery_codes) e
+     WHERE e <> $1::text),
+    '[]'::jsonb)
+WHERE id = $2::uuid
+  AND EXISTS (SELECT 1 FROM jsonb_array_elements_text(mfa_recovery_codes) x
+              WHERE x = $1::text)
+RETURNING id
+`
+
+type ConsumeRecoveryCodeParams struct {
+	Hash string      `json:"hash"`
+	ID   pgtype.UUID `json:"id"`
+}
+
+// Atomic single-use burn: removes the hash and returns the row in one
+// statement — concurrent logins can't both consume the same code.
+func (q *Queries) ConsumeRecoveryCode(ctx context.Context, arg ConsumeRecoveryCodeParams) (pgtype.UUID, error) {
+	row := q.db.QueryRow(ctx, consumeRecoveryCode, arg.Hash, arg.ID)
+	var id pgtype.UUID
+	err := row.Scan(&id)
+	return id, err
+}
+
 const createOAuthUser = `-- name: CreateOAuthUser :one
 INSERT INTO users (email, display_name, is_verified, status)
 VALUES ($1, $2, $3, 'active')
@@ -317,19 +343,35 @@ func (q *Queries) ListUserSessions(ctx context.Context, userID pgtype.UUID) ([]L
 	return items, nil
 }
 
-const revokeAllUserSessions = `-- name: RevokeAllUserSessions :exec
+const revokeAllUserSessions = `-- name: RevokeAllUserSessions :many
 UPDATE user_sessions SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL
+RETURNING jti
 `
 
-func (q *Queries) RevokeAllUserSessions(ctx context.Context, userID pgtype.UUID) error {
-	_, err := q.db.Exec(ctx, revokeAllUserSessions, userID)
-	return err
+func (q *Queries) RevokeAllUserSessions(ctx context.Context, userID pgtype.UUID) ([]pgtype.UUID, error) {
+	rows, err := q.db.Query(ctx, revokeAllUserSessions, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []pgtype.UUID
+	for rows.Next() {
+		var jti pgtype.UUID
+		if err := rows.Scan(&jti); err != nil {
+			return nil, err
+		}
+		items = append(items, jti)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const revokeSessionByID = `-- name: RevokeSessionByID :one
 UPDATE user_sessions SET revoked_at = now()
 WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL
-RETURNING id
+RETURNING jti
 `
 
 type RevokeSessionByIDParams struct {
@@ -339,18 +381,21 @@ type RevokeSessionByIDParams struct {
 
 func (q *Queries) RevokeSessionByID(ctx context.Context, arg RevokeSessionByIDParams) (pgtype.UUID, error) {
 	row := q.db.QueryRow(ctx, revokeSessionByID, arg.ID, arg.UserID)
+	var jti pgtype.UUID
+	err := row.Scan(&jti)
+	return jti, err
+}
+
+const revokeSessionByJTI = `-- name: RevokeSessionByJTI :one
+UPDATE user_sessions SET revoked_at = now() WHERE jti = $1 AND revoked_at IS NULL
+RETURNING id
+`
+
+func (q *Queries) RevokeSessionByJTI(ctx context.Context, jti pgtype.UUID) (pgtype.UUID, error) {
+	row := q.db.QueryRow(ctx, revokeSessionByJTI, jti)
 	var id pgtype.UUID
 	err := row.Scan(&id)
 	return id, err
-}
-
-const revokeSessionByJTI = `-- name: RevokeSessionByJTI :exec
-UPDATE user_sessions SET revoked_at = now() WHERE jti = $1 AND revoked_at IS NULL
-`
-
-func (q *Queries) RevokeSessionByJTI(ctx context.Context, jti pgtype.UUID) error {
-	_, err := q.db.Exec(ctx, revokeSessionByJTI, jti)
-	return err
 }
 
 const setJapaconnectUserID = `-- name: SetJapaconnectUserID :exec

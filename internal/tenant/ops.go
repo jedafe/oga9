@@ -19,15 +19,38 @@ var ErrBadValue = errors.New("invalid json value")
 
 var unitTypes = map[string]bool{"hq": true, "branch": true, "chapter": true, "committee": true, "wing": true}
 
-// orgSettingsCatalog — system-settings-catalog.md org_settings keys (Rule 23).
+// orgSettingsCatalog — every key registered in
+// conventions/system-settings-catalog.md (Rule 23 — unknown keys rejected).
+// Patterned keys (org.welfare.cap.{kind}_minor, once_per.{kind}_days) match
+// via orgSettingKeyAllowed.
 var orgSettingsCatalog = map[string]bool{
 	"org.meeting.quorum_percent": true, "org.meeting.notice_days": true,
 	"org.term.length_months": true, "org.dues.default_amount_minor": true,
 	"org.dues.currency": true, "org.listing.is_public_listed": true,
 	"org.membership.sponsor_required": true, "org.membership.number_format": true,
 	"org.membership.app_fields": true, "org.finance.grace_days": true,
-	"org.finance.defaulter_fine_minor": true, "org.attendance.late_fine_minor": true,
-	"org.attendance.absent_fine_minor": true,
+	"org.finance.defaulter_fine_minor": true, "org.finance.statement_visibility": true,
+	"org.finance.drives.show_contributors": true, "org.finance.claims.require_receipt": true,
+	"org.attendance.late_fine_minor": true, "org.attendance.absent_fine_minor": true,
+	"org.welfare.min_membership_days": true, "org.welfare.requires_good_standing": true,
+	"org.projects.update_interval_days": true,
+	"org.chat.general_post_scope":       true, "org.chat.voice_max_seconds": true,
+	"org.chat.edit_window_minutes": true, "org.chat.retention_days": true,
+}
+
+// orgSettingKeyAllowed allows catalogued pattern keys of the form
+// org.welfare.cap.{kind}_minor / org.welfare.once_per.{kind}_days.
+func orgSettingKeyAllowed(key string) bool {
+	if orgSettingsCatalog[key] {
+		return true
+	}
+	if strings.HasPrefix(key, "org.welfare.cap.") && strings.HasSuffix(key, "_minor") {
+		return true
+	}
+	if strings.HasPrefix(key, "org.welfare.once_per.") && strings.HasSuffix(key, "_days") {
+		return true
+	}
+	return false
 }
 
 type Unit struct {
@@ -86,8 +109,8 @@ func (s *Service) CreateUnit(ctx context.Context, oc *OrgCtx, parentID uuid.UUID
 			return err
 		}
 		id = r
-		return emit(ctx, q, oc.TenantID, "OrgUnitCreated", "org_unit", fromPg(r), oc.UserID,
-			map[string]any{"org_id": oc.OrgID, "type": typ})
+		return emit(ctx, q, oc.TenantID, oc.OrgID, "OrgUnitCreated", "org_unit", fromPg(r), oc.UserID, true,
+			map[string]any{"unit_id": fromPg(r), "org_id": oc.OrgID, "type": typ})
 	})
 	return fromPg(id), err
 }
@@ -139,8 +162,8 @@ func (s *Service) UpdateUnit(ctx context.Context, oc *OrgCtx, unitID, parentID u
 		}); err != nil {
 			return err
 		}
-		return emit(ctx, q, oc.TenantID, "OrgUnitUpdated", "org_unit", unitID, oc.UserID,
-			map[string]any{"org_id": oc.OrgID})
+		return emit(ctx, q, oc.TenantID, oc.OrgID, "OrgUnitUpdated", "org_unit", unitID, oc.UserID, true,
+			map[string]any{"unit_id": unitID, "org_id": oc.OrgID})
 	})
 }
 
@@ -163,8 +186,8 @@ func (s *Service) ArchiveUnit(ctx context.Context, oc *OrgCtx, unitID uuid.UUID)
 		if _, err := q.ArchiveUnit(ctx, toPg(unitID)); err != nil {
 			return err
 		}
-		return emit(ctx, q, oc.TenantID, "OrgUnitArchived", "org_unit", unitID, oc.UserID,
-			map[string]any{"org_id": oc.OrgID})
+		return emit(ctx, q, oc.TenantID, oc.OrgID, "OrgUnitArchived", "org_unit", unitID, oc.UserID, true,
+			map[string]any{"unit_id": unitID, "org_id": oc.OrgID})
 	})
 }
 
@@ -180,8 +203,8 @@ func (s *Service) UpdateOrgProfile(ctx context.Context, oc *OrgCtx, name, countr
 		}); err != nil {
 			return err
 		}
-		return emit(ctx, q, oc.TenantID, "OrganizationSettingChanged", "organization", oc.OrgID, oc.UserID,
-			map[string]any{"organization_id": oc.OrgID, "profile": true})
+		return emit(ctx, q, oc.TenantID, oc.OrgID, "OrganizationSettingChanged", "organization", oc.OrgID, oc.UserID, false,
+			map[string]any{"org_id": oc.OrgID, "organization_id": oc.OrgID, "profile": true})
 	})
 }
 
@@ -192,7 +215,7 @@ func (s *Service) ListSettings(ctx context.Context, orgID uuid.UUID) ([]db.ListO
 // SetSetting validates the key against the settings catalog (Rule 23 —
 // unknown keys rejected, not silently stored).
 func (s *Service) SetSetting(ctx context.Context, oc *OrgCtx, key string, value json.RawMessage) error {
-	if !orgSettingsCatalog[key] {
+	if !orgSettingKeyAllowed(key) {
 		return ErrUnknownSetting
 	}
 	if !json.Valid(value) {
@@ -204,8 +227,8 @@ func (s *Service) SetSetting(ctx context.Context, oc *OrgCtx, key string, value 
 		}); err != nil {
 			return err
 		}
-		return emit(ctx, q, oc.TenantID, "OrganizationSettingChanged", "organization", oc.OrgID, oc.UserID,
-			map[string]any{"key": key})
+		return emit(ctx, q, oc.TenantID, oc.OrgID, "OrganizationSettingChanged", "organization", oc.OrgID, oc.UserID, false,
+			map[string]any{"org_id": oc.OrgID, "organization_id": oc.OrgID, "key": key})
 	})
 }
 
@@ -235,8 +258,11 @@ func (s *Service) CreateInvitation(ctx context.Context, oc *OrgCtx, email, phone
 		}
 		out = Invitation{ID: fromPg(r.ID), Email: email, Phone: phone, Category: category,
 			Token: fromPg(r.Token), ExpiresAt: r.ExpiresAt.Time}
-		return emit(ctx, q, oc.TenantID, "MemberInvited", "organization", oc.OrgID, oc.UserID,
-			map[string]any{"membership_id": oc.MembershipID, "email": email})
+		// membership_id is the inviter's (no invitee membership exists yet);
+		// invitation_id identifies the invite itself.
+		return emit(ctx, q, oc.TenantID, oc.OrgID, "MemberInvited", "invitation", fromPg(r.ID), oc.UserID, true,
+			map[string]any{"membership_id": oc.MembershipID, "invitation_id": fromPg(r.ID),
+				"org_id": oc.OrgID, "email": email})
 	})
 	return &out, err
 }
@@ -254,13 +280,20 @@ func (s *Service) ListInvitations(ctx context.Context, orgID uuid.UUID) ([]Invit
 	return out, nil
 }
 
+// RevokeInvitation is org-scoped — an invitation id grants nothing outside
+// the caller's org. Only pending invites flip; anything else is 404.
 func (s *Service) RevokeInvitation(ctx context.Context, oc *OrgCtx, inviteID uuid.UUID) error {
 	return s.withTx(ctx, func(q *db.Queries) error {
-		if err := q.SetInvitationStatus(ctx, db.SetInvitationStatusParams{ID: toPg(inviteID), Status: "revoked"}); err != nil {
+		if _, err := q.SetInvitationStatus(ctx, db.SetInvitationStatusParams{
+			ID: toPg(inviteID), OrganizationID: toPg(oc.OrgID), Status: "revoked",
+		}); err != nil {
+			if err == pgx.ErrNoRows {
+				return ErrInviteNotFound
+			}
 			return err
 		}
-		return emit(ctx, q, oc.TenantID, "InvitationRevoked", "invitation", inviteID, oc.UserID,
-			map[string]any{"org_id": oc.OrgID})
+		return emit(ctx, q, oc.TenantID, oc.OrgID, "InvitationRevoked", "invitation", inviteID, oc.UserID, false,
+			map[string]any{"invitation_id": inviteID, "org_id": oc.OrgID})
 	})
 }
 
@@ -281,31 +314,46 @@ func (s *Service) AcceptInvitation(ctx context.Context, userID uuid.UUID, token 
 	orgID := fromPg(inv.OrganizationID)
 	var tenantID pgtype.UUID
 	err = s.withTx(ctx, func(q *db.Queries) error {
-		if err := q.SetInvitationStatus(ctx, db.SetInvitationStatusParams{ID: inv.ID, Status: "accepted"}); err != nil {
-			return err
-		}
 		org, err := q.GetOrg(ctx, inv.OrganizationID)
 		if err != nil {
 			return err
 		}
 		tenantID = org.TenantID
-		if _, err := q.CreateMembership(ctx, db.CreateMembershipParams{
+		if _, err := q.SetInvitationStatus(ctx, db.SetInvitationStatusParams{
+			ID: inv.ID, OrganizationID: inv.OrganizationID, Status: "accepted",
+		}); err != nil {
+			if err == pgx.ErrNoRows {
+				return ErrInviteDead // flipped by a concurrent accept
+			}
+			return err
+		}
+		// Idempotent: an existing membership means the goal is already
+		// achieved (re-accept, prior approval) — consume the invite and
+		// move on instead of failing on the unique constraint.
+		if _, err := q.GetMembership(ctx, db.GetMembershipParams{
 			OrganizationID: inv.OrganizationID, UserID: toPg(userID),
-			MemberNo: inv.MemberNoHint, Category: inv.Category, LifecycleState: "applied",
 		}); err != nil {
-			return err
+			if err != pgx.ErrNoRows {
+				return err
+			}
+			if _, err := q.CreateMembership(ctx, db.CreateMembershipParams{
+				OrganizationID: inv.OrganizationID, UserID: toPg(userID),
+				MemberNo: inv.MemberNoHint, Category: inv.Category, LifecycleState: "applied",
+			}); err != nil {
+				return err
+			}
+			mb, err := q.GetMembershipByID(ctx, inv.InvitedBy)
+			if err != nil {
+				return err
+			}
+			if err := q.AssignRoleBySlug(ctx, db.AssignRoleBySlugParams{
+				UserID: toPg(userID), TenantID: tenantID, GrantedBy: mb.UserID, Slug: "member",
+			}); err != nil {
+				return err
+			}
 		}
-		mb, err := q.GetMembershipByID(ctx, inv.InvitedBy)
-		if err != nil {
-			return err
-		}
-		if err := q.AssignRoleBySlug(ctx, db.AssignRoleBySlugParams{
-			UserID: toPg(userID), TenantID: tenantID, GrantedBy: mb.UserID, Slug: "member",
-		}); err != nil {
-			return err
-		}
-		return emit(ctx, q, fromPg(tenantID), "InvitationAccepted", "invitation", fromPg(inv.ID), userID,
-			map[string]any{"org_id": orgID, "user_id": userID})
+		return emit(ctx, q, fromPg(tenantID), orgID, "InvitationAccepted", "invitation", fromPg(inv.ID), userID, true,
+			map[string]any{"invitation_id": fromPg(inv.ID), "org_id": orgID, "user_id": userID})
 	})
 	s.InvalidateOrgCtx(ctx, userID, orgID)
 	return orgID, err
@@ -332,7 +380,8 @@ func (s *Service) SetBranding(ctx context.Context, oc *OrgCtx, b Branding) error
 		}); err != nil {
 			return err
 		}
-		return emit(ctx, q, oc.TenantID, "OrgBrandingUpdated", "organization", oc.OrgID, oc.UserID, nil)
+		return emit(ctx, q, oc.TenantID, oc.OrgID, "OrgBrandingUpdated", "organization", oc.OrgID, oc.UserID, false,
+			map[string]any{"org_id": oc.OrgID})
 	})
 }
 

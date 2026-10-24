@@ -30,6 +30,16 @@ RETURNING id;
 -- name: CountTenantOrgs :one
 SELECT count(*) FROM organizations WHERE tenant_id = $1 AND deleted_at IS NULL;
 
+-- name: ListOrgAdminTenants :many
+-- Tenants where the caller holds the org_admin role — the server-side
+-- "my tenant" resolution for POST /orgs (Rule 24).
+SELECT DISTINCT r.tenant_id FROM user_role_assignments ura
+JOIN user_roles r ON r.id = ura.role_id
+WHERE ura.user_id = sqlc.arg(user_id) AND r.slug = 'org_admin' AND r.tenant_id IS NOT NULL;
+
+-- name: GetTenant :one
+SELECT id, name, slug, billing_email, edition, status FROM tenants WHERE id = $1;
+
 -- name: ListUserOrgs :many
 SELECT o.id, o.name, o.slug, o.org_type, o.tenant_id,
        m.id AS membership_id, m.category, m.lifecycle_state, m.member_no
@@ -49,9 +59,11 @@ SELECT id, organization_id, user_id, member_no, category, lifecycle_state
 FROM organization_memberships WHERE id = $1;
 
 -- name: CreateMembership :one
+-- joined_at marks actual joining — 'applied' states haven't joined yet (ADR-014).
 INSERT INTO organization_memberships (organization_id, user_id, member_no, category, lifecycle_state, joined_at)
 VALUES (sqlc.arg(organization_id), sqlc.arg(user_id), sqlc.arg(member_no),
-        sqlc.arg(category), sqlc.arg(lifecycle_state), now())
+        sqlc.arg(category), sqlc.arg(lifecycle_state),
+        CASE WHEN sqlc.arg(lifecycle_state) = 'active' THEN now() ELSE NULL END)
 RETURNING id;
 
 -- name: ListTemplates :many
@@ -141,8 +153,10 @@ ORDER BY created_at DESC;
 SELECT id, organization_id, invited_by, email, category, member_no_hint, status, expires_at
 FROM org_invitations WHERE token = $1;
 
--- name: SetInvitationStatus :exec
-UPDATE org_invitations SET status = $2 WHERE id = $1 AND status = 'pending';
+-- name: SetInvitationStatus :one
+-- Org-scoped: an invitation id alone must not grant cross-org mutation.
+UPDATE org_invitations SET status = $3 WHERE id = $1 AND organization_id = $2 AND status = 'pending'
+RETURNING id;
 
 -- name: UpsertBranding :exec
 INSERT INTO org_branding (organization_id, primary_color, secondary_color, motto, founded_year, portal_config)
@@ -156,6 +170,19 @@ ON CONFLICT (organization_id) DO UPDATE SET
 -- name: GetBranding :one
 SELECT primary_color, secondary_color, motto, founded_year, portal_config
 FROM org_branding WHERE organization_id = $1;
+
+-- name: CreateCustomFieldGroup :one
+INSERT INTO custom_field_groups (organization_id, entity_type, name, slug, sort_order, visibility, source)
+VALUES (sqlc.arg(organization_id), sqlc.arg(entity_type), sqlc.arg(name), sqlc.arg(slug),
+        sqlc.arg(sort_order), sqlc.arg(visibility), sqlc.arg(source))
+RETURNING id;
+
+-- name: CreateCustomField :exec
+INSERT INTO custom_fields (group_id, organization_id, entity_type, key, label, help_text,
+                           kind, required, options, sort_order, visibility, source)
+VALUES (sqlc.arg(group_id), sqlc.arg(organization_id), sqlc.arg(entity_type), sqlc.arg(key),
+        sqlc.arg(label), sqlc.arg(help_text), sqlc.arg(kind), sqlc.arg(required),
+        sqlc.arg(options), sqlc.arg(sort_order), sqlc.arg(visibility), sqlc.arg(source));
 
 -- name: ListPublicOrgs :many
 SELECT id, name, slug, org_type, country_code, city

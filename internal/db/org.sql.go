@@ -82,6 +82,79 @@ func (q *Queries) CountTenantOrgs(ctx context.Context, tenantID pgtype.UUID) (in
 	return count, err
 }
 
+const createCustomField = `-- name: CreateCustomField :exec
+INSERT INTO custom_fields (group_id, organization_id, entity_type, key, label, help_text,
+                           kind, required, options, sort_order, visibility, source)
+VALUES ($1, $2, $3, $4,
+        $5, $6, $7, $8,
+        $9, $10, $11, $12)
+`
+
+type CreateCustomFieldParams struct {
+	GroupID        pgtype.UUID `json:"group_id"`
+	OrganizationID pgtype.UUID `json:"organization_id"`
+	EntityType     string      `json:"entity_type"`
+	Key            string      `json:"key"`
+	Label          string      `json:"label"`
+	HelpText       pgtype.Text `json:"help_text"`
+	Kind           string      `json:"kind"`
+	Required       bool        `json:"required"`
+	Options        []byte      `json:"options"`
+	SortOrder      int32       `json:"sort_order"`
+	Visibility     string      `json:"visibility"`
+	Source         string      `json:"source"`
+}
+
+func (q *Queries) CreateCustomField(ctx context.Context, arg CreateCustomFieldParams) error {
+	_, err := q.db.Exec(ctx, createCustomField,
+		arg.GroupID,
+		arg.OrganizationID,
+		arg.EntityType,
+		arg.Key,
+		arg.Label,
+		arg.HelpText,
+		arg.Kind,
+		arg.Required,
+		arg.Options,
+		arg.SortOrder,
+		arg.Visibility,
+		arg.Source,
+	)
+	return err
+}
+
+const createCustomFieldGroup = `-- name: CreateCustomFieldGroup :one
+INSERT INTO custom_field_groups (organization_id, entity_type, name, slug, sort_order, visibility, source)
+VALUES ($1, $2, $3, $4,
+        $5, $6, $7)
+RETURNING id
+`
+
+type CreateCustomFieldGroupParams struct {
+	OrganizationID pgtype.UUID `json:"organization_id"`
+	EntityType     string      `json:"entity_type"`
+	Name           string      `json:"name"`
+	Slug           string      `json:"slug"`
+	SortOrder      int32       `json:"sort_order"`
+	Visibility     string      `json:"visibility"`
+	Source         string      `json:"source"`
+}
+
+func (q *Queries) CreateCustomFieldGroup(ctx context.Context, arg CreateCustomFieldGroupParams) (pgtype.UUID, error) {
+	row := q.db.QueryRow(ctx, createCustomFieldGroup,
+		arg.OrganizationID,
+		arg.EntityType,
+		arg.Name,
+		arg.Slug,
+		arg.SortOrder,
+		arg.Visibility,
+		arg.Source,
+	)
+	var id pgtype.UUID
+	err := row.Scan(&id)
+	return id, err
+}
+
 const createInvitation = `-- name: CreateInvitation :one
 INSERT INTO org_invitations (organization_id, email, phone, member_no_hint, category, invited_by, token, expires_at)
 VALUES ($1, $2, $3, $4,
@@ -124,7 +197,8 @@ func (q *Queries) CreateInvitation(ctx context.Context, arg CreateInvitationPara
 const createMembership = `-- name: CreateMembership :one
 INSERT INTO organization_memberships (organization_id, user_id, member_no, category, lifecycle_state, joined_at)
 VALUES ($1, $2, $3,
-        $4, $5, now())
+        $4, $5,
+        CASE WHEN $5 = 'active' THEN now() ELSE NULL END)
 RETURNING id
 `
 
@@ -136,6 +210,7 @@ type CreateMembershipParams struct {
 	LifecycleState string      `json:"lifecycle_state"`
 }
 
+// joined_at marks actual joining — 'applied' states haven't joined yet (ADR-014).
 func (q *Queries) CreateMembership(ctx context.Context, arg CreateMembershipParams) (pgtype.UUID, error) {
 	row := q.db.QueryRow(ctx, createMembership,
 		arg.OrganizationID,
@@ -431,6 +506,33 @@ func (q *Queries) GetTemplate(ctx context.Context, slug string) ([]byte, error) 
 	return seed, err
 }
 
+const getTenant = `-- name: GetTenant :one
+SELECT id, name, slug, billing_email, edition, status FROM tenants WHERE id = $1
+`
+
+type GetTenantRow struct {
+	ID           pgtype.UUID `json:"id"`
+	Name         string      `json:"name"`
+	Slug         string      `json:"slug"`
+	BillingEmail string      `json:"billing_email"`
+	Edition      string      `json:"edition"`
+	Status       string      `json:"status"`
+}
+
+func (q *Queries) GetTenant(ctx context.Context, id pgtype.UUID) (GetTenantRow, error) {
+	row := q.db.QueryRow(ctx, getTenant, id)
+	var i GetTenantRow
+	err := row.Scan(
+		&i.ID,
+		&i.Name,
+		&i.Slug,
+		&i.BillingEmail,
+		&i.Edition,
+		&i.Status,
+	)
+	return i, err
+}
+
 const getUnit = `-- name: GetUnit :one
 SELECT id, organization_id, parent_unit_id, type, level_label, name, slug
 FROM org_units WHERE id = $1 AND archived_at IS NULL
@@ -482,6 +584,34 @@ func (q *Queries) HasPermission(ctx context.Context, arg HasPermissionParams) (b
 	var allowed bool
 	err := row.Scan(&allowed)
 	return allowed, err
+}
+
+const listOrgAdminTenants = `-- name: ListOrgAdminTenants :many
+SELECT DISTINCT r.tenant_id FROM user_role_assignments ura
+JOIN user_roles r ON r.id = ura.role_id
+WHERE ura.user_id = $1 AND r.slug = 'org_admin' AND r.tenant_id IS NOT NULL
+`
+
+// Tenants where the caller holds the org_admin role — the server-side
+// "my tenant" resolution for POST /orgs (Rule 24).
+func (q *Queries) ListOrgAdminTenants(ctx context.Context, userID pgtype.UUID) ([]pgtype.UUID, error) {
+	rows, err := q.db.Query(ctx, listOrgAdminTenants, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []pgtype.UUID
+	for rows.Next() {
+		var tenant_id pgtype.UUID
+		if err := rows.Scan(&tenant_id); err != nil {
+			return nil, err
+		}
+		items = append(items, tenant_id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const listOrgSettings = `-- name: ListOrgSettings :many
@@ -725,18 +855,23 @@ func (q *Queries) ListUserOrgs(ctx context.Context, userID pgtype.UUID) ([]ListU
 	return items, nil
 }
 
-const setInvitationStatus = `-- name: SetInvitationStatus :exec
-UPDATE org_invitations SET status = $2 WHERE id = $1 AND status = 'pending'
+const setInvitationStatus = `-- name: SetInvitationStatus :one
+UPDATE org_invitations SET status = $3 WHERE id = $1 AND organization_id = $2 AND status = 'pending'
+RETURNING id
 `
 
 type SetInvitationStatusParams struct {
-	ID     pgtype.UUID `json:"id"`
-	Status string      `json:"status"`
+	ID             pgtype.UUID `json:"id"`
+	OrganizationID pgtype.UUID `json:"organization_id"`
+	Status         string      `json:"status"`
 }
 
-func (q *Queries) SetInvitationStatus(ctx context.Context, arg SetInvitationStatusParams) error {
-	_, err := q.db.Exec(ctx, setInvitationStatus, arg.ID, arg.Status)
-	return err
+// Org-scoped: an invitation id alone must not grant cross-org mutation.
+func (q *Queries) SetInvitationStatus(ctx context.Context, arg SetInvitationStatusParams) (pgtype.UUID, error) {
+	row := q.db.QueryRow(ctx, setInvitationStatus, arg.ID, arg.OrganizationID, arg.Status)
+	var id pgtype.UUID
+	err := row.Scan(&id)
+	return id, err
 }
 
 const setTenantOwnerOrg = `-- name: SetTenantOwnerOrg :exec

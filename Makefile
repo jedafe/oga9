@@ -25,5 +25,5 @@ build:
 	go build -o bin/oga9 ./cmd/api
 
 lint:
-	gofmt -l . | grep -v vendor || true
+	test -z "$$(gofmt -l cmd internal)"
 	go vet ./...

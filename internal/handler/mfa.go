@@ -72,6 +72,11 @@ func (h *MFAHandler) Confirm(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.svc.ClearPendingMFA(r.Context(), userID)
+	// a gated login (mfa_setup_required) has now enrolled — burn the gate
+	// nonce so it can't be replayed against these routes.
+	if nonce := middleware.MFAGateNonce(r.Context()); nonce != "" {
+		h.svc.DropMFAGate(r.Context(), nonce)
+	}
 	// recovery codes are returned ONCE — store them offline.
 	httpx.WriteData(w, 200, map[string]any{"mfa_enabled": true, "recovery_codes": codes})
 }

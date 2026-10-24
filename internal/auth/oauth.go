@@ -31,6 +31,7 @@ type ProviderConfig struct {
 
 var ErrProviderNotConfigured = errors.New("provider_not_configured")
 var ErrOAuthState = errors.New("oauth_state_invalid")
+var ErrOAuthNoEmail = errors.New("oauth_email_missing")
 
 var oauthHTTP = &http.Client{Timeout: 10 * time.Second}
 
@@ -120,7 +121,10 @@ func (s *Service) OAuthCallback(ctx context.Context, state, code, redirectURI st
 		return nil, ErrUserSuspended
 	}
 	if !state2.IsVerified {
-		return nil, ErrEmailNotVerified
+		// Carry the provider-asserted address so the handler can send a
+		// verification link — an unverified OAuth account must not be a
+		// dead end (the provider link is already recorded).
+		return &LoginResult{Email: info.Email}, ErrEmailNotVerified
 	}
 	return s.finishLogin(ctx, userID, state2.MfaSecret, "", deviceLabel, ip, ua, provider)
 }
@@ -142,7 +146,14 @@ func (s *Service) findOrProvisionOAuthUser(ctx context.Context, provider string,
 		}
 	}
 	if userID == uuid.Nil {
-		// new account: provision + emit + link in one tx (Rule 12)
+		if info.Email == "" {
+			// No usable address: account would be uncontactable and
+			// unverifiable — refuse rather than strand it.
+			return uuid.Nil, ErrOAuthNoEmail
+		}
+		// new account: provision + emit + link in one tx (Rule 12). If the
+		// provider didn't verify the email the account lands unverified and
+		// completes verification via the standard token flow.
 		display := info.Name
 		if display == "" {
 			display = info.Email
@@ -155,7 +166,8 @@ func (s *Service) findOrProvisionOAuthUser(ctx context.Context, provider string,
 				return e
 			}
 			userID = fromPg(id)
-			if e := emit(ctx, q, "UserRegistered", "user", userID, userID, map[string]any{"provider": provider}); e != nil {
+			if e := emit(ctx, q, "UserRegistered", "user", userID, userID, false,
+				map[string]any{"user_id": userID, "provider": provider}); e != nil {
 				return e
 			}
 			return q.LinkOAuthProvider(ctx, db.LinkOAuthProviderParams{

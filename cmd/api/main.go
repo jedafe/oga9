@@ -95,14 +95,14 @@ func main() {
 		w.Write([]byte(`{"status":"ok"}`))
 	})
 	// §02 identity: auth service + handlers
-	mail := mailer.New(cfg.SMTPHost, cfg.SMTPPort, cfg.MailFrom)
+	mail := mailer.New(cfg.SMTPHost, cfg.SMTPPort, cfg.MailFrom, cfg.SMTPUser, cfg.SMTPPass)
 	queue := asynq.NewClient(asynq.RedisClientOpt{Addr: cfg.ValkeyAddr})
 	defer queue.Close()
 	for taskType, h := range tasks.Handlers(mail) {
 		mux.HandleFunc(taskType, h)
 	}
 	authSvc := auth.NewService(pool, vk, cfg.JWTSecret, cfg.SessionTTL, cfg.DataKey)
-	authH := handler.NewAuthHandler(authSvc, queue, cfg.JWTSecret)
+	authH := handler.NewAuthHandler(authSvc, queue, cfg.JWTSecret, cfg.BaseURL)
 	mfaH := handler.NewMFAHandler(authSvc)
 	providers := make(map[string]auth.ProviderConfig, 2)
 	for name, p := range cfg.OAuthProviders() {
@@ -111,7 +111,7 @@ func main() {
 			AuthURL: p.AuthURL, TokenURL: p.TokenURL, UserinfoURL: p.UserinfoURL,
 		}
 	}
-	oauthH := handler.NewOAuthHandler(authSvc, vk, providers, cfg.BaseURL)
+	oauthH := handler.NewOAuthHandler(authSvc, vk, providers, cfg.BaseURL, queue, cfg.JWTSecret)
 	orgSvc := tenant.NewService(pool, vk)
 	orgH := handler.NewOrgHandler(orgSvc)
 

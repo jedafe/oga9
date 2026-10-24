@@ -4,6 +4,7 @@ package handler
 import (
 	"context"
 	"errors"
+	"log"
 	"net/http"
 	"time"
 
@@ -17,13 +18,14 @@ import (
 )
 
 type AuthHandler struct {
-	svc    *auth.Service
-	queue  *asynq.Client
-	secret string
+	svc     *auth.Service
+	queue   *asynq.Client
+	secret  string
+	baseURL string
 }
 
-func NewAuthHandler(svc *auth.Service, q *asynq.Client, secret string) *AuthHandler {
-	return &AuthHandler{svc: svc, queue: q, secret: secret}
+func NewAuthHandler(svc *auth.Service, q *asynq.Client, secret, baseURL string) *AuthHandler {
+	return &AuthHandler{svc: svc, queue: q, secret: secret, baseURL: baseURL}
 }
 
 // enqueueMail is fire-and-forget (Rule 8): queue the mail task, never block.
@@ -31,9 +33,12 @@ func NewAuthHandler(svc *auth.Service, q *asynq.Client, secret string) *AuthHand
 func (h *AuthHandler) enqueueMail(ctx context.Context, taskType, to, subject, body string) {
 	t, err := tasks.NewEmailTask(taskType, tasks.SendEmailPayload{To: to, Subject: subject, Body: body})
 	if err != nil {
+		log.Printf("mail task build failed (%s): %v", taskType, err)
 		return
 	}
-	_, _ = h.queue.EnqueueContext(context.WithoutCancel(ctx), t)
+	if _, err := h.queue.EnqueueContext(context.WithoutCancel(ctx), t); err != nil {
+		log.Printf("mail enqueue failed (%s → %s): %v", taskType, to, err)
+	}
 }
 
 type registerReq struct {
@@ -70,7 +75,8 @@ func (h *AuthHandler) Register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.enqueueMail(r.Context(), tasks.TypeSendVerification, u.Email,
-		"Verify your OGA9 account", "Verify: "+verifyToken)
+		"Verify your OGA9 account",
+		"Verify your account: "+h.baseURL+"/api/v1/auth/verify/"+verifyToken)
 	httpx.WriteData(w, 201, map[string]any{"user_id": u.ID, "email": u.Email, "display_name": u.DisplayName})
 }
 
@@ -160,7 +166,8 @@ func (h *AuthHandler) ForgotPassword(w http.ResponseWriter, r *http.Request) {
 	if uid != "" {
 		token, _ := auth.SignActionToken(h.secret, uid, "password_reset", time.Hour)
 		h.enqueueMail(r.Context(), tasks.TypeSendPasswordReset, req.Email,
-			"OGA9 password reset", "Reset: "+token)
+			"OGA9 password reset",
+			"Reset your password: "+h.baseURL+"/api/v1/auth/password/reset\nToken: "+token)
 	}
 	httpx.WriteData(w, 200, map[string]any{"sent": true})
 }
@@ -231,7 +238,8 @@ func (h *AuthHandler) ResendVerification(w http.ResponseWriter, r *http.Request)
 		if u, _ := h.svc.GetUser(r.Context(), uuid.MustParse(uid)); u != nil && !u.IsVerified {
 			token, _ := auth.SignActionToken(h.secret, uid, "verify_email", 24*time.Hour)
 			h.enqueueMail(r.Context(), tasks.TypeSendVerification, u.Email,
-				"Verify your OGA9 account", "Verify: "+token)
+				"Verify your OGA9 account",
+				"Verify your account: "+h.baseURL+"/api/v1/auth/verify/"+token)
 		}
 	}
 	httpx.WriteData(w, 200, map[string]any{"sent": true})
