@@ -27,8 +27,7 @@ jobs:
       OGA9_TEST_VALKEY_ADDR: localhost:6379
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: true
+        # .oos (engineering spec) is not a build dependency — skip submodules
       - uses: actions/setup-go@v5
         with:
           go-version: "1.26"
