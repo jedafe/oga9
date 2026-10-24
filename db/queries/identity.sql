@@ -37,14 +37,14 @@ SELECT COALESCE(convert_from(mfa_secret, 'UTF8'), '')::text AS mfa_secret FROM u
 
 -- name: CreateSession :one
 INSERT INTO user_sessions (user_id, jti, device_label, ip, user_agent, expires_at)
-VALUES ($1, $2, $3, $4::inet, $5, $6)
+VALUES ($1, $2, $3, NULLIF($4::text, '')::inet, $5, $6)
 RETURNING id;
 
 -- name: GetSessionByJTI :one
 SELECT id, user_id, revoked_at, expires_at FROM user_sessions WHERE jti = $1;
 
 -- name: ListUserSessions :many
-SELECT id, device_label, ip::text AS ip, user_agent, created_at, expires_at
+SELECT id, jti, device_label, ip::text AS ip, user_agent, created_at, expires_at
 FROM user_sessions
 WHERE user_id = $1 AND revoked_at IS NULL AND expires_at > now()
 ORDER BY created_at DESC;

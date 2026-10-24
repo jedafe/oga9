@@ -180,6 +180,8 @@ func (h *AuthHandler) Me(w http.ResponseWriter, r *http.Request) {
 
 func (h *AuthHandler) Sessions(w http.ResponseWriter, r *http.Request) {
 	sessions, err := h.svc.ListSessions(r.Context(), middleware.UserID(r.Context()))
+	jti := middleware.SessionJTI(r.Context())
+	for i := range sessions { sessions[i].Current = sessions[i].JTI == jti }
 	if err != nil {
 		writeErr(w, 500, "internal_error", "could not list sessions")
 		return

@@ -90,7 +90,7 @@ func main() {
 		w.Write([]byte(`{"status":"ok"}`))
 	})
 	// §02 identity: auth service + handlers
-	mail := mailer.New(cfg.SMTPHost, cfg.SMTPPort)
+	mail := mailer.New(cfg.SMTPHost, cfg.SMTPPort, cfg.MailFrom)
 	authSvc := auth.NewService(pool, vk, cfg.JWTSecret, cfg.SessionTTL)
 	authH := handler.NewAuthHandler(authSvc, mail, cfg.JWTSecret)
 	mfaH := handler.NewMFAHandler(authSvc)
@@ -123,7 +123,14 @@ func main() {
 		})
 	})
 
-	httpSrv := &http.Server{Addr: ":" + strconv.Itoa(cfg.APIPort), Handler: r}
+	httpSrv := &http.Server{
+		Addr:              ":" + strconv.Itoa(cfg.APIPort),
+		Handler:           r,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      60 * time.Second, // WS endpoints override via hijack
+		IdleTimeout:       120 * time.Second,
+	}
 	go func() {
 		log.Printf("api listening on :%d (env=%s)", cfg.APIPort, cfg.Env)
 		if err := httpSrv.ListenAndServe(); err != http.ErrServerClosed {

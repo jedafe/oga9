@@ -7,7 +7,6 @@ package db
 
 import (
 	"context"
-	"net/netip"
 
 	"github.com/jackc/pgx/v5/pgtype"
 )
@@ -33,7 +32,7 @@ func (q *Queries) CreateOAuthUser(ctx context.Context, arg CreateOAuthUserParams
 
 const createSession = `-- name: CreateSession :one
 INSERT INTO user_sessions (user_id, jti, device_label, ip, user_agent, expires_at)
-VALUES ($1, $2, $3, $4::inet, $5, $6)
+VALUES ($1, $2, $3, NULLIF($4::text, '')::inet, $5, $6)
 RETURNING id
 `
 
@@ -41,7 +40,7 @@ type CreateSessionParams struct {
 	UserID      pgtype.UUID        `json:"user_id"`
 	Jti         pgtype.UUID        `json:"jti"`
 	DeviceLabel pgtype.Text        `json:"device_label"`
-	Column4     netip.Addr         `json:"column_4"`
+	Column4     string             `json:"column_4"`
 	UserAgent   pgtype.Text        `json:"user_agent"`
 	ExpiresAt   pgtype.Timestamptz `json:"expires_at"`
 }
@@ -254,7 +253,7 @@ func (q *Queries) LinkOAuthProvider(ctx context.Context, arg LinkOAuthProviderPa
 }
 
 const listUserSessions = `-- name: ListUserSessions :many
-SELECT id, device_label, ip::text AS ip, user_agent, created_at, expires_at
+SELECT id, jti, device_label, ip::text AS ip, user_agent, created_at, expires_at
 FROM user_sessions
 WHERE user_id = $1 AND revoked_at IS NULL AND expires_at > now()
 ORDER BY created_at DESC
@@ -262,6 +261,7 @@ ORDER BY created_at DESC
 
 type ListUserSessionsRow struct {
 	ID          pgtype.UUID        `json:"id"`
+	Jti         pgtype.UUID        `json:"jti"`
 	DeviceLabel pgtype.Text        `json:"device_label"`
 	Ip          string             `json:"ip"`
 	UserAgent   pgtype.Text        `json:"user_agent"`
@@ -280,6 +280,7 @@ func (q *Queries) ListUserSessions(ctx context.Context, userID pgtype.UUID) ([]L
 		var i ListUserSessionsRow
 		if err := rows.Scan(
 			&i.ID,
+			&i.Jti,
 			&i.DeviceLabel,
 			&i.Ip,
 			&i.UserAgent,

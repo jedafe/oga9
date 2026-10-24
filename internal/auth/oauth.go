@@ -15,6 +15,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"time"
 	"github.com/jedafe/oga9/internal/db"
 	valkey "github.com/valkey-io/valkey-go"
 )
@@ -29,6 +30,8 @@ type ProviderConfig struct {
 
 var ErrProviderNotConfigured = errors.New("provider_not_configured")
 var ErrOAuthState = errors.New("oauth_state_invalid")
+
+var oauthHTTP = &http.Client{Timeout: 10 * time.Second}
 
 // StartOAuth stores a single-use state nonce (oga9:oauth:state:{state}) and
 // returns the provider authorize URL.
@@ -72,7 +75,7 @@ func (s *Service) OAuthCallback(ctx context.Context, state, code, redirectURI st
 	}
 	req, _ := http.NewRequestWithContext(ctx, "POST", p.TokenURL, strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := oauthHTTP.Do(req)
 	if err != nil {
 		return "", uuid.Nil, err
 	}
@@ -87,7 +90,7 @@ func (s *Service) OAuthCallback(ctx context.Context, state, code, redirectURI st
 
 	ureq, _ := http.NewRequestWithContext(ctx, "GET", p.UserinfoURL, nil)
 	ureq.Header.Set("Authorization", "Bearer "+tok.AccessToken)
-	uresp, err := http.DefaultClient.Do(ureq)
+	uresp, err := oauthHTTP.Do(ureq)
 	if err != nil {
 		return "", uuid.Nil, err
 	}
@@ -113,7 +116,9 @@ func (s *Service) findOrProvisionOAuthUser(ctx context.Context, provider string,
 		return uuid.Nil, err
 	}
 
-	if info.Email != "" {
+	// link by email only when the provider VERIFIED the address — otherwise
+	// an unverified provider account could claim an existing OGA9 user.
+	if info.Email != "" && info.EmailVerified {
 		if id, e := s.UserIDByEmail(ctx, info.Email); e == nil {
 			userID = uuid.MustParse(id)
 		}
@@ -132,7 +137,7 @@ func (s *Service) findOrProvisionOAuthUser(ctx context.Context, provider string,
 				return e
 			}
 			userID = fromPg(id)
-			emit(ctx, q, "UserRegistered", "user", userID, map[string]any{"provider": provider})
+			emit(ctx, q, "UserRegistered", "user", userID, userID, map[string]any{"provider": provider})
 			return q.LinkOAuthProvider(ctx, db.LinkOAuthProviderParams{
 				UserID: toPg(userID), Provider: provider, ProviderSubject: info.Sub,
 			})

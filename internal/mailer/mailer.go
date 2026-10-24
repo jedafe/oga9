@@ -13,8 +13,9 @@ type Mailer struct {
 	from string
 }
 
-func New(host string, port int) *Mailer {
-	return &Mailer{host: host, port: port, from: "noreply@oga9.com"}
+func New(host string, port int, from string) *Mailer {
+	if from == "" { from = "noreply@localhost" }
+	return &Mailer{host: host, port: port, from: from}
 }
 
 func (m *Mailer) Send(to, subject, body string) error {

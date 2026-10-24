@@ -7,7 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"net/netip"
+	"net/mail"
 	"time"
 	"unicode"
 
@@ -31,6 +31,7 @@ var (
 	ErrMFARequired    = errors.New("mfa_required")
 	ErrMFACode        = errors.New("invalid_mfa_code")
 	ErrUserNotFound   = errors.New("user_not_found")
+	ErrInvalidEmail   = errors.New("invalid_email")
 )
 
 type User struct {
@@ -83,7 +84,8 @@ func ValidatePassword(pw string) error {
 // emit appends to the domain-event outbox via the given query handle (§05).
 // Callers must pass the tx-scoped Queries so the event lands in the SAME
 // transaction as the state mutation (Rule 12 outbox contract).
-func emit(ctx context.Context, q *db.Queries, name, aggType string, aggID uuid.UUID, payload map[string]any) {
+func emit(ctx context.Context, q *db.Queries, name, aggType string, aggID, actorID uuid.UUID, payload map[string]any) {
+	payload["actor_id"] = actorID
 	b, _ := json.Marshal(payload)
 	_ = q.EmitDomainEvent(ctx, db.EmitDomainEventParams{
 		Name: name, AggregateType: aggType, AggregateID: toPg(aggID), Payload: b,
@@ -92,7 +94,7 @@ func emit(ctx context.Context, q *db.Queries, name, aggType string, aggID uuid.U
 
 // EmitEvent is the fire-and-forget variant for non-mutating notifications.
 func (s *Service) EmitEvent(ctx context.Context, name, aggType string, aggID uuid.UUID, payload map[string]any) {
-	emit(ctx, s.q, name, aggType, aggID, payload)
+	emit(ctx, s.q, name, aggType, aggID, aggID, payload)
 }
 
 func (s *Service) withTx(ctx context.Context, fn func(*db.Queries) error) error {
@@ -108,6 +110,9 @@ func (s *Service) withTx(ctx context.Context, fn func(*db.Queries) error) error 
 }
 
 func (s *Service) Register(ctx context.Context, email, password, displayName string) (*User, string, error) {
+	if _, err := mail.ParseAddress(email); err != nil {
+		return nil, "", ErrInvalidEmail
+	}
 	if err := ValidatePassword(password); err != nil {
 		return nil, "", err
 	}
@@ -124,7 +129,7 @@ func (s *Service) Register(ctx context.Context, email, password, displayName str
 			return e
 		}
 		row = r
-		emit(ctx, q, "UserRegistered", "user", fromPg(r.ID), map[string]any{"email": r.Email})
+		emit(ctx, q, "UserRegistered", "user", fromPg(r.ID), fromPg(r.ID), map[string]any{"email": r.Email})
 		return nil
 	})
 	if err != nil {
@@ -175,14 +180,13 @@ func (s *Service) Login(ctx context.Context, email, password, mfaCode, deviceLab
 func (s *Service) createSession(ctx context.Context, userID uuid.UUID, deviceLabel, ip, ua, provider string) (string, uuid.UUID, error) {
 	jti := uuid.New()
 	expires := time.Now().Add(s.tokenTTL)
-	addr, _ := netip.ParseAddr(ip)
 	var sessID pgtype.UUID
 	err := s.withTx(ctx, func(q *db.Queries) error {
 		id, e := q.CreateSession(ctx, db.CreateSessionParams{
 			UserID:      toPg(userID),
 			Jti:         toPg(jti),
 			DeviceLabel: pgText(deviceLabel),
-			Column4:     addr,
+			Column4:     ip,
 			UserAgent:   pgText(ua),
 			ExpiresAt:   pgtype.Timestamptz{Time: expires, Valid: true},
 		})
@@ -190,7 +194,7 @@ func (s *Service) createSession(ctx context.Context, userID uuid.UUID, deviceLab
 			return e
 		}
 		sessID = id
-		emit(ctx, q, "UserLoggedIn", "user", userID, map[string]any{"provider": provider})
+		emit(ctx, q, "UserLoggedIn", "user", userID, userID, map[string]any{"provider": provider})
 		return nil
 	})
 	if err != nil {
@@ -206,7 +210,7 @@ func (s *Service) createSession(ctx context.Context, userID uuid.UUID, deviceLab
 func (s *Service) Logout(ctx context.Context, jti uuid.UUID) error {
 	return s.withTx(ctx, func(q *db.Queries) error {
 		if row, err := q.GetSessionByJTI(ctx, toPg(jti)); err == nil {
-			emit(ctx, q, "SessionRevoked", "session", fromPg(row.ID), map[string]any{"reason": "logout"})
+			emit(ctx, q, "SessionRevoked", "session", fromPg(row.ID), fromPg(row.UserID), map[string]any{"reason": "logout"})
 		}
 		return q.RevokeSessionByJTI(ctx, toPg(jti))
 	})
@@ -254,7 +258,7 @@ func (s *Service) VerifyEmail(ctx context.Context, token string) error {
 	}
 	uid := uuid.MustParse(userID)
 	return s.withTx(ctx, func(q *db.Queries) error {
-		emit(ctx, q, "IdentityVerified", "user", uid, map[string]any{"method": "email_link"})
+		emit(ctx, q, "IdentityVerified", "user", uid, uid, map[string]any{"method": "email_link"})
 		return q.SetUserVerified(ctx, toPg(uid))
 	})
 }
@@ -291,11 +295,27 @@ func (s *Service) ResetPassword(ctx context.Context, token, newPassword string) 
 			return err
 		}
 		// revoke all sessions on password reset (§02)
-		emit(ctx, q, "PasswordChanged", "user", uid, map[string]any{"via": "reset_link"})
+		emit(ctx, q, "PasswordChanged", "user", uid, uid, map[string]any{"via": "reset_link"})
 		return q.RevokeAllUserSessions(ctx, toPg(uid))
 	})
 }
 
+// StageMFASecret parks a TOTP secret in Valkey (oga9:mfa:pending:{user_id},
+// 10 min) until the user proves it with a valid code — never trust a
+// client-supplied secret at confirm time.
+func (s *Service) StageMFASecret(ctx context.Context, userID uuid.UUID, secret string) error {
+	return s.vk.Do(ctx, s.vk.B().Set().Key("oga9:mfa:pending:"+userID.String()).Value(secret).ExSeconds(600).Build()).Error()
+}
+
+func (s *Service) PendingMFASecret(ctx context.Context, userID uuid.UUID) (string, error) {
+	return s.vk.Do(ctx, s.vk.B().Get().Key("oga9:mfa:pending:"+userID.String()).Build()).ToString()
+}
+
+func (s *Service) ClearPendingMFA(ctx context.Context, userID uuid.UUID) {
+	_ = s.vk.Do(ctx, s.vk.B().Del().Key("oga9:mfa:pending:"+userID.String()).Build())
+}
+
+// SetupMFA writes the confirmed secret to the user row.
 func (s *Service) SetupMFA(ctx context.Context, userID uuid.UUID, secret string) error {
 	return s.q.SetMFASecret(ctx, db.SetMFASecretParams{MfaSecret: []byte(secret), ID: toPg(userID)})
 }
@@ -306,6 +326,8 @@ func (s *Service) MFASecret(ctx context.Context, userID uuid.UUID) (string, erro
 
 type SessionInfo struct {
 	ID          uuid.UUID `json:"id"`
+	JTI         uuid.UUID `json:"-"`
+	Current     bool      `json:"current"`
 	DeviceLabel string    `json:"device_label"`
 	IP          string    `json:"ip"`
 	UserAgent   string    `json:"user_agent"`
@@ -322,6 +344,7 @@ func (s *Service) ListSessions(ctx context.Context, userID uuid.UUID) ([]Session
 	for i, r := range rows {
 		out[i] = SessionInfo{
 			ID:          fromPg(r.ID),
+			JTI:         fromPg(r.Jti),
 			DeviceLabel: r.DeviceLabel.String,
 			IP:          r.Ip,
 			UserAgent:   r.UserAgent.String,
@@ -334,7 +357,7 @@ func (s *Service) ListSessions(ctx context.Context, userID uuid.UUID) ([]Session
 
 func (s *Service) RevokeSession(ctx context.Context, userID, sessionID uuid.UUID) error {
 	return s.withTx(ctx, func(q *db.Queries) error {
-		emit(ctx, q, "SessionRevoked", "session", sessionID, map[string]any{"reason": "revoked_by_user"})
+		emit(ctx, q, "SessionRevoked", "session", sessionID, userID, map[string]any{"reason": "revoked_by_user"})
 		return q.RevokeSessionByID(ctx, db.RevokeSessionByIDParams{ID: toPg(sessionID), UserID: toPg(userID)})
 	})
 }

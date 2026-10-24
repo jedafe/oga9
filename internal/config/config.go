@@ -32,6 +32,7 @@ type Config struct {
 	S3SecretKey    string
 	ImgproxyURL    string
 	BaseURL        string
+	MailFrom       string
 }
 
 func Load() (*Config, error) {
@@ -54,6 +55,7 @@ func Load() (*Config, error) {
 		S3AccessKey:    env("OGA9_S3_ACCESS_KEY", ""),
 		S3SecretKey:    env("OGA9_S3_SECRET_KEY", ""),
 		ImgproxyURL:    env("OGA9_IMGPROXY_URL", ""),
+		MailFrom:       env("OGA9_MAIL_FROM", "noreply@oga9.com"),
 		BaseURL:        env("OGA9_BASE_URL", "http://localhost:8080"),
 	}
 	if cfg.JWTSecret == "change-me" && cfg.Env == "production" {

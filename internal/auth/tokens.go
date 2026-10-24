@@ -30,7 +30,8 @@ func VerifyActionToken(secret, token, purpose string) (jti, userID string, err e
 	}
 	sig := hmac.New(sha256.New, []byte(secret))
 	sig.Write([]byte(parts[0]))
-	if hex.EncodeToString(sig.Sum(nil))[:32] != parts[1] {
+	expected, _ := hex.DecodeString(parts[1])
+	if !hmac.Equal(sig.Sum(nil)[:16], expected) {
 		return "", "", errors.New("bad signature")
 	}
 	f := strings.Split(parts[0], "|")
