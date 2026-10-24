@@ -33,6 +33,8 @@ func orgErr(w http.ResponseWriter, err error) {
 		httpx.WriteErr(w, 400, "tenant_required", "you administer multiple tenants — send tenant_id")
 	case errors.Is(err, tenant.ErrNoTenant):
 		httpx.WriteErr(w, 403, "forbidden", "no admin rights on the requested tenant")
+	case errors.Is(err, tenant.ErrTermConflict):
+		httpx.WriteErr(w, 409, "term_conflict", "a current term already exists — close it first")
 	case errors.Is(err, tenant.ErrNotFound):
 		httpx.WriteErr(w, 404, "not_found", "resource not found")
 	case errors.Is(err, tenant.ErrUnitNotFound):

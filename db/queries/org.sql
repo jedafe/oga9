@@ -37,6 +37,13 @@ SELECT DISTINCT r.tenant_id FROM user_role_assignments ura
 JOIN user_roles r ON r.id = ura.role_id
 WHERE ura.user_id = sqlc.arg(user_id) AND r.slug = 'org_admin' AND r.tenant_id IS NOT NULL;
 
+-- name: HasRoleInTenant :one
+SELECT EXISTS(
+  SELECT 1 FROM user_role_assignments ura
+  JOIN user_roles r ON r.id = ura.role_id
+  WHERE ura.user_id = sqlc.arg(user_id) AND r.tenant_id = sqlc.arg(tenant_id) AND r.slug = sqlc.arg(slug)
+);
+
 -- name: GetTenant :one
 SELECT id, name, slug, billing_email, edition, status FROM tenants WHERE id = $1;
 

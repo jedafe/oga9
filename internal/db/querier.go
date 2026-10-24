@@ -73,6 +73,7 @@ type Querier interface {
 	GetUserByOAuthSubject(ctx context.Context, arg GetUserByOAuthSubjectParams) (pgtype.UUID, error)
 	GetUserIDByEmail(ctx context.Context, email string) (pgtype.UUID, error)
 	HasPermission(ctx context.Context, arg HasPermissionParams) (bool, error)
+	HasRoleInTenant(ctx context.Context, arg HasRoleInTenantParams) (bool, error)
 	InsertAuditEvent(ctx context.Context, arg InsertAuditEventParams) error
 	LinkOAuthProvider(ctx context.Context, arg LinkOAuthProviderParams) error
 	// Tenants where the caller holds the org_admin role — the server-side

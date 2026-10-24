@@ -39,6 +39,7 @@ var (
 	ErrTenantRequired   = errors.New("tenant_required")
 	ErrNoTenant         = errors.New("no_administered_tenant")
 	ErrNotFound         = errors.New("not_found")
+	ErrTermConflict     = errors.New("term_conflict")
 )
 
 type Service struct {
@@ -117,16 +118,10 @@ func (s *Service) InvalidateOrgCtx(ctx context.Context, userID, orgID uuid.UUID)
 // HasTenantRole reports whether the user holds the named role in the tenant —
 // used by tenant resolution where org context doesn't exist yet.
 func (s *Service) HasTenantRole(ctx context.Context, userID, tenantID uuid.UUID, slug string) bool {
-	admins, err := s.q.ListOrgAdminTenants(ctx, toPg(userID))
-	if err != nil {
-		return false
-	}
-	for _, t := range admins {
-		if fromPg(t) == tenantID {
-			return slug == "org_admin" // the only tenant-role check in use
-		}
-	}
-	return false
+	ok, err := s.q.HasRoleInTenant(ctx, db.HasRoleInTenantParams{
+		UserID: toPg(userID), TenantID: toPg(tenantID), Slug: slug,
+	})
+	return err == nil && ok
 }
 
 // UpdateOrgProfile moved to ops.go

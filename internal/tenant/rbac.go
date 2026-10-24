@@ -7,18 +7,21 @@ package tenant
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jedafe/oga9/internal/db"
 )
 
 type permSet struct {
-	Nodes     map[string]bool `json:"n"`
-	Branch    map[string]bool `json:"b"` // base nodes granted via branch-scoped appointments
-	Committee map[string]bool `json:"c"` // base nodes granted via committee scope/membership
+	Nodes       map[string]bool `json:"n"`
+	Branch      map[string]bool `json:"b"` // base nodes granted via branch-scoped appointments
+	Committee   map[string]bool `json:"c"` // base nodes granted via committee scope/membership
+	InCommittee bool            `json:"ic"`
 }
 
 // ResolvePermissions computes the user's effective node set for an org.
@@ -50,6 +53,11 @@ func (s *Service) ResolvePermissions(ctx context.Context, userID, orgID uuid.UUI
 			ps.Committee[sc.Permission] = true
 		}
 	}
+	units, err := s.q.UserCommitteeUnits(ctx, db.UserCommitteeUnitsParams{OrgID: toPg(orgID), UserID: toPg(userID)})
+	if err != nil {
+		return nil, err
+	}
+	ps.InCommittee = len(units) > 0
 	if b, err := json.Marshal(ps); err == nil {
 		_ = s.vk.Do(ctx, s.vk.B().Set().Key(key).Value(string(b)).ExSeconds(300).Build()).Error()
 	}
@@ -70,8 +78,12 @@ func (s *Service) HasPermission(ctx context.Context, userID, orgID uuid.UUID, no
 	if base, ok := strings.CutSuffix(node, "_branch"); ok {
 		return ps.Branch[base] || ps.Branch[node]
 	}
+	// QUESTION: §03 lists committee_memberships as a Rule-6 trigger but
+	// doesn't say whether membership alone scopes base nodes — read as
+	// conferring _committee on nodes the member already holds. Flag for
+	// review; tighten to appointment-only if that's wrong.
 	if base, ok := strings.CutSuffix(node, "_committee"); ok {
-		return ps.Committee[base] || ps.Committee[node]
+		return ps.Committee[base] || ps.Committee[node] || (ps.InCommittee && ps.Nodes[base])
 	}
 	return false
 }
@@ -103,7 +115,8 @@ func (s *Service) CreatePosition(ctx context.Context, oc *OrgCtx, name, slug str
 				return err
 			}
 		}
-		return nil
+		return emit(ctx, q, oc.TenantID, oc.OrgID, "PositionCreated", "org_position", id, oc.UserID, true,
+			map[string]any{"position_id": id, "org_id": oc.OrgID, "name": name})
 	})
 	return id, err
 }
@@ -118,6 +131,10 @@ func (s *Service) CreateTerm(ctx context.Context, oc *OrgCtx, label string, star
 			StartsAt: pgDate(startsAt), EndsAt: pgDate(endsAt), IsCurrent: current,
 		})
 		if err != nil {
+			var pgErr *pgconn.PgError
+			if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+				return ErrTermConflict // a current term already exists
+			}
 			return err
 		}
 		id = fromPg(tid)

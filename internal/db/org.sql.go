@@ -586,6 +586,27 @@ func (q *Queries) HasPermission(ctx context.Context, arg HasPermissionParams) (b
 	return allowed, err
 }
 
+const hasRoleInTenant = `-- name: HasRoleInTenant :one
+SELECT EXISTS(
+  SELECT 1 FROM user_role_assignments ura
+  JOIN user_roles r ON r.id = ura.role_id
+  WHERE ura.user_id = $1 AND r.tenant_id = $2 AND r.slug = $3
+)
+`
+
+type HasRoleInTenantParams struct {
+	UserID   pgtype.UUID `json:"user_id"`
+	TenantID pgtype.UUID `json:"tenant_id"`
+	Slug     string      `json:"slug"`
+}
+
+func (q *Queries) HasRoleInTenant(ctx context.Context, arg HasRoleInTenantParams) (bool, error) {
+	row := q.db.QueryRow(ctx, hasRoleInTenant, arg.UserID, arg.TenantID, arg.Slug)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
+}
+
 const listOrgAdminTenants = `-- name: ListOrgAdminTenants :many
 SELECT DISTINCT r.tenant_id FROM user_role_assignments ura
 JOIN user_roles r ON r.id = ura.role_id
