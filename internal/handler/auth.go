@@ -51,6 +51,7 @@ func (h *AuthHandler) Register(w http.ResponseWriter, r *http.Request) {
 	}
 	u, verifyToken, err := h.svc.Register(r.Context(), req.Email, req.Password, req.DisplayName)
 	if errors.Is(err, auth.ErrEmailTaken) { writeErr(w, 409, "email_taken", "email already registered"); return }
+	if errors.Is(err, auth.ErrWeakPassword) { writeErr(w, 400, "weak_password", "min 8 chars with a letter and a digit"); return }
 	if err != nil { writeErr(w, 500, "internal_error", "registration failed"); return }
 	h.mailer.Send(u.Email, "Verify your OGA9 account",
 		"Verify: "+verifyToken) // TODO(§02): branded template + link
@@ -60,13 +61,14 @@ func (h *AuthHandler) Register(w http.ResponseWriter, r *http.Request) {
 type loginReq struct {
 	Email       string `json:"email"`
 	Password    string `json:"password"`
+	MFACode     string `json:"mfa_code"`
 	DeviceLabel string `json:"device_label"`
 }
 func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 	var req loginReq
 	if err := decode(r, &req); err != nil { writeErr(w, 400, "validation_failed", "email+password required"); return }
 	ip, _, _ := net.SplitHostPort(r.RemoteAddr)
-	token, sessionID, err := h.svc.Login(r.Context(), req.Email, req.Password, req.DeviceLabel, ip, r.UserAgent())
+	token, sessionID, err := h.svc.Login(r.Context(), req.Email, req.Password, req.MFACode, req.DeviceLabel, ip, r.UserAgent())
 	if errors.Is(err, auth.ErrBadCredentials) { writeErr(w, 401, "invalid_credentials", "email or password incorrect"); return }
 	if errors.Is(err, auth.ErrUserSuspended) { writeErr(w, 403, "user_suspended", "account suspended"); return }
 	if err != nil { writeErr(w, 500, "internal_error", "login failed"); return }

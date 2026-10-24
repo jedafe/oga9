@@ -5,6 +5,9 @@ package config
 import (
 	"fmt"
 	"os"
+	"strings"
+
+	"github.com/jedafe/oga9/internal/auth"
 	"strconv"
 	"time"
 )
@@ -28,6 +31,7 @@ type Config struct {
 	S3AccessKey   string
 	S3SecretKey   string
 	ImgproxyURL   string
+	BaseURL       string
 }
 
 func Load() (*Config, error) {
@@ -50,6 +54,7 @@ func Load() (*Config, error) {
 		S3AccessKey:    env("OGA9_S3_ACCESS_KEY", ""),
 		S3SecretKey:    env("OGA9_S3_SECRET_KEY", ""),
 		ImgproxyURL:    env("OGA9_IMGPROXY_URL", ""),
+		BaseURL:       env("OGA9_BASE_URL", "http://localhost:8080"),
 	}
 	if cfg.JWTSecret == "change-me" && cfg.Env == "production" {
 		return nil, fmt.Errorf("OGA9_JWT_SECRET must be set in production")
@@ -98,3 +103,32 @@ func envInt(key string, fallback int) int {
 	return n
 }
 
+
+// OAuthProviders builds the configured provider map — a provider activates
+// only when its client id+secret env vars are set (§02).
+func (c *Config) OAuthProviders() map[string]auth.ProviderConfig {
+	defs := map[string]map[string]string{
+		"google": {
+			"auth":      "https://accounts.google.com/o/oauth2/v2/auth",
+			"token":     "https://oauth2.googleapis.com/token",
+			"userinfo":  "https://openidconnect.googleapis.com/v1/userinfo",
+		},
+		"japaconnect": {}, // URLs required via env (ADR-021 endpoint TBD)
+	}
+	out := map[string]auth.ProviderConfig{}
+	for name, urls := range defs {
+		id := os.Getenv("OGA9_OAUTH_" + strings.ToUpper(name) + "_CLIENT_ID")
+		secret := os.Getenv("OGA9_OAUTH_" + strings.ToUpper(name) + "_CLIENT_SECRET")
+		if id == "" || secret == "" {
+			continue
+		}
+		out[name] = auth.ProviderConfig{
+			ClientID:     id,
+			ClientSecret: secret,
+			AuthURL:      env("OGA9_OAUTH_"+strings.ToUpper(name)+"_AUTH_URL", urls["auth"]),
+			TokenURL:     env("OGA9_OAUTH_"+strings.ToUpper(name)+"_TOKEN_URL", urls["token"]),
+			UserinfoURL:  env("OGA9_OAUTH_"+strings.ToUpper(name)+"_USERINFO_URL", urls["userinfo"]),
+		}
+	}
+	return out
+}

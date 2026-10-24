@@ -94,7 +94,7 @@ func main() {
 	authSvc := auth.NewService(pool, vk, cfg.JWTSecret, cfg.SessionTTL)
 	authH := handler.NewAuthHandler(authSvc, mail, cfg.JWTSecret)
 	mfaH := handler.NewMFAHandler(authSvc)
-	oauthH := handler.NewOAuthHandler(authSvc)
+	oauthH := handler.NewOAuthHandler(authSvc, vk, cfg.OAuthProviders(), cfg.BaseURL)
 
 	r.Route("/api/v1", func(r chi.Router) {
 		r.Get("/", func(w http.ResponseWriter, r *http.Request) {
@@ -102,14 +102,14 @@ func main() {
 			w.Write([]byte(`{"data":{"service":"oga9","version":"0.0.1"}}`))
 		})
 
-		// public auth
-		r.Post("/auth/register", authH.Register)
-		r.Post("/auth/login", authH.Login)
+		// public auth — Valkey fixed-window rate limits (ADR-020 baseline)
+		r.With(middleware.RateLimit(vk, "register", 5, time.Minute)).Post("/auth/register", authH.Register)
+		r.With(middleware.RateLimit(vk, "login", 10, time.Minute)).Post("/auth/login", authH.Login)
 		r.Post("/auth/verify/{token}", authH.VerifyEmail)
-		r.Post("/auth/password/forgot", authH.ForgotPassword)
-		r.Post("/auth/password/reset", authH.ResetPassword)
-		r.Get("/auth/oauth/{provider}/start", oauthH.Start)
-		r.Get("/auth/oauth/{provider}/callback", oauthH.Callback)
+		r.With(middleware.RateLimit(vk, "forgot", 3, time.Minute)).Post("/auth/password/forgot", authH.ForgotPassword)
+		r.With(middleware.RateLimit(vk, "reset", 5, time.Minute)).Post("/auth/password/reset", authH.ResetPassword)
+		r.With(middleware.RateLimit(vk, "oauth", 20, time.Minute)).Get("/auth/oauth/{provider}/start", oauthH.Start)
+		r.With(middleware.RateLimit(vk, "oauth", 20, time.Minute)).Get("/auth/oauth/{provider}/callback", oauthH.Callback)
 
 		// authed
 		r.Group(func(r chi.Router) {
