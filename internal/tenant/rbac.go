@@ -78,10 +78,8 @@ func (s *Service) HasPermission(ctx context.Context, userID, orgID uuid.UUID, no
 	if base, ok := strings.CutSuffix(node, "_branch"); ok {
 		return ps.Branch[base] || ps.Branch[node]
 	}
-	// QUESTION: §03 lists committee_memberships as a Rule-6 trigger but
-	// doesn't say whether membership alone scopes base nodes — read as
-	// conferring _committee on nodes the member already holds. Flag for
-	// review; tighten to appointment-only if that's wrong.
+	// §03: committee membership confers _committee on nodes the member
+	// already holds via roles/positions.
 	if base, ok := strings.CutSuffix(node, "_committee"); ok {
 		return ps.Committee[base] || ps.Committee[node] || (ps.InCommittee && ps.Nodes[base])
 	}
@@ -129,7 +127,36 @@ func (s *Service) CreatePosition(ctx context.Context, oc *OrgCtx, name, slug str
 // per org — the partial unique index enforces it.
 func (s *Service) CreateTerm(ctx context.Context, oc *OrgCtx, label string, startsAt, endsAt time.Time, current bool) (uuid.UUID, error) {
 	var id uuid.UUID
+	var outgoing []uuid.UUID
 	err := s.withTx(ctx, func(q *db.Queries) error {
+		if current {
+			// §03: a new current term auto-closes the predecessor and ends
+			// its open appointments in the same tx (EXCO handover).
+			prev, err := q.CloseCurrentTerm(ctx, toPg(oc.OrgID))
+			if err == nil {
+				ended, err := q.EndTermAppointments(ctx, prev)
+				if err != nil {
+					return err
+				}
+				for _, ap := range ended {
+					m, err := q.GetMembershipByID(ctx, ap.MemberID)
+					if err != nil {
+						return err
+					}
+					outgoing = append(outgoing, fromPg(m.UserID))
+					if err := emit(ctx, q, oc.TenantID, oc.OrgID, "AppointmentEnded", "officer_appointment", fromPg(ap.ID), oc.UserID, true,
+						map[string]any{"appointment_id": fromPg(ap.ID), "term_id": fromPg(prev), "org_id": oc.OrgID}); err != nil {
+						return err
+					}
+				}
+				if err := emit(ctx, q, oc.TenantID, oc.OrgID, "TermClosed", "term", fromPg(prev), oc.UserID, true,
+					map[string]any{"term_id": fromPg(prev), "org_id": oc.OrgID, "reason": "superseded"}); err != nil {
+					return err
+				}
+			} else if err != pgx.ErrNoRows {
+				return err
+			}
+		}
 		tid, err := q.CreateTerm(ctx, db.CreateTermParams{
 			OrganizationID: toPg(oc.OrgID), Label: label,
 			StartsAt: pgDate(startsAt), EndsAt: pgDate(endsAt), IsCurrent: current,
@@ -145,6 +172,9 @@ func (s *Service) CreateTerm(ctx context.Context, oc *OrgCtx, label string, star
 		return emit(ctx, q, oc.TenantID, oc.OrgID, "TermStarted", "term", id, oc.UserID, true,
 			map[string]any{"term_id": id, "org_id": oc.OrgID})
 	})
+	for _, u := range outgoing {
+		s.InvalidatePermCache(ctx, u, oc.OrgID)
+	}
 	return id, err
 }
 

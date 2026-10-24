@@ -19,6 +19,8 @@ type Querier interface {
 	CloneTenantRolePermissions(ctx context.Context, tenantID pgtype.UUID) error
 	// Instantiate system role templates into tenant-scoped roles at org creation.
 	CloneTenantRoles(ctx context.Context, tenantID pgtype.UUID) error
+	// Auto-close the org's live term when a new current term is created (§03).
+	CloseCurrentTerm(ctx context.Context, orgID pgtype.UUID) (pgtype.UUID, error)
 	// Closes the current term; appointments lose their is_current backing.
 	// RETURNING lets callers distinguish unknown/foreign/closed terms (404).
 	CloseTerm(ctx context.Context, arg CloseTermParams) (pgtype.UUID, error)

@@ -86,6 +86,20 @@ func (q *Queries) AssignPositionPermission(ctx context.Context, arg AssignPositi
 	return err
 }
 
+const closeCurrentTerm = `-- name: CloseCurrentTerm :one
+UPDATE terms SET is_current = false
+WHERE organization_id = $1::uuid AND is_current
+RETURNING id
+`
+
+// Auto-close the org's live term when a new current term is created (§03).
+func (q *Queries) CloseCurrentTerm(ctx context.Context, orgID pgtype.UUID) (pgtype.UUID, error) {
+	row := q.db.QueryRow(ctx, closeCurrentTerm, orgID)
+	var id pgtype.UUID
+	err := row.Scan(&id)
+	return id, err
+}
+
 const closeTerm = `-- name: CloseTerm :one
 UPDATE terms SET is_current = false
 WHERE id = $1 AND organization_id = $2::uuid AND is_current

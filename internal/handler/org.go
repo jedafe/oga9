@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -307,4 +308,138 @@ func (h *OrgHandler) Directory(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httpx.WriteData(w, 200, orgs)
+}
+
+// ---------- Phase 04: positions / terms / appointments / committees (§03) ----------
+
+type positionReq struct {
+	Name        string   `json:"name"`
+	Slug        string   `json:"slug"`
+	IsExecutive bool     `json:"is_executive"`
+	Seats       int32    `json:"seats"`
+	Permissions []string `json:"permissions"`
+}
+
+func (h *OrgHandler) CreatePosition(w http.ResponseWriter, r *http.Request) {
+	var req positionReq
+	if err := httpx.Decode(w, r, &req); err != nil || req.Name == "" || req.Slug == "" {
+		httpx.WriteErr(w, 400, "validation_failed", "name and slug required")
+		return
+	}
+	id, err := h.svc.CreatePosition(r.Context(), middleware.OrgCtx(r.Context()),
+		req.Name, req.Slug, req.IsExecutive, req.Seats, req.Permissions)
+	if err != nil {
+		orgErr(w, err)
+		return
+	}
+	httpx.WriteData(w, 201, map[string]any{"position_id": id})
+}
+
+type termReq struct {
+	Label    string `json:"label"`
+	StartsAt string `json:"starts_at"`
+	EndsAt   string `json:"ends_at"`
+	Current  bool   `json:"is_current"`
+}
+
+func parseDate(s string) (time.Time, bool) {
+	t, err := time.Parse("2006-01-02", s)
+	return t, err == nil
+}
+
+func (h *OrgHandler) CreateTerm(w http.ResponseWriter, r *http.Request) {
+	var req termReq
+	sa, ok1 := parseDate(req.StartsAt)
+	ea, ok2 := parseDate(req.EndsAt)
+	if err := httpx.Decode(w, r, &req); err != nil || req.Label == "" {
+		httpx.WriteErr(w, 400, "validation_failed", "label required")
+		return
+	}
+	if !ok1 || !ok2 {
+		httpx.WriteErr(w, 400, "validation_failed", "starts_at/ends_at must be YYYY-MM-DD")
+		return
+	}
+	id, err := h.svc.CreateTerm(r.Context(), middleware.OrgCtx(r.Context()), req.Label, sa, ea, req.Current)
+	if err != nil {
+		orgErr(w, err)
+		return
+	}
+	httpx.WriteData(w, 201, map[string]any{"term_id": id})
+}
+
+func (h *OrgHandler) CloseTerm(w http.ResponseWriter, r *http.Request) {
+	termID, _ := uuid.Parse(chi.URLParam(r, "term_id"))
+	if err := h.svc.CloseTerm(r.Context(), middleware.OrgCtx(r.Context()), termID); err != nil {
+		orgErr(w, err)
+		return
+	}
+	httpx.WriteData(w, 200, map[string]any{"closed": true})
+}
+
+type appointReq struct {
+	TermID      uuid.UUID `json:"term_id"`
+	PositionID  uuid.UUID `json:"position_id"`
+	MemberID    uuid.UUID `json:"member_id"`
+	BranchID    uuid.UUID `json:"branch_id"`
+	CommitteeID uuid.UUID `json:"committee_id"`
+	StartsAt    string    `json:"starts_at"`
+}
+
+func (h *OrgHandler) Appoint(w http.ResponseWriter, r *http.Request) {
+	var req appointReq
+	sa, _ := parseDate(req.StartsAt)
+	if err := httpx.Decode(w, r, &req); err != nil || req.TermID == uuid.Nil || req.PositionID == uuid.Nil || req.MemberID == uuid.Nil {
+		httpx.WriteErr(w, 400, "validation_failed", "term_id, position_id and member_id required")
+		return
+	}
+	if sa.IsZero() {
+		sa = time.Now()
+	}
+	id, err := h.svc.AppointOfficer(r.Context(), middleware.OrgCtx(r.Context()),
+		req.TermID, req.PositionID, req.MemberID, req.BranchID, req.CommitteeID, sa)
+	if err != nil {
+		orgErr(w, err)
+		return
+	}
+	httpx.WriteData(w, 201, map[string]any{"appointment_id": id})
+}
+
+func (h *OrgHandler) EndAppointment(w http.ResponseWriter, r *http.Request) {
+	apptID, _ := uuid.Parse(chi.URLParam(r, "appointment_id"))
+	if err := h.svc.EndAppointment(r.Context(), middleware.OrgCtx(r.Context()), apptID); err != nil {
+		orgErr(w, err)
+		return
+	}
+	httpx.WriteData(w, 200, map[string]any{"ended": true})
+}
+
+type committeeMemberReq struct {
+	MemberID uuid.UUID `json:"member_id"`
+	Role     string    `json:"role"`
+}
+
+func (h *OrgHandler) AddCommitteeMember(w http.ResponseWriter, r *http.Request) {
+	var req committeeMemberReq
+	unitID, _ := uuid.Parse(chi.URLParam(r, "unit_id"))
+	if err := httpx.Decode(w, r, &req); err != nil || req.MemberID == uuid.Nil {
+		httpx.WriteErr(w, 400, "validation_failed", "member_id required")
+		return
+	}
+	if req.Role == "" {
+		req.Role = "member"
+	}
+	if err := h.svc.AddCommitteeMember(r.Context(), middleware.OrgCtx(r.Context()), unitID, req.MemberID, req.Role); err != nil {
+		orgErr(w, err)
+		return
+	}
+	httpx.WriteData(w, 201, map[string]any{"added": true})
+}
+
+func (h *OrgHandler) RemoveCommitteeMember(w http.ResponseWriter, r *http.Request) {
+	cmID, _ := uuid.Parse(chi.URLParam(r, "cm_id"))
+	if err := h.svc.RemoveCommitteeMember(r.Context(), middleware.OrgCtx(r.Context()), cmID); err != nil {
+		orgErr(w, err)
+		return
+	}
+	httpx.WriteData(w, 200, map[string]any{"removed": true})
 }

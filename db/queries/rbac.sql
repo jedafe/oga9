@@ -112,3 +112,9 @@ SELECT seats FROM org_positions WHERE id = sqlc.arg(id)::uuid;
 SELECT count(*) FROM officer_appointments
 WHERE position_id = sqlc.arg(position_id)::uuid AND term_id = sqlc.arg(term_id)::uuid
   AND (ends_at IS NULL OR ends_at >= CURRENT_DATE);
+
+-- name: CloseCurrentTerm :one
+-- Auto-close the org's live term when a new current term is created (§03).
+UPDATE terms SET is_current = false
+WHERE organization_id = sqlc.arg(org_id)::uuid AND is_current
+RETURNING id;
