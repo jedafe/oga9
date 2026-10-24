@@ -10,6 +10,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jedafe/oga9/internal/db"
 )
 
 type Entry struct {
@@ -27,9 +29,20 @@ type Entry struct {
 // audited mutation.
 func Log(ctx context.Context, tx pgx.Tx, e Entry) error {
 	ctxJSON, _ := json.Marshal(e.Context)
-	_, err := tx.Exec(ctx,
-		`INSERT INTO audit_events (tenant_id, organization_id, actor_id, action, target_type, target_id, context)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-		e.TenantID, e.OrganizationID, e.ActorID, e.Action, e.TargetType, e.TargetID, ctxJSON)
-	return err
+	return db.New(tx).InsertAuditEvent(ctx, db.InsertAuditEventParams{
+		TenantID:       optUUID(e.TenantID),
+		OrganizationID: optUUID(e.OrganizationID),
+		ActorID:        optUUID(e.ActorID),
+		Action:         e.Action,
+		TargetType:     pgtype.Text{String: e.TargetType, Valid: e.TargetType != ""},
+		TargetID:       optUUID(e.TargetID),
+		Context:        ctxJSON,
+	})
+}
+
+func optUUID(u *uuid.UUID) pgtype.UUID {
+	if u == nil {
+		return pgtype.UUID{}
+	}
+	return pgtype.UUID{Bytes: *u, Valid: true}
 }

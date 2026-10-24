@@ -1,8 +1,8 @@
--- Group 6 (pulled forward for Phase 02 event emission): domain-event outbox.
+-- Group 6: domain-event outbox (lands with Phase 02 emission per §05).
 -- Ref: oga9-engineering/sections/05-domain-events-infrastructure.md
 CREATE TABLE domain_events (
   id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  name          text NOT NULL,               -- e.g. user.registered
+  name          text NOT NULL,               -- e.g. UserRegistered
   aggregate_type text NOT NULL,              -- e.g. user, organization, payment
   aggregate_id  uuid NOT NULL,
   tenant_id     uuid REFERENCES tenants(id), -- null = platform-scoped event

@@ -3,18 +3,17 @@
 
 -- name: CreateUser :one
 INSERT INTO users (email, password_hash, display_name)
-VALUES ($1, $2, $3)
+VALUES (sqlc.arg(email), sqlc.arg(password_hash), sqlc.arg(display_name))
 RETURNING id, email, display_name, is_verified, status;
 
 -- name: CreateOAuthUser :one
 INSERT INTO users (email, display_name, is_verified, status)
-VALUES ($1, $2, $3, 'active')
+VALUES (sqlc.arg(email), sqlc.arg(display_name), sqlc.arg(is_verified), 'active')
 RETURNING id;
 
 -- name: GetUserByEmail :one
-SELECT id, email, display_name, is_verified, status, password_hash,
-       COALESCE(convert_from(mfa_secret, 'UTF8'), '')::text AS mfa_secret
-FROM users WHERE email = $1;
+SELECT id, email, display_name, is_verified, status, password_hash, mfa_secret
+FROM users WHERE email = sqlc.arg(email);
 
 -- name: GetUserByID :one
 SELECT id, email, display_name, is_verified, status
@@ -33,15 +32,19 @@ UPDATE users SET password_hash = $1 WHERE id = $2;
 UPDATE users SET mfa_secret = $1 WHERE id = $2;
 
 -- name: GetMFASecret :one
-SELECT COALESCE(convert_from(mfa_secret, 'UTF8'), '')::text AS mfa_secret FROM users WHERE id = $1;
+SELECT mfa_secret FROM users WHERE id = $1;
 
 -- name: CreateSession :one
 INSERT INTO user_sessions (user_id, jti, device_label, ip, user_agent, expires_at)
-VALUES ($1, $2, $3, NULLIF($4::text, '')::inet, $5, $6)
+VALUES (sqlc.arg(user_id), sqlc.arg(jti), sqlc.arg(device_label),
+        NULLIF(sqlc.arg(ip)::text, '')::inet, sqlc.arg(user_agent), sqlc.arg(expires_at))
 RETURNING id;
 
 -- name: GetSessionByJTI :one
-SELECT id, user_id, revoked_at, expires_at FROM user_sessions WHERE jti = $1;
+SELECT s.id, s.user_id, s.revoked_at, s.expires_at, u.status AS user_status
+FROM user_sessions s
+JOIN users u ON u.id = s.user_id
+WHERE s.jti = $1;
 
 -- name: ListUserSessions :many
 SELECT id, jti, device_label, ip::text AS ip, user_agent, created_at, expires_at
@@ -52,9 +55,10 @@ ORDER BY created_at DESC;
 -- name: RevokeSessionByJTI :exec
 UPDATE user_sessions SET revoked_at = now() WHERE jti = $1 AND revoked_at IS NULL;
 
--- name: RevokeSessionByID :exec
+-- name: RevokeSessionByID :one
 UPDATE user_sessions SET revoked_at = now()
-WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL;
+WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL
+RETURNING id;
 
 -- name: RevokeAllUserSessions :exec
 UPDATE user_sessions SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL;
@@ -67,9 +71,8 @@ ON CONFLICT (provider, provider_subject) DO NOTHING;
 -- name: GetUserByOAuthSubject :one
 SELECT user_id FROM oauth_providers WHERE provider = $1 AND provider_subject = $2;
 
--- name: EmitDomainEvent :exec
-INSERT INTO domain_events (name, aggregate_type, aggregate_id, payload)
-VALUES ($1, $2, $3, $4);
+-- name: SetJapaconnectUserID :exec
+UPDATE users SET japaconnect_user_id = sqlc.arg(japaconnect_user_id) WHERE id = sqlc.arg(user_id);
 
 -- name: GetRecoveryCodes :one
 SELECT mfa_recovery_codes FROM users WHERE id = $1;
@@ -78,6 +81,16 @@ SELECT mfa_recovery_codes FROM users WHERE id = $1;
 UPDATE users SET mfa_recovery_codes = $2 WHERE id = $1;
 
 -- name: GetUserAuthState :one
-SELECT id, password_hash, convert_from(mfa_secret, 'UTF8')::text AS mfa_secret,
-       status, is_verified
+SELECT id, password_hash, mfa_secret, status, is_verified
 FROM users WHERE id = $1;
+
+-- name: UserRequiresMFA :one
+SELECT EXISTS (
+  SELECT 1
+  FROM user_role_assignments ura
+  JOIN user_roles r ON r.id = ura.role_id
+  LEFT JOIN role_permissions rp ON rp.role_id = r.id
+  LEFT JOIN permissions p ON p.node = rp.permission
+  WHERE ura.user_id = sqlc.arg(user_id)
+    AND (r.slug = 'org_admin' OR p.node LIKE 'platform.%')
+) AS requires_mfa;

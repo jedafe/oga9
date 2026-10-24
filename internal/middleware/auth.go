@@ -4,12 +4,12 @@ package middleware
 
 import (
 	"context"
-	"encoding/json"
 	"net/http"
 	"strings"
 
 	"github.com/google/uuid"
 	"github.com/jedafe/oga9/internal/auth"
+	"github.com/jedafe/oga9/internal/httpx"
 )
 
 type ctxKey string
@@ -17,33 +17,75 @@ type ctxKey string
 const (
 	CtxUserID     ctxKey = "user_id"
 	CtxSessionJTI ctxKey = "session_jti"
+	CtxMFAGate    ctxKey = "mfa_gate"
 )
+
+func bearerToken(r *http.Request) (string, bool) {
+	h := r.Header.Get("Authorization")
+	if !strings.HasPrefix(h, "Bearer ") {
+		return "", false
+	}
+	return strings.TrimPrefix(h, "Bearer "), true
+}
+
+// resolveSessionToken parses a Bearer JWT and validates the live session row.
+func resolveSessionToken(r *http.Request, svc *auth.Service, jwtSecret, token string) (context.Context, bool) {
+	claims, err := auth.ParseToken(jwtSecret, token)
+	if err != nil {
+		return nil, false
+	}
+	jti, err := uuid.Parse(claims.ID)
+	if err != nil {
+		return nil, false
+	}
+	userID, err := svc.ResolveSession(r.Context(), jti)
+	if err != nil {
+		return nil, false
+	}
+	ctx := context.WithValue(r.Context(), CtxUserID, userID)
+	return context.WithValue(ctx, CtxSessionJTI, jti), true
+}
 
 func RequireAuth(svc *auth.Service, jwtSecret string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			h := r.Header.Get("Authorization")
-			if !strings.HasPrefix(h, "Bearer ") {
-				writeErr(w, 401, "unauthorized", "missing bearer token")
+			token, ok := bearerToken(r)
+			if !ok {
+				httpx.WriteErr(w, 401, "unauthorized", "missing bearer token")
 				return
 			}
-			claims, err := auth.ParseToken(jwtSecret, strings.TrimPrefix(h, "Bearer "))
-			if err != nil {
-				writeErr(w, 401, "unauthorized", "invalid token")
+			ctx, ok := resolveSessionToken(r, svc, jwtSecret, token)
+			if !ok {
+				httpx.WriteErr(w, 401, "session_revoked", "session expired or revoked")
 				return
 			}
-			jti, err := uuid.Parse(claims.ID)
-			if err != nil {
-				writeErr(w, 401, "unauthorized", "bad jti")
+			next.ServeHTTP(w, r.WithContext(ctx))
+		})
+	}
+}
+
+// RequireAuthOrMFAGate accepts a full session OR an mfa gate nonce as the
+// Bearer credential — used on mfa/setup + mfa/confirm so a privileged login
+// held at mfa_setup_required can still enroll (§02).
+func RequireAuthOrMFAGate(svc *auth.Service, jwtSecret string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			token, ok := bearerToken(r)
+			if !ok {
+				httpx.WriteErr(w, 401, "unauthorized", "missing bearer token")
 				return
 			}
-			userID, err := svc.ResolveSession(r.Context(), jti)
+			if ctx, ok := resolveSessionToken(r, svc, jwtSecret, token); ok {
+				next.ServeHTTP(w, r.WithContext(ctx))
+				return
+			}
+			userID, err := svc.ResolveMFAGate(r.Context(), token)
 			if err != nil {
-				writeErr(w, 401, "session_revoked", "session expired or revoked")
+				httpx.WriteErr(w, 401, "session_revoked", "session expired, revoked, or invalid mfa token")
 				return
 			}
 			ctx := context.WithValue(r.Context(), CtxUserID, userID)
-			ctx = context.WithValue(ctx, CtxSessionJTI, jti)
+			ctx = context.WithValue(ctx, CtxMFAGate, true)
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
@@ -61,11 +103,7 @@ func SessionJTI(ctx context.Context) uuid.UUID {
 	}
 	return uuid.Nil
 }
-
-func writeErr(w http.ResponseWriter, status int, code, msg string) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(map[string]any{
-		"error": map[string]any{"code": code, "message": msg, "status": status},
-	})
+func ViaMFAGate(ctx context.Context) bool {
+	v, _ := ctx.Value(CtxMFAGate).(bool)
+	return v
 }

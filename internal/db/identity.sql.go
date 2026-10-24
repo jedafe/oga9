@@ -32,7 +32,8 @@ func (q *Queries) CreateOAuthUser(ctx context.Context, arg CreateOAuthUserParams
 
 const createSession = `-- name: CreateSession :one
 INSERT INTO user_sessions (user_id, jti, device_label, ip, user_agent, expires_at)
-VALUES ($1, $2, $3, NULLIF($4::text, '')::inet, $5, $6)
+VALUES ($1, $2, $3,
+        NULLIF($4::text, '')::inet, $5, $6)
 RETURNING id
 `
 
@@ -40,7 +41,7 @@ type CreateSessionParams struct {
 	UserID      pgtype.UUID        `json:"user_id"`
 	Jti         pgtype.UUID        `json:"jti"`
 	DeviceLabel pgtype.Text        `json:"device_label"`
-	Column4     string             `json:"column_4"`
+	Ip          string             `json:"ip"`
 	UserAgent   pgtype.Text        `json:"user_agent"`
 	ExpiresAt   pgtype.Timestamptz `json:"expires_at"`
 }
@@ -50,7 +51,7 @@ func (q *Queries) CreateSession(ctx context.Context, arg CreateSessionParams) (p
 		arg.UserID,
 		arg.Jti,
 		arg.DeviceLabel,
-		arg.Column4,
+		arg.Ip,
 		arg.UserAgent,
 		arg.ExpiresAt,
 	)
@@ -95,35 +96,13 @@ func (q *Queries) CreateUser(ctx context.Context, arg CreateUserParams) (CreateU
 	return i, err
 }
 
-const emitDomainEvent = `-- name: EmitDomainEvent :exec
-INSERT INTO domain_events (name, aggregate_type, aggregate_id, payload)
-VALUES ($1, $2, $3, $4)
-`
-
-type EmitDomainEventParams struct {
-	Name          string      `json:"name"`
-	AggregateType string      `json:"aggregate_type"`
-	AggregateID   pgtype.UUID `json:"aggregate_id"`
-	Payload       []byte      `json:"payload"`
-}
-
-func (q *Queries) EmitDomainEvent(ctx context.Context, arg EmitDomainEventParams) error {
-	_, err := q.db.Exec(ctx, emitDomainEvent,
-		arg.Name,
-		arg.AggregateType,
-		arg.AggregateID,
-		arg.Payload,
-	)
-	return err
-}
-
 const getMFASecret = `-- name: GetMFASecret :one
-SELECT COALESCE(convert_from(mfa_secret, 'UTF8'), '')::text AS mfa_secret FROM users WHERE id = $1
+SELECT mfa_secret FROM users WHERE id = $1
 `
 
-func (q *Queries) GetMFASecret(ctx context.Context, id pgtype.UUID) (string, error) {
+func (q *Queries) GetMFASecret(ctx context.Context, id pgtype.UUID) ([]byte, error) {
 	row := q.db.QueryRow(ctx, getMFASecret, id)
-	var mfa_secret string
+	var mfa_secret []byte
 	err := row.Scan(&mfa_secret)
 	return mfa_secret, err
 }
@@ -140,14 +119,18 @@ func (q *Queries) GetRecoveryCodes(ctx context.Context, id pgtype.UUID) ([]byte,
 }
 
 const getSessionByJTI = `-- name: GetSessionByJTI :one
-SELECT id, user_id, revoked_at, expires_at FROM user_sessions WHERE jti = $1
+SELECT s.id, s.user_id, s.revoked_at, s.expires_at, u.status AS user_status
+FROM user_sessions s
+JOIN users u ON u.id = s.user_id
+WHERE s.jti = $1
 `
 
 type GetSessionByJTIRow struct {
-	ID        pgtype.UUID        `json:"id"`
-	UserID    pgtype.UUID        `json:"user_id"`
-	RevokedAt pgtype.Timestamptz `json:"revoked_at"`
-	ExpiresAt pgtype.Timestamptz `json:"expires_at"`
+	ID         pgtype.UUID        `json:"id"`
+	UserID     pgtype.UUID        `json:"user_id"`
+	RevokedAt  pgtype.Timestamptz `json:"revoked_at"`
+	ExpiresAt  pgtype.Timestamptz `json:"expires_at"`
+	UserStatus string             `json:"user_status"`
 }
 
 func (q *Queries) GetSessionByJTI(ctx context.Context, jti pgtype.UUID) (GetSessionByJTIRow, error) {
@@ -158,20 +141,20 @@ func (q *Queries) GetSessionByJTI(ctx context.Context, jti pgtype.UUID) (GetSess
 		&i.UserID,
 		&i.RevokedAt,
 		&i.ExpiresAt,
+		&i.UserStatus,
 	)
 	return i, err
 }
 
 const getUserAuthState = `-- name: GetUserAuthState :one
-SELECT id, password_hash, convert_from(mfa_secret, 'UTF8')::text AS mfa_secret,
-       status, is_verified
+SELECT id, password_hash, mfa_secret, status, is_verified
 FROM users WHERE id = $1
 `
 
 type GetUserAuthStateRow struct {
 	ID           pgtype.UUID `json:"id"`
 	PasswordHash pgtype.Text `json:"password_hash"`
-	MfaSecret    string      `json:"mfa_secret"`
+	MfaSecret    []byte      `json:"mfa_secret"`
 	Status       string      `json:"status"`
 	IsVerified   bool        `json:"is_verified"`
 }
@@ -190,8 +173,7 @@ func (q *Queries) GetUserAuthState(ctx context.Context, id pgtype.UUID) (GetUser
 }
 
 const getUserByEmail = `-- name: GetUserByEmail :one
-SELECT id, email, display_name, is_verified, status, password_hash,
-       COALESCE(convert_from(mfa_secret, 'UTF8'), '')::text AS mfa_secret
+SELECT id, email, display_name, is_verified, status, password_hash, mfa_secret
 FROM users WHERE email = $1
 `
 
@@ -202,7 +184,7 @@ type GetUserByEmailRow struct {
 	IsVerified   bool        `json:"is_verified"`
 	Status       string      `json:"status"`
 	PasswordHash pgtype.Text `json:"password_hash"`
-	MfaSecret    string      `json:"mfa_secret"`
+	MfaSecret    []byte      `json:"mfa_secret"`
 }
 
 func (q *Queries) GetUserByEmail(ctx context.Context, email string) (GetUserByEmailRow, error) {
@@ -344,9 +326,10 @@ func (q *Queries) RevokeAllUserSessions(ctx context.Context, userID pgtype.UUID)
 	return err
 }
 
-const revokeSessionByID = `-- name: RevokeSessionByID :exec
+const revokeSessionByID = `-- name: RevokeSessionByID :one
 UPDATE user_sessions SET revoked_at = now()
 WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL
+RETURNING id
 `
 
 type RevokeSessionByIDParams struct {
@@ -354,9 +337,11 @@ type RevokeSessionByIDParams struct {
 	UserID pgtype.UUID `json:"user_id"`
 }
 
-func (q *Queries) RevokeSessionByID(ctx context.Context, arg RevokeSessionByIDParams) error {
-	_, err := q.db.Exec(ctx, revokeSessionByID, arg.ID, arg.UserID)
-	return err
+func (q *Queries) RevokeSessionByID(ctx context.Context, arg RevokeSessionByIDParams) (pgtype.UUID, error) {
+	row := q.db.QueryRow(ctx, revokeSessionByID, arg.ID, arg.UserID)
+	var id pgtype.UUID
+	err := row.Scan(&id)
+	return id, err
 }
 
 const revokeSessionByJTI = `-- name: RevokeSessionByJTI :exec
@@ -365,6 +350,20 @@ UPDATE user_sessions SET revoked_at = now() WHERE jti = $1 AND revoked_at IS NUL
 
 func (q *Queries) RevokeSessionByJTI(ctx context.Context, jti pgtype.UUID) error {
 	_, err := q.db.Exec(ctx, revokeSessionByJTI, jti)
+	return err
+}
+
+const setJapaconnectUserID = `-- name: SetJapaconnectUserID :exec
+UPDATE users SET japaconnect_user_id = $1 WHERE id = $2
+`
+
+type SetJapaconnectUserIDParams struct {
+	JapaconnectUserID pgtype.UUID `json:"japaconnect_user_id"`
+	UserID            pgtype.UUID `json:"user_id"`
+}
+
+func (q *Queries) SetJapaconnectUserID(ctx context.Context, arg SetJapaconnectUserIDParams) error {
+	_, err := q.db.Exec(ctx, setJapaconnectUserID, arg.JapaconnectUserID, arg.UserID)
 	return err
 }
 
@@ -417,4 +416,23 @@ type UpdateUserPasswordParams struct {
 func (q *Queries) UpdateUserPassword(ctx context.Context, arg UpdateUserPasswordParams) error {
 	_, err := q.db.Exec(ctx, updateUserPassword, arg.PasswordHash, arg.ID)
 	return err
+}
+
+const userRequiresMFA = `-- name: UserRequiresMFA :one
+SELECT EXISTS (
+  SELECT 1
+  FROM user_role_assignments ura
+  JOIN user_roles r ON r.id = ura.role_id
+  LEFT JOIN role_permissions rp ON rp.role_id = r.id
+  LEFT JOIN permissions p ON p.node = rp.permission
+  WHERE ura.user_id = $1
+    AND (r.slug = 'org_admin' OR p.node LIKE 'platform.%')
+) AS requires_mfa
+`
+
+func (q *Queries) UserRequiresMFA(ctx context.Context, userID pgtype.UUID) (bool, error) {
+	row := q.db.QueryRow(ctx, userRequiresMFA, userID)
+	var requires_mfa bool
+	err := row.Scan(&requires_mfa)
+	return requires_mfa, err
 }

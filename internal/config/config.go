@@ -3,14 +3,16 @@
 package config
 
 import (
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
 	"os"
 	"strconv"
 	"strings"
 	"time"
-
-	"github.com/jedafe/oga9/internal/auth"
 )
 
 type Config struct {
@@ -18,6 +20,7 @@ type Config struct {
 	DatabaseURL    string
 	ValkeyAddr     string
 	JWTSecret      string
+	DataKey        []byte // 32B AES key for secrets at rest (mfa_secret etc.)
 	BaseDomain     string
 	ControlHost    string
 	APIPort        int
@@ -37,18 +40,25 @@ type Config struct {
 	TrustedProxies []*net.IPNet
 }
 
+// OAuthProviderEnv is a raw provider env bundle; cmd/api maps it onto
+// auth.ProviderConfig so config stays free of domain-package imports.
+type OAuthProviderEnv struct {
+	ClientID, ClientSecret, AuthURL, TokenURL, UserinfoURL string
+}
+
 func Load() (*Config, error) {
+	var errs []error
 	cfg := &Config{
 		Env:            env("OGA9_ENV", "development"),
-		DatabaseURL:    mustEnv("OGA9_DATABASE_URL"),
-		ValkeyAddr:     mustEnv("OGA9_VALKEY_ADDR"),
-		JWTSecret:      mustEnv("OGA9_JWT_SECRET"),
+		DatabaseURL:    reqEnv(&errs, "OGA9_DATABASE_URL"),
+		ValkeyAddr:     reqEnv(&errs, "OGA9_VALKEY_ADDR"),
+		JWTSecret:      reqEnv(&errs, "OGA9_JWT_SECRET"),
 		BaseDomain:     env("OGA9_BASE_DOMAIN", "oga9.com"),
 		ControlHost:    env("OGA9_CONTROL_HOST", "control.oga9.com"),
-		APIPort:        envInt("OGA9_API_PORT", 8080),
-		SessionTTL:     envDur("OGA9_SESSION_TTL", 24*time.Hour),
+		APIPort:        envInt(&errs, "OGA9_API_PORT", 8080),
+		SessionTTL:     envDur(&errs, "OGA9_SESSION_TTL", 24*time.Hour),
 		SMTPHost:       env("OGA9_SMTP_HOST", "localhost"),
-		SMTPPort:       envInt("OGA9_SMTP_PORT", 1025),
+		SMTPPort:       envInt(&errs, "OGA9_SMTP_PORT", 1025),
 		GlitchTipDSN:   env("OGA9_GLITCHTIP_DSN", ""),
 		MeilisearchURL: env("OGA9_MEILISEARCH_URL", ""),
 		MeilisearchKey: env("OGA9_MEILISEARCH_KEY", ""),
@@ -61,16 +71,46 @@ func Load() (*Config, error) {
 		BaseURL:        env("OGA9_BASE_URL", "http://localhost:8080"),
 	}
 	for _, c := range strings.Split(env("OGA9_TRUSTED_PROXIES", ""), ",") {
-		if c = strings.TrimSpace(c); c != "" {
-			if _, n, err := net.ParseCIDR(c); err == nil {
-				cfg.TrustedProxies = append(cfg.TrustedProxies, n)
-			}
+		c = strings.TrimSpace(c)
+		if c == "" {
+			continue
+		}
+		if _, n, err := net.ParseCIDR(c); err != nil {
+			errs = append(errs, fmt.Errorf("OGA9_TRUSTED_PROXIES: bad CIDR %q", c))
+		} else {
+			cfg.TrustedProxies = append(cfg.TrustedProxies, n)
 		}
 	}
+	cfg.DataKey = dataKey(env("OGA9_DATA_ENCRYPTION_KEY", ""), cfg.JWTSecret)
 	if cfg.JWTSecret == "change-me" && cfg.Env == "production" {
-		return nil, fmt.Errorf("OGA9_JWT_SECRET must be set in production")
+		errs = append(errs, errors.New("OGA9_JWT_SECRET must be set in production"))
+	}
+	if cfg.JWTSecret == "" {
+		errs = append(errs, errors.New("OGA9_JWT_SECRET is empty"))
+	}
+	if len(errs) > 0 {
+		return nil, errors.Join(errs...)
 	}
 	return cfg, nil
+}
+
+// dataKey resolves the 32-byte at-rest encryption key: explicit
+// OGA9_DATA_ENCRYPTION_KEY (hex/base64/raw) wins; otherwise derive a stable
+// key from the JWT secret so dev installs need no extra env.
+func dataKey(raw, jwtSecret string) []byte {
+	sum := sha256.Sum256([]byte("oga9-data-key|" + jwtSecret))
+	if raw != "" {
+		if b, err := base64.StdEncoding.DecodeString(raw); err == nil {
+			sum = sha256.Sum256(b)
+		} else if b, err := hex.DecodeString(raw); err == nil {
+			sum = sha256.Sum256(b)
+		} else {
+			sum = sha256.Sum256([]byte(raw))
+		}
+	}
+	k := make([]byte, 32)
+	copy(k, sum[:])
+	return k
 }
 
 func (c *Config) IsProduction() bool { return c.Env == "production" }
@@ -82,33 +122,35 @@ func env(key, fallback string) string {
 	return fallback
 }
 
-func mustEnv(key string) string {
+func reqEnv(errs *[]error, key string) string {
 	v := os.Getenv(key)
 	if v == "" {
-		panic(fmt.Sprintf("required env var %s is not set", key))
+		*errs = append(*errs, fmt.Errorf("required env var %s is not set", key))
 	}
 	return v
 }
 
-func envDur(key string, fallback time.Duration) time.Duration {
+func envDur(errs *[]error, key string, fallback time.Duration) time.Duration {
 	v := os.Getenv(key)
 	if v == "" {
 		return fallback
 	}
 	d, err := time.ParseDuration(v)
 	if err != nil {
+		*errs = append(*errs, fmt.Errorf("%s: %w", key, err))
 		return fallback
 	}
 	return d
 }
 
-func envInt(key string, fallback int) int {
+func envInt(errs *[]error, key string, fallback int) int {
 	v := os.Getenv(key)
 	if v == "" {
 		return fallback
 	}
 	n, err := strconv.Atoi(v)
 	if err != nil {
+		*errs = append(*errs, fmt.Errorf("%s: %w", key, err))
 		return fallback
 	}
 	return n
@@ -116,7 +158,7 @@ func envInt(key string, fallback int) int {
 
 // OAuthProviders builds the configured provider map — a provider activates
 // only when its client id+secret env vars are set (§02).
-func (c *Config) OAuthProviders() map[string]auth.ProviderConfig {
+func (c *Config) OAuthProviders() map[string]OAuthProviderEnv {
 	defs := map[string]map[string]string{
 		"google": {
 			"auth":     "https://accounts.google.com/o/oauth2/v2/auth",
@@ -125,14 +167,14 @@ func (c *Config) OAuthProviders() map[string]auth.ProviderConfig {
 		},
 		"japaconnect": {}, // URLs required via env (ADR-021 endpoint TBD)
 	}
-	out := map[string]auth.ProviderConfig{}
+	out := map[string]OAuthProviderEnv{}
 	for name, urls := range defs {
 		id := os.Getenv("OGA9_OAUTH_" + strings.ToUpper(name) + "_CLIENT_ID")
 		secret := os.Getenv("OGA9_OAUTH_" + strings.ToUpper(name) + "_CLIENT_SECRET")
 		if id == "" || secret == "" {
 			continue
 		}
-		out[name] = auth.ProviderConfig{
+		out[name] = OAuthProviderEnv{
 			ClientID:     id,
 			ClientSecret: secret,
 			AuthURL:      env("OGA9_OAUTH_"+strings.ToUpper(name)+"_AUTH_URL", urls["auth"]),

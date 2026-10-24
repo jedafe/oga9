@@ -1,0 +1,353 @@
+// Ref: oga9-engineering/sections/10-organization-core.md
+// Units, settings, invitations, branding, public directory.
+package tenant
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jedafe/oga9/internal/db"
+)
+
+var ErrBadValue = errors.New("invalid json value")
+
+var unitTypes = map[string]bool{"hq": true, "branch": true, "chapter": true, "committee": true, "wing": true}
+
+// orgSettingsCatalog — system-settings-catalog.md org_settings keys (Rule 23).
+var orgSettingsCatalog = map[string]bool{
+	"org.meeting.quorum_percent": true, "org.meeting.notice_days": true,
+	"org.term.length_months": true, "org.dues.default_amount_minor": true,
+	"org.dues.currency": true, "org.listing.is_public_listed": true,
+	"org.membership.sponsor_required": true, "org.membership.number_format": true,
+	"org.membership.app_fields": true, "org.finance.grace_days": true,
+	"org.finance.defaulter_fine_minor": true, "org.attendance.late_fine_minor": true,
+	"org.attendance.absent_fine_minor": true,
+}
+
+type Unit struct {
+	ID         uuid.UUID  `json:"id"`
+	ParentID   *uuid.UUID `json:"parent_unit_id"`
+	Type       string     `json:"type"`
+	LevelLabel string     `json:"level_label"`
+	Name       string     `json:"name"`
+	Slug       string     `json:"slug"`
+}
+
+func toUnit(r db.ListUnitsRow) Unit {
+	var p *uuid.UUID
+	if r.ParentUnitID.Valid {
+		u := fromPg(r.ParentUnitID)
+		p = &u
+	}
+	return Unit{ID: fromPg(r.ID), ParentID: p, Type: r.Type,
+		LevelLabel: r.LevelLabel.String, Name: r.Name, Slug: r.Slug}
+}
+
+func (s *Service) ListUnits(ctx context.Context, orgID uuid.UUID) ([]Unit, error) {
+	rows, err := s.q.ListUnits(ctx, toPg(orgID))
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Unit, len(rows))
+	for i, r := range rows {
+		out[i] = toUnit(r)
+	}
+	return out, nil
+}
+
+// CreateUnit validates same-org parent + DAG (no self-parent via DB; cycle
+// impossible on create since the node doesn't exist yet).
+func (s *Service) CreateUnit(ctx context.Context, oc *OrgCtx, parentID uuid.UUID, typ, label, name, slug string) (uuid.UUID, error) {
+	if !unitTypes[typ] {
+		return uuid.Nil, ErrBadUnitType
+	}
+	if parentID != uuid.Nil {
+		p, err := s.q.GetUnit(ctx, toPg(parentID))
+		if err != nil {
+			return uuid.Nil, ErrUnitNotFound
+		}
+		if fromPg(p.OrganizationID) != oc.OrgID {
+			return uuid.Nil, ErrUnitNotFound // parent must be same-org (DAG)
+		}
+	}
+	var id pgtype.UUID
+	err := s.withTx(ctx, func(q *db.Queries) error {
+		r, err := q.CreateUnit(ctx, db.CreateUnitParams{
+			OrganizationID: toPg(oc.OrgID), ParentUnitID: pgUUIDPtr(parentID),
+			Type: typ, LevelLabel: pgText(label), Name: name, Slug: slug,
+		})
+		if err != nil {
+			return err
+		}
+		id = r
+		return emit(ctx, q, oc.TenantID, "OrgUnitCreated", "org_unit", fromPg(r), oc.UserID,
+			map[string]any{"org_id": oc.OrgID, "type": typ})
+	})
+	return fromPg(id), err
+}
+
+// UpdateUnit reparents a unit — walks the new parent chain to the root to
+// prove the move can't create a cycle (§10 DAG).
+func (s *Service) UpdateUnit(ctx context.Context, oc *OrgCtx, unitID, parentID uuid.UUID, typ, label, name string) error {
+	u, err := s.q.GetUnit(ctx, toPg(unitID))
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return ErrUnitNotFound
+		}
+		return err
+	}
+	if fromPg(u.OrganizationID) != oc.OrgID {
+		return ErrUnitNotFound // cross-org access → 404, not 403 (no existence leak)
+	}
+	if !unitTypes[typ] {
+		return ErrBadUnitType
+	}
+	if parentID == unitID {
+		return ErrUnitCycle
+	}
+	if parentID != uuid.Nil {
+		seen := map[uuid.UUID]bool{unitID: true}
+		cur := parentID
+		for cur != uuid.Nil {
+			if seen[cur] {
+				return ErrUnitCycle
+			}
+			seen[cur] = true
+			p, err := s.q.GetUnit(ctx, toPg(cur))
+			if err != nil {
+				if err == pgx.ErrNoRows {
+					return ErrUnitNotFound
+				}
+				return err
+			}
+			if fromPg(p.OrganizationID) != oc.OrgID {
+				return ErrUnitNotFound
+			}
+			cur = fromPg(p.ParentUnitID)
+		}
+	}
+	return s.withTx(ctx, func(q *db.Queries) error {
+		if _, err := q.UpdateUnit(ctx, db.UpdateUnitParams{
+			ID: toPg(unitID), Name: name, ParentUnitID: pgUUIDPtr(parentID),
+			Type: typ, LevelLabel: pgText(label),
+		}); err != nil {
+			return err
+		}
+		return emit(ctx, q, oc.TenantID, "OrgUnitUpdated", "org_unit", unitID, oc.UserID,
+			map[string]any{"org_id": oc.OrgID})
+	})
+}
+
+// ArchiveUnit soft-archives (§10: blocked while children exist).
+func (s *Service) ArchiveUnit(ctx context.Context, oc *OrgCtx, unitID uuid.UUID) error {
+	u, err := s.q.GetUnit(ctx, toPg(unitID))
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return ErrUnitNotFound
+		}
+		return err
+	}
+	if fromPg(u.OrganizationID) != oc.OrgID {
+		return ErrUnitNotFound
+	}
+	if has, _ := s.q.UnitHasActiveChildren(ctx, toPg(unitID)); has {
+		return ErrUnitDependents
+	}
+	return s.withTx(ctx, func(q *db.Queries) error {
+		if _, err := q.ArchiveUnit(ctx, toPg(unitID)); err != nil {
+			return err
+		}
+		return emit(ctx, q, oc.TenantID, "OrgUnitArchived", "org_unit", unitID, oc.UserID,
+			map[string]any{"org_id": oc.OrgID})
+	})
+}
+
+// UpdateOrgProfile — §04 PATCH: name/geo/directory opt-in via org.admin.settings.
+func (s *Service) UpdateOrgProfile(ctx context.Context, oc *OrgCtx, name, country, city string, listed bool) error {
+	if name == "" {
+		return ErrBadValue
+	}
+	return s.withTx(ctx, func(q *db.Queries) error {
+		if _, err := q.UpdateOrgProfile(ctx, db.UpdateOrgProfileParams{
+			ID: toPg(oc.OrgID), Name: name, CountryCode: pgText(country),
+			City: pgText(city), IsPublicListed: listed,
+		}); err != nil {
+			return err
+		}
+		return emit(ctx, q, oc.TenantID, "OrganizationSettingChanged", "organization", oc.OrgID, oc.UserID,
+			map[string]any{"organization_id": oc.OrgID, "profile": true})
+	})
+}
+
+func (s *Service) ListSettings(ctx context.Context, orgID uuid.UUID) ([]db.ListOrgSettingsRow, error) {
+	return s.q.ListOrgSettings(ctx, toPg(orgID))
+}
+
+// SetSetting validates the key against the settings catalog (Rule 23 —
+// unknown keys rejected, not silently stored).
+func (s *Service) SetSetting(ctx context.Context, oc *OrgCtx, key string, value json.RawMessage) error {
+	if !orgSettingsCatalog[key] {
+		return ErrUnknownSetting
+	}
+	if !json.Valid(value) {
+		return ErrBadValue
+	}
+	return s.withTx(ctx, func(q *db.Queries) error {
+		if err := q.UpsertOrgSetting(ctx, db.UpsertOrgSettingParams{
+			OrganizationID: toPg(oc.OrgID), Key: key, Value: value,
+		}); err != nil {
+			return err
+		}
+		return emit(ctx, q, oc.TenantID, "OrganizationSettingChanged", "organization", oc.OrgID, oc.UserID,
+			map[string]any{"key": key})
+	})
+}
+
+type Invitation struct {
+	ID        uuid.UUID `json:"id"`
+	Email     string    `json:"email"`
+	Phone     string    `json:"phone"`
+	Category  string    `json:"category"`
+	Token     uuid.UUID `json:"token,omitempty"`
+	ExpiresAt time.Time `json:"expires_at"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+func (s *Service) CreateInvitation(ctx context.Context, oc *OrgCtx, email, phone, hint, category string) (*Invitation, error) {
+	if email == "" && phone == "" {
+		return nil, ErrInviteNoContact
+	}
+	var out Invitation
+	err := s.withTx(ctx, func(q *db.Queries) error {
+		r, err := q.CreateInvitation(ctx, db.CreateInvitationParams{
+			OrganizationID: toPg(oc.OrgID), Email: pgText(email), Phone: pgText(phone),
+			MemberNoHint: pgText(hint), Category: category,
+			InvitedBy: toPg(oc.MembershipID), Token: toPg(uuid.New()),
+		})
+		if err != nil {
+			return err
+		}
+		out = Invitation{ID: fromPg(r.ID), Email: email, Phone: phone, Category: category,
+			Token: fromPg(r.Token), ExpiresAt: r.ExpiresAt.Time}
+		return emit(ctx, q, oc.TenantID, "MemberInvited", "organization", oc.OrgID, oc.UserID,
+			map[string]any{"membership_id": oc.MembershipID, "email": email})
+	})
+	return &out, err
+}
+
+func (s *Service) ListInvitations(ctx context.Context, orgID uuid.UUID) ([]Invitation, error) {
+	rows, err := s.q.ListPendingInvitations(ctx, toPg(orgID))
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Invitation, len(rows))
+	for i, r := range rows {
+		out[i] = Invitation{ID: fromPg(r.ID), Email: r.Email.String, Phone: r.Phone.String,
+			Category: r.Category, ExpiresAt: r.ExpiresAt.Time, CreatedAt: r.CreatedAt.Time}
+	}
+	return out, nil
+}
+
+func (s *Service) RevokeInvitation(ctx context.Context, oc *OrgCtx, inviteID uuid.UUID) error {
+	return s.withTx(ctx, func(q *db.Queries) error {
+		if err := q.SetInvitationStatus(ctx, db.SetInvitationStatusParams{ID: toPg(inviteID), Status: "revoked"}); err != nil {
+			return err
+		}
+		return emit(ctx, q, oc.TenantID, "InvitationRevoked", "invitation", inviteID, oc.UserID,
+			map[string]any{"org_id": oc.OrgID})
+	})
+}
+
+// AcceptInvitation — public token flow: creates the membership for the
+// authenticated user (invited→applied fast-path, §10).
+func (s *Service) AcceptInvitation(ctx context.Context, userID uuid.UUID, token uuid.UUID) (uuid.UUID, error) {
+	inv, err := s.q.GetInvitationByToken(ctx, toPg(token))
+	if err != nil || inv.Status != "pending" || inv.ExpiresAt.Time.Before(time.Now()) {
+		return uuid.Nil, ErrInviteDead
+	}
+	// email-targeted invites bind to the acceptor's verified address
+	if inv.Email.Valid && inv.Email.String != "" {
+		u, err := s.q.GetUserByID(ctx, toPg(userID))
+		if err != nil || !strings.EqualFold(u.Email, inv.Email.String) {
+			return uuid.Nil, ErrForbidden
+		}
+	}
+	orgID := fromPg(inv.OrganizationID)
+	var tenantID pgtype.UUID
+	err = s.withTx(ctx, func(q *db.Queries) error {
+		if err := q.SetInvitationStatus(ctx, db.SetInvitationStatusParams{ID: inv.ID, Status: "accepted"}); err != nil {
+			return err
+		}
+		org, err := q.GetOrg(ctx, inv.OrganizationID)
+		if err != nil {
+			return err
+		}
+		tenantID = org.TenantID
+		if _, err := q.CreateMembership(ctx, db.CreateMembershipParams{
+			OrganizationID: inv.OrganizationID, UserID: toPg(userID),
+			MemberNo: inv.MemberNoHint, Category: inv.Category, LifecycleState: "applied",
+		}); err != nil {
+			return err
+		}
+		mb, err := q.GetMembershipByID(ctx, inv.InvitedBy)
+		if err != nil {
+			return err
+		}
+		if err := q.AssignRoleBySlug(ctx, db.AssignRoleBySlugParams{
+			UserID: toPg(userID), TenantID: tenantID, GrantedBy: mb.UserID, Slug: "member",
+		}); err != nil {
+			return err
+		}
+		return emit(ctx, q, fromPg(tenantID), "InvitationAccepted", "invitation", fromPg(inv.ID), userID,
+			map[string]any{"org_id": orgID, "user_id": userID})
+	})
+	s.InvalidateOrgCtx(ctx, userID, orgID)
+	return orgID, err
+}
+
+type Branding struct {
+	PrimaryColor   string          `json:"primary_color"`
+	SecondaryColor string          `json:"secondary_color"`
+	Motto          string          `json:"motto"`
+	FoundedYear    int32           `json:"founded_year"`
+	PortalConfig   json.RawMessage `json:"portal_config"`
+}
+
+func (s *Service) SetBranding(ctx context.Context, oc *OrgCtx, b Branding) error {
+	if b.PortalConfig == nil {
+		b.PortalConfig = json.RawMessage("{}")
+	}
+	return s.withTx(ctx, func(q *db.Queries) error {
+		if err := q.UpsertBranding(ctx, db.UpsertBrandingParams{
+			OrganizationID: toPg(oc.OrgID), PrimaryColor: pgText(b.PrimaryColor),
+			SecondaryColor: pgText(b.SecondaryColor), Motto: pgText(b.Motto),
+			FoundedYear:  pgtype.Int4{Int32: b.FoundedYear, Valid: b.FoundedYear != 0},
+			PortalConfig: b.PortalConfig,
+		}); err != nil {
+			return err
+		}
+		return emit(ctx, q, oc.TenantID, "OrgBrandingUpdated", "organization", oc.OrgID, oc.UserID, nil)
+	})
+}
+
+func (s *Service) GetBranding(ctx context.Context, orgID uuid.UUID) (*Branding, error) {
+	r, err := s.q.GetBranding(ctx, toPg(orgID))
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return &Branding{}, nil
+		}
+		return nil, err
+	}
+	return &Branding{PrimaryColor: r.PrimaryColor.String, SecondaryColor: r.SecondaryColor.String,
+		Motto: r.Motto.String, FoundedYear: r.FoundedYear.Int32, PortalConfig: r.PortalConfig}, nil
+}
+
+func (s *Service) Directory(ctx context.Context) ([]db.ListPublicOrgsRow, error) {
+	return s.q.ListPublicOrgs(ctx)
+}

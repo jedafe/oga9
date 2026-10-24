@@ -53,3 +53,43 @@ entries reference engineering phases in `.oos/roadmaps/ROADMAP-BACKEND.md`.
 - Events emitted outside mutation transaction → `WithTx` outbox emission
 - Event names `user.*` → catalog PascalCase (`UserRegistered`, ...)
 - Rate limiter fail-closed → fail-open on Valkey error
+- Outbox append failures silently swallowed → `emit` returns error; event failure aborts the tx (Rule 12)
+- `mfa/disable` 500ed on non-MFA accounts → `mfa_secret` read as nullable bytea
+- Suspended accounts kept live sessions and could re-login via OAuth → session
+  resolution now checks `users.status`; OAuth callback applies the same
+  status/verified gates as password login
+- `japaconnect_user_id` never written → linked on japaconnect OAuth login (ADR-021)
+- `Name <a@b>` registration emails stored verbatim → normalized to `addr.Address`
+- `mfa_secret` stored as plaintext base32 → AES-256-GCM envelope
+  (`OGA9_DATA_ENCRYPTION_KEY`, dev fallback derived from JWT secret)
+- Recovery codes were 48-bit truncated UUIDs → 16-char base32 (~80-bit), dashed
+- `SessionRevoked` events emitted for no-op revokes → only on actual revocation;
+  `DisableMFA` now emits `MFADisabled` (cataloged) instead and clears recovery codes
+- `RevokeSession` is now idempotent and reports `revoked: bool`
+- Registration honored no kill-switch → `platform.registration_open` system
+  setting enforced (seeded `true`)
+- MFA not enforced for privileged accounts → `mfa_setup_required` gate:
+  `platform.*`/`org_admin` logins get an `mfa_token` and enroll via
+  `mfa/setup`+`mfa/confirm` before any session is issued; OAuth MFA users
+  complete via new `POST /auth/mfa/complete`
+- Unknown-email logins skipped bcrypt (timing oracle) → constant dummy compare;
+  suspension/verification errors now surface only after credentials verify
+- JWT issuer claim set but unchecked → `iss=oga9` enforced at parse
+- Mail enqueue used cancellable request ctx → `context.WithoutCancel`
+- Rate-limit key could permanently block an IP on EXPIRE failure → DEL fallback
+- `internal/audit` inlined SQL → routes through sqlc `InsertAuditEvent`
+- Envelope helpers duplicated across packages → shared `internal/httpx`
+- `config` panicked on missing env and swallowed bad durations/ints → aggregated
+  `Load()` errors; `config`→`auth` import removed (provider map built in main)
+- Migration numbering squatted on group-4 slots → `domain_events`→000040,
+  `audit_events`→000043 (canonical group-6), index/recovery folded into 000011/
+  000010; group-2 slot 000007 now seeds `system_settings` defaults
+- Permission seed drift → added `org.members.view`, `org.finance.dues.manage`,
+  `org.documents.view`, `org.governance.positions.assign`,
+  `platform.ai_assistant.enabled` (106 nodes); `api.keys.self_manage` +
+  `org.listing.manage` cataloged in spec
+- `plan_capabilities` seeded uncataloged keys → keys added to
+  plans-entitlements catalog (spec)
+- `.env.example` missing half the vars config reads → complete
+- compose services lacked profiles → `mvp`/`full` on postgres/valkey/mailpit
+- `/health` ignored Valkey → pings both dependencies

@@ -11,29 +11,73 @@ import (
 )
 
 type Querier interface {
+	ArchiveUnit(ctx context.Context, id pgtype.UUID) (pgtype.UUID, error)
+	AssignRoleBySlug(ctx context.Context, arg AssignRoleBySlugParams) error
+	CloneTenantRolePermissions(ctx context.Context, tenantID pgtype.UUID) error
+	// Instantiate system role templates into tenant-scoped roles at org creation.
+	CloneTenantRoles(ctx context.Context, tenantID pgtype.UUID) error
+	CountTenantOrgs(ctx context.Context, tenantID pgtype.UUID) (int64, error)
+	CreateInvitation(ctx context.Context, arg CreateInvitationParams) (CreateInvitationRow, error)
+	CreateMembership(ctx context.Context, arg CreateMembershipParams) (pgtype.UUID, error)
 	CreateOAuthUser(ctx context.Context, arg CreateOAuthUserParams) (pgtype.UUID, error)
+	CreateOrg(ctx context.Context, arg CreateOrgParams) (CreateOrgRow, error)
 	CreateSession(ctx context.Context, arg CreateSessionParams) (pgtype.UUID, error)
+	// Ref: oga9-engineering/sections/04-tenancy-organizations.md, 10-organization-core.md
+	// sqlc queries for tenants, organizations, memberships, units, settings,
+	// invitations, branding (Phase 03).
+	CreateTenant(ctx context.Context, arg CreateTenantParams) (pgtype.UUID, error)
+	CreateUnit(ctx context.Context, arg CreateUnitParams) (pgtype.UUID, error)
 	// Ref: oga9-engineering/sections/02-identity-authentication-sessions.md
 	// sqlc queries for users, sessions, oauth links (Phase 02).
 	CreateUser(ctx context.Context, arg CreateUserParams) (CreateUserRow, error)
+	// Ref: oga9-engineering/sections/05-domain-events-infrastructure.md
+	// Outbox + audit queries (Phase 02 emission, Phase 05 dispatch).
 	EmitDomainEvent(ctx context.Context, arg EmitDomainEventParams) error
-	GetMFASecret(ctx context.Context, id pgtype.UUID) (string, error)
+	GetBranding(ctx context.Context, organizationID pgtype.UUID) (GetBrandingRow, error)
+	GetInvitationByToken(ctx context.Context, token pgtype.UUID) (GetInvitationByTokenRow, error)
+	GetMFASecret(ctx context.Context, id pgtype.UUID) ([]byte, error)
+	GetMembership(ctx context.Context, arg GetMembershipParams) (GetMembershipRow, error)
+	GetMembershipByID(ctx context.Context, id pgtype.UUID) (GetMembershipByIDRow, error)
+	GetOrg(ctx context.Context, id pgtype.UUID) (GetOrgRow, error)
+	GetOrgSetting(ctx context.Context, arg GetOrgSettingParams) ([]byte, error)
 	GetRecoveryCodes(ctx context.Context, id pgtype.UUID) ([]byte, error)
 	GetSessionByJTI(ctx context.Context, jti pgtype.UUID) (GetSessionByJTIRow, error)
+	// Ref: oga9-engineering/conventions/system-settings-catalog.md
+	// Platform-level settings (Rule 3: hot-reloadable via GetSetting).
+	GetSystemSetting(ctx context.Context, key string) ([]byte, error)
+	GetTemplate(ctx context.Context, slug string) ([]byte, error)
+	GetUnit(ctx context.Context, id pgtype.UUID) (GetUnitRow, error)
 	GetUserAuthState(ctx context.Context, id pgtype.UUID) (GetUserAuthStateRow, error)
 	GetUserByEmail(ctx context.Context, email string) (GetUserByEmailRow, error)
 	GetUserByID(ctx context.Context, id pgtype.UUID) (GetUserByIDRow, error)
 	GetUserByOAuthSubject(ctx context.Context, arg GetUserByOAuthSubjectParams) (pgtype.UUID, error)
 	GetUserIDByEmail(ctx context.Context, email string) (pgtype.UUID, error)
+	HasPermission(ctx context.Context, arg HasPermissionParams) (bool, error)
+	InsertAuditEvent(ctx context.Context, arg InsertAuditEventParams) error
 	LinkOAuthProvider(ctx context.Context, arg LinkOAuthProviderParams) error
+	ListOrgSettings(ctx context.Context, organizationID pgtype.UUID) ([]ListOrgSettingsRow, error)
+	ListPendingInvitations(ctx context.Context, organizationID pgtype.UUID) ([]ListPendingInvitationsRow, error)
+	ListPublicOrgs(ctx context.Context) ([]ListPublicOrgsRow, error)
+	ListTemplates(ctx context.Context) ([]ListTemplatesRow, error)
+	ListUnits(ctx context.Context, organizationID pgtype.UUID) ([]ListUnitsRow, error)
+	ListUserOrgs(ctx context.Context, userID pgtype.UUID) ([]ListUserOrgsRow, error)
 	ListUserSessions(ctx context.Context, userID pgtype.UUID) ([]ListUserSessionsRow, error)
 	RevokeAllUserSessions(ctx context.Context, userID pgtype.UUID) error
-	RevokeSessionByID(ctx context.Context, arg RevokeSessionByIDParams) error
+	RevokeSessionByID(ctx context.Context, arg RevokeSessionByIDParams) (pgtype.UUID, error)
 	RevokeSessionByJTI(ctx context.Context, jti pgtype.UUID) error
+	SetInvitationStatus(ctx context.Context, arg SetInvitationStatusParams) error
+	SetJapaconnectUserID(ctx context.Context, arg SetJapaconnectUserIDParams) error
 	SetMFASecret(ctx context.Context, arg SetMFASecretParams) error
 	SetRecoveryCodes(ctx context.Context, arg SetRecoveryCodesParams) error
+	SetTenantOwnerOrg(ctx context.Context, arg SetTenantOwnerOrgParams) error
 	SetUserVerified(ctx context.Context, id pgtype.UUID) error
+	UnitHasActiveChildren(ctx context.Context, parentUnitID pgtype.UUID) (bool, error)
+	UpdateOrgProfile(ctx context.Context, arg UpdateOrgProfileParams) (pgtype.UUID, error)
+	UpdateUnit(ctx context.Context, arg UpdateUnitParams) (pgtype.UUID, error)
 	UpdateUserPassword(ctx context.Context, arg UpdateUserPasswordParams) error
+	UpsertBranding(ctx context.Context, arg UpsertBrandingParams) error
+	UpsertOrgSetting(ctx context.Context, arg UpsertOrgSettingParams) error
+	UserRequiresMFA(ctx context.Context, userID pgtype.UUID) (bool, error)
 }
 
 var _ Querier = (*Queries)(nil)

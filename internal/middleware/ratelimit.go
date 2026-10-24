@@ -9,6 +9,8 @@ import (
 	"time"
 
 	valkey "github.com/valkey-io/valkey-go"
+
+	"github.com/jedafe/oga9/internal/httpx"
 )
 
 // RateLimit returns a limiter allowing `limit` requests per `window` per
@@ -33,11 +35,15 @@ func RateLimit(vk valkey.Client, bucket string, limit int64, window time.Duratio
 				return
 			}
 			if n == 1 {
-				vk.Do(ctx, vk.B().Expire().Key(key).Seconds(int64(window.Seconds())).Build())
+				// A failed EXPIRE would leave a counter that never decays and
+				// blocks the IP forever — delete and let the window restart.
+				if err := vk.Do(ctx, vk.B().Expire().Key(key).Seconds(int64(window.Seconds())).Build()).Error(); err != nil {
+					_ = vk.Do(ctx, vk.B().Del().Key(key).Build()).Error()
+				}
 			}
 			if n > limit {
 				w.Header().Set("Retry-After", strconv.Itoa(int(window.Seconds())))
-				writeErr(w, 429, "rate_limited", "too many requests, slow down")
+				httpx.WriteErr(w, 429, "rate_limited", "too many requests, slow down")
 				return
 			}
 			next.ServeHTTP(w, r)

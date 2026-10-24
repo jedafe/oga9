@@ -3,11 +3,13 @@
 package handler
 
 import (
-	"net"
+	"errors"
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/jedafe/oga9/internal/auth"
+	"github.com/jedafe/oga9/internal/httpx"
+	"github.com/jedafe/oga9/internal/middleware"
 	valkey "github.com/valkey-io/valkey-go"
 )
 
@@ -26,7 +28,7 @@ func (h *OAuthHandler) provider(w http.ResponseWriter, r *http.Request) (auth.Pr
 	name := chi.URLParam(r, "provider")
 	p, ok := h.providers[name]
 	if !ok {
-		writeErr(w, 501, "provider_not_configured", name+" OAuth adapter not yet configured")
+		httpx.WriteErr(w, 501, "provider_not_configured", name+" OAuth adapter not yet configured")
 		return p, name, false
 	}
 	return p, name, true
@@ -40,13 +42,14 @@ func (h *OAuthHandler) Start(w http.ResponseWriter, r *http.Request) {
 	}
 	url, err := auth.StartOAuth(r.Context(), h.vk, p, h.baseURL+"/api/v1/auth/oauth/"+name+"/callback")
 	if err != nil {
-		writeErr(w, 500, "internal_error", "oauth start failed")
+		httpx.WriteErr(w, 500, "internal_error", "oauth start failed")
 		return
 	}
 	http.Redirect(w, r, url, http.StatusFound)
 }
 
-// GET /api/v1/auth/oauth/{provider}/callback?code&state → session.
+// GET /api/v1/auth/oauth/{provider}/callback?code&state → session, or an
+// mfa_required response carrying mfa_token for /auth/mfa/complete.
 func (h *OAuthHandler) Callback(w http.ResponseWriter, r *http.Request) {
 	p, name, ok := h.provider(w, r)
 	if !ok {
@@ -54,20 +57,31 @@ func (h *OAuthHandler) Callback(w http.ResponseWriter, r *http.Request) {
 	}
 	state, code := r.URL.Query().Get("state"), r.URL.Query().Get("code")
 	if state == "" || code == "" {
-		writeErr(w, 400, "validation_failed", "state and code required")
+		httpx.WriteErr(w, 400, "validation_failed", "state and code required")
 		return
 	}
-	ip, _, _ := net.SplitHostPort(r.RemoteAddr)
-	token, sessionID, err := h.svc.OAuthCallback(r.Context(), state, code,
+	res, err := h.svc.OAuthCallback(r.Context(), state, code,
 		h.baseURL+"/api/v1/auth/oauth/"+name+"/callback", p, name,
-		r.URL.Query().Get("device_label"), ip, r.UserAgent())
+		r.URL.Query().Get("device_label"), middleware.ClientIPFrom(r.Context()), r.UserAgent())
 	if err != nil {
-		if err == auth.ErrOAuthState {
-			writeErr(w, 400, "oauth_state_invalid", "expired or reused oauth state")
-			return
+		switch {
+		case errors.Is(err, auth.ErrOAuthState):
+			httpx.WriteErr(w, 400, "oauth_state_invalid", "expired or reused oauth state")
+		case errors.Is(err, auth.ErrMFARequired) && res != nil:
+			httpx.WriteErrDetails(w, 403, "mfa_required", "mfa code required",
+				map[string]any{"mfa_token": res.MFAToken})
+		case errors.Is(err, auth.ErrMFASetupRequired) && res != nil:
+			httpx.WriteErrDetails(w, 403, "mfa_setup_required",
+				"this account must enroll mfa before login; use mfa_token with /auth/mfa/setup then /auth/mfa/confirm",
+				map[string]any{"mfa_token": res.MFAToken})
+		case errors.Is(err, auth.ErrUserSuspended):
+			httpx.WriteErr(w, 403, "user_suspended", "account suspended")
+		case errors.Is(err, auth.ErrEmailNotVerified):
+			httpx.WriteErr(w, 403, "email_not_verified", "verify your email before logging in")
+		default:
+			httpx.WriteErr(w, 401, "oauth_failed", "provider authentication failed")
 		}
-		writeErr(w, 401, "oauth_failed", "provider authentication failed")
 		return
 	}
-	writeData(w, 200, map[string]any{"token": token, "session_id": sessionID})
+	httpx.WriteData(w, 200, map[string]any{"token": res.Token, "session_id": res.SessionID})
 }

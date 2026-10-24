@@ -6,7 +6,8 @@ CREATE TABLE users (
   display_name text NOT NULL,
   japaconnect_user_id uuid,
   is_verified boolean NOT NULL DEFAULT false,
-  mfa_secret bytea,
+  mfa_secret bytea,                        -- AES-256-GCM ciphertext (nonce||ct), app-layer encrypted at rest
+  mfa_recovery_codes jsonb NOT NULL DEFAULT '[]',   -- sha256(code+user_id) hashes; one-time
   status text NOT NULL DEFAULT 'active',
   created_at timestamptz NOT NULL DEFAULT now(),
   deleted_at timestamptz

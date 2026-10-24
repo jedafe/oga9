@@ -4,6 +4,7 @@
 services:
   postgres:
     image: pgvector/pgvector:pg18
+    profiles: ["mvp", "full"]
     environment:
       POSTGRES_DB: oga9
       POSTGRES_USER: oga9
@@ -13,10 +14,12 @@ services:
 
   valkey:
     image: valkey/valkey:8
+    profiles: ["mvp", "full"]
     ports: ["6379:6379"]
 
   mailpit:
     image: axllent/mailpit:latest
+    profiles: ["mvp", "full"]
     ports: ["1025:1025", "8025:8025"]
 
   glitchtip:

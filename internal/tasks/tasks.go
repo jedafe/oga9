@@ -22,6 +22,9 @@ type SendEmailPayload struct {
 	Body    string `json:"body"`
 }
 
+// NewEmailTask builds a queueable mail task. Handlers enqueue with
+// context.WithoutCancel so a client disconnect can't drop the enqueue
+// (Rule 8: fire-and-forget still means "actually enqueued").
 func NewEmailTask(taskType string, p SendEmailPayload) (*asynq.Task, error) {
 	b, err := json.Marshal(p)
 	if err != nil {

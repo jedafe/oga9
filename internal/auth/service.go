@@ -5,11 +5,14 @@ package auth
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base32"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net/mail"
+	"strings"
 	"time"
 	"unicode"
 
@@ -31,11 +34,14 @@ var (
 	ErrSessionRevoked   = errors.New("session_revoked")
 	ErrWeakPassword     = errors.New("weak_password")
 	ErrMFARequired      = errors.New("mfa_required")
+	ErrMFASetupRequired = errors.New("mfa_setup_required")
+	ErrMFAGateInvalid   = errors.New("mfa_gate_invalid")
 	ErrMFACode          = errors.New("invalid_mfa_code")
 	ErrUserNotFound     = errors.New("user_not_found")
 	ErrInvalidEmail     = errors.New("invalid_email")
 	ErrEmailNotVerified = errors.New("email_not_verified")
 	ErrMFANotEnabled    = errors.New("mfa_not_enabled")
+	ErrRegClosed        = errors.New("registration_closed")
 )
 
 type User struct {
@@ -46,16 +52,26 @@ type User struct {
 	Status      string    `json:"status"`
 }
 
+// LoginResult carries the session on success; on ErrMFARequired /
+// ErrMFASetupRequired it carries MFAToken so the client can complete the
+// gate via /auth/mfa/complete or /auth/mfa/setup+confirm.
+type LoginResult struct {
+	Token     string
+	SessionID uuid.UUID
+	MFAToken  string
+}
+
 type Service struct {
 	pool      *pgxpool.Pool
 	q         *db.Queries
 	vk        valkey.Client
 	jwtSecret string
 	tokenTTL  time.Duration
+	dataKey   []byte
 }
 
-func NewService(pool *pgxpool.Pool, vk valkey.Client, jwtSecret string, tokenTTL time.Duration) *Service {
-	return &Service{pool: pool, q: db.New(pool), vk: vk, jwtSecret: jwtSecret, tokenTTL: tokenTTL}
+func NewService(pool *pgxpool.Pool, vk valkey.Client, jwtSecret string, tokenTTL time.Duration, dataKey []byte) *Service {
+	return &Service{pool: pool, q: db.New(pool), vk: vk, jwtSecret: jwtSecret, tokenTTL: tokenTTL, dataKey: dataKey}
 }
 
 func toPg(u uuid.UUID) pgtype.UUID { return pgtype.UUID{Bytes: u, Valid: true} }
@@ -64,6 +80,10 @@ func fromPg(p pgtype.UUID) uuid.UUID {
 	return u
 }
 func pgText(s string) pgtype.Text { return pgtype.Text{String: s, Valid: s != ""} }
+
+// dummyHash keeps unknown-email logins on the bcrypt path so response time
+// doesn't disclose account existence.
+var dummyHash, _ = HashPassword("oga9-timing-equalizer")
 
 // ValidatePassword — §02 policy: min 8 chars, at least one letter + one digit.
 func ValidatePassword(pw string) error {
@@ -85,20 +105,28 @@ func ValidatePassword(pw string) error {
 	return nil
 }
 
-// emit appends to the domain-event outbox via the given query handle (§05).
-// Callers must pass the tx-scoped Queries so the event lands in the SAME
-// transaction as the state mutation (Rule 12 outbox contract).
-func emit(ctx context.Context, q *db.Queries, name, aggType string, aggID, actorID uuid.UUID, payload map[string]any) {
+// emit appends to the domain-event outbox via the tx-scoped query handle
+// (§05). Rule 12 + error-handling-go: the event lands in the SAME transaction
+// as the state mutation and an append failure aborts the mutation — callers
+// must propagate the returned error, never swallow it.
+func emit(ctx context.Context, q *db.Queries, name, aggType string, aggID, actorID uuid.UUID, payload map[string]any) error {
+	if payload == nil {
+		payload = map[string]any{}
+	}
 	payload["actor_id"] = actorID
-	b, _ := json.Marshal(payload)
-	_ = q.EmitDomainEvent(ctx, db.EmitDomainEventParams{
-		Name: name, AggregateType: aggType, AggregateID: toPg(aggID), Payload: b,
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	return q.EmitDomainEvent(ctx, db.EmitDomainEventParams{
+		Name: name, AggregateType: aggType, AggregateID: toPg(aggID),
+		ActorID: toPg(actorID), Payload: b,
 	})
 }
 
-// EmitEvent is the fire-and-forget variant for non-mutating notifications.
-func (s *Service) EmitEvent(ctx context.Context, name, aggType string, aggID uuid.UUID, payload map[string]any) {
-	emit(ctx, s.q, name, aggType, aggID, aggID, payload)
+// EmitEvent is the non-tx variant for notification-grade emits.
+func (s *Service) EmitEvent(ctx context.Context, name, aggType string, aggID uuid.UUID, payload map[string]any) error {
+	return emit(ctx, s.q, name, aggType, aggID, aggID, payload)
 }
 
 func (s *Service) withTx(ctx context.Context, fn func(*db.Queries) error) error {
@@ -113,12 +141,27 @@ func (s *Service) withTx(ctx context.Context, fn func(*db.Queries) error) error 
 	return tx.Commit(ctx)
 }
 
+// registrationOpen reads system_settings.platform.registration_open
+// (catalog default: true when the key is absent).
+func (s *Service) registrationOpen(ctx context.Context) bool {
+	v, err := s.q.GetSystemSetting(ctx, "platform.registration_open")
+	if err != nil {
+		return true
+	}
+	return strings.TrimSpace(string(v)) == "true"
+}
+
 func (s *Service) Register(ctx context.Context, email, password, displayName string) (*User, string, error) {
-	if _, err := mail.ParseAddress(email); err != nil {
+	addr, err := mail.ParseAddress(email)
+	if err != nil || addr.Address == "" {
 		return nil, "", ErrInvalidEmail
 	}
+	email = addr.Address // normalize "Name <a@b>" → "a@b" before it hits the citext column
 	if err := ValidatePassword(password); err != nil {
 		return nil, "", err
+	}
+	if !s.registrationOpen(ctx) {
+		return nil, "", ErrRegClosed
 	}
 	hash, err := HashPassword(password)
 	if err != nil {
@@ -133,8 +176,7 @@ func (s *Service) Register(ctx context.Context, email, password, displayName str
 			return e
 		}
 		row = r
-		emit(ctx, q, "UserRegistered", "user", fromPg(r.ID), fromPg(r.ID), map[string]any{"email": r.Email})
-		return nil
+		return emit(ctx, q, "UserRegistered", "user", fromPg(r.ID), fromPg(r.ID), map[string]any{"email": r.Email})
 	})
 	if err != nil {
 		var pgErr *pgconn.PgError
@@ -148,42 +190,63 @@ func (s *Service) Register(ctx context.Context, email, password, displayName str
 	return u, verifyToken, nil
 }
 
-func (s *Service) Login(ctx context.Context, email, password, mfaCode, deviceLabel, ip, ua string) (string, uuid.UUID, error) {
+func (s *Service) Login(ctx context.Context, email, password, mfaCode, deviceLabel, ip, ua string) (*LoginResult, error) {
 	row, err := s.q.GetUserByEmail(ctx, email)
 	if err == pgx.ErrNoRows {
-		return "", uuid.Nil, ErrBadCredentials
+		CheckPassword(dummyHash, password) // keep response time flat
+		return nil, ErrBadCredentials
 	}
 	if err != nil {
-		return "", uuid.Nil, err // real DB error → 500
-	}
-	if row.Status != "active" {
-		return "", uuid.Nil, ErrUserSuspended
+		return nil, err // real DB error → 500
 	}
 	if !row.PasswordHash.Valid || !CheckPassword(row.PasswordHash.String, password) {
-		return "", uuid.Nil, ErrBadCredentials
+		return nil, ErrBadCredentials
 	}
-	// §02 flow: register → verify → login. Unverified accounts get no session.
+	// status + verification checks run only after credentials prove out, so
+	// probing without the password can't distinguish account states.
+	if row.Status != "active" {
+		return nil, ErrUserSuspended
+	}
 	if !row.IsVerified {
-		return "", uuid.Nil, ErrEmailNotVerified
+		return nil, ErrEmailNotVerified
 	}
-	// §02: MFA-enabled accounts must present a valid TOTP code at login.
-	if row.MfaSecret != "" {
+	return s.finishLogin(ctx, fromPg(row.ID), row.MfaSecret, mfaCode, deviceLabel, ip, ua, "password")
+}
+
+// finishLogin is the shared post-credential tail: MFA gate → session.
+// mfaSecret is the raw encrypted bytea; empty means MFA is off.
+func (s *Service) finishLogin(ctx context.Context, userID uuid.UUID, mfaSecret []byte, mfaCode, deviceLabel, ip, ua, provider string) (*LoginResult, error) {
+	if len(mfaSecret) > 0 {
 		if mfaCode == "" {
-			return "", uuid.Nil, ErrMFARequired
-		}
-		if !totp.Validate(mfaCode, row.MfaSecret) {
-			// fall back to one-time recovery code (consumed on use)
-			if ok, err := s.ConsumeRecoveryCode(ctx, fromPg(row.ID), mfaCode); err != nil || !ok {
-				return "", uuid.Nil, ErrMFACode
+			tok, err := s.stageMFAGate(ctx, userID, deviceLabel, ip, ua, provider)
+			if err != nil {
+				return nil, err
 			}
+			return &LoginResult{MFAToken: tok}, ErrMFARequired
+		}
+		if err := s.checkMFACode(ctx, userID, mfaSecret, mfaCode); err != nil {
+			return nil, err
+		}
+	} else {
+		// §02: platform.* holders and org admins must enroll MFA — gate the
+		// login until setup completes rather than issuing a session.
+		req, err := s.q.UserRequiresMFA(ctx, toPg(userID))
+		if err != nil {
+			return nil, err
+		}
+		if req {
+			tok, err := s.stageMFAGate(ctx, userID, deviceLabel, ip, ua, provider)
+			if err != nil {
+				return nil, err
+			}
+			return &LoginResult{MFAToken: tok}, ErrMFASetupRequired
 		}
 	}
-	uid := fromPg(row.ID)
-	token, sessionID, err := s.createSession(ctx, uid, deviceLabel, ip, ua, "password")
+	token, sessionID, err := s.createSession(ctx, userID, deviceLabel, ip, ua, provider)
 	if err != nil {
-		return "", uuid.Nil, err
+		return nil, err
 	}
-	return token, sessionID, nil
+	return &LoginResult{Token: token, SessionID: sessionID}, nil
 }
 
 // createSession is the shared session-issuing tail of Login/OAuthCallback:
@@ -197,7 +260,7 @@ func (s *Service) createSession(ctx context.Context, userID uuid.UUID, deviceLab
 			UserID:      toPg(userID),
 			Jti:         toPg(jti),
 			DeviceLabel: pgText(deviceLabel),
-			Column4:     ip,
+			Ip:          ip,
 			UserAgent:   pgText(ua),
 			ExpiresAt:   pgtype.Timestamptz{Time: expires, Valid: true},
 		})
@@ -205,8 +268,7 @@ func (s *Service) createSession(ctx context.Context, userID uuid.UUID, deviceLab
 			return e
 		}
 		sessID = id
-		emit(ctx, q, "UserLoggedIn", "user", userID, userID, map[string]any{"provider": provider})
-		return nil
+		return emit(ctx, q, "UserLoggedIn", "user", userID, userID, map[string]any{"provider": provider})
 	})
 	if err != nil {
 		return "", uuid.Nil, err
@@ -221,13 +283,16 @@ func (s *Service) createSession(ctx context.Context, userID uuid.UUID, deviceLab
 func (s *Service) Logout(ctx context.Context, jti uuid.UUID) error {
 	return s.withTx(ctx, func(q *db.Queries) error {
 		if row, err := q.GetSessionByJTI(ctx, toPg(jti)); err == nil {
-			emit(ctx, q, "SessionRevoked", "session", fromPg(row.ID), fromPg(row.UserID), map[string]any{"reason": "logout"})
+			if err := emit(ctx, q, "SessionRevoked", "session", fromPg(row.ID), fromPg(row.UserID), map[string]any{"reason": "logout"}); err != nil {
+				return err
+			}
 		}
 		return q.RevokeSessionByJTI(ctx, toPg(jti))
 	})
 }
 
-// ResolveSession maps a JWT jti → userID, enforcing revocation + expiry (§02).
+// ResolveSession maps a JWT jti → userID, enforcing revocation + expiry +
+// account status (a suspended account's live sessions die immediately).
 func (s *Service) ResolveSession(ctx context.Context, jti uuid.UUID) (uuid.UUID, error) {
 	row, err := s.q.GetSessionByJTI(ctx, toPg(jti))
 	if err == pgx.ErrNoRows {
@@ -238,6 +303,9 @@ func (s *Service) ResolveSession(ctx context.Context, jti uuid.UUID) (uuid.UUID,
 	}
 	if row.RevokedAt.Valid || row.ExpiresAt.Time.Before(time.Now()) {
 		return uuid.Nil, ErrSessionRevoked
+	}
+	if row.UserStatus != "active" {
+		return uuid.Nil, ErrUserSuspended
 	}
 	return fromPg(row.UserID), nil
 }
@@ -269,7 +337,9 @@ func (s *Service) VerifyEmail(ctx context.Context, token string) error {
 	}
 	uid := uuid.MustParse(userID)
 	return s.withTx(ctx, func(q *db.Queries) error {
-		emit(ctx, q, "IdentityVerified", "user", uid, uid, map[string]any{"method": "email_link"})
+		if err := emit(ctx, q, "IdentityVerified", "user", uid, uid, map[string]any{"method": "email_link"}); err != nil {
+			return err
+		}
 		return q.SetUserVerified(ctx, toPg(uid))
 	})
 }
@@ -305,9 +375,10 @@ func (s *Service) ResetPassword(ctx context.Context, token, newPassword string) 
 		if err := q.UpdateUserPassword(ctx, db.UpdateUserPasswordParams{PasswordHash: pgText(hash), ID: toPg(uid)}); err != nil {
 			return err
 		}
-		// revoke all sessions on password reset (§02)
-		emit(ctx, q, "PasswordChanged", "user", uid, uid, map[string]any{"via": "reset_link"})
-		return q.RevokeAllUserSessions(ctx, toPg(uid))
+		if err := q.RevokeAllUserSessions(ctx, toPg(uid)); err != nil {
+			return err
+		}
+		return emit(ctx, q, "PasswordChanged", "user", uid, uid, map[string]any{"via": "reset_link"})
 	})
 }
 
@@ -326,23 +397,139 @@ func (s *Service) ClearPendingMFA(ctx context.Context, userID uuid.UUID) {
 	_ = s.vk.Do(ctx, s.vk.B().Del().Key("oga9:mfa:pending:"+userID.String()).Build())
 }
 
-// SetupMFA writes the confirmed secret + issues one-time recovery codes
-// (sha256(code+userID) hashes only — the plaintext is returned once, never stored).
+// mfaGate is the staged post-credential context carried by an mfa_token
+// (oga9:auth:mfa_gate:{nonce}, 10 min) until the caller proves a second factor.
+type mfaGate struct {
+	UserID      uuid.UUID `json:"user_id"`
+	DeviceLabel string    `json:"device_label"`
+	IP          string    `json:"ip"`
+	UserAgent   string    `json:"user_agent"`
+	Provider    string    `json:"provider"`
+}
+
+func (s *Service) stageMFAGate(ctx context.Context, userID uuid.UUID, deviceLabel, ip, ua, provider string) (string, error) {
+	nonce := uuid.NewString()
+	b, _ := json.Marshal(mfaGate{UserID: userID, DeviceLabel: deviceLabel, IP: ip, UserAgent: ua, Provider: provider})
+	err := s.vk.Do(ctx, s.vk.B().Set().Key("oga9:auth:mfa_gate:"+nonce).Value(string(b)).ExSeconds(600).Build()).Error()
+	if err != nil {
+		return "", err
+	}
+	return nonce, nil
+}
+
+// ResolveMFAGate reads a gate nonce without consuming it — mfa/setup and
+// mfa/confirm need two requests against the same gate.
+func (s *Service) ResolveMFAGate(ctx context.Context, nonce string) (uuid.UUID, error) {
+	raw, err := s.vk.Do(ctx, s.vk.B().Get().Key("oga9:auth:mfa_gate:"+nonce).Build()).AsBytes()
+	if err != nil {
+		return uuid.Nil, ErrMFAGateInvalid
+	}
+	var g mfaGate
+	if err := json.Unmarshal(raw, &g); err != nil || g.UserID == uuid.Nil {
+		return uuid.Nil, ErrMFAGateInvalid
+	}
+	return g.UserID, nil
+}
+
+func (s *Service) dropMFAGate(ctx context.Context, nonce string) {
+	_ = s.vk.Do(ctx, s.vk.B().Del().Key("oga9:auth:mfa_gate:"+nonce).Build())
+}
+
+// ConsumeMFAGate reads + burns a gate nonce (single-use at completion).
+func (s *Service) ConsumeMFAGate(ctx context.Context, nonce string) (mfaGate, error) {
+	var g mfaGate
+	raw, err := s.vk.Do(ctx, s.vk.B().Get().Key("oga9:auth:mfa_gate:"+nonce).Build()).AsBytes()
+	if err != nil {
+		return g, ErrMFAGateInvalid
+	}
+	if err := json.Unmarshal(raw, &g); err != nil || g.UserID == uuid.Nil {
+		return g, ErrMFAGateInvalid
+	}
+	s.dropMFAGate(ctx, nonce)
+	return g, nil
+}
+
+// CompleteMFALogin finishes a gated login (OAuth or privileged password):
+// gate nonce + live TOTP or recovery code → session.
+func (s *Service) CompleteMFALogin(ctx context.Context, mfaToken, code string) (*LoginResult, error) {
+	gate, err := s.ConsumeMFAGate(ctx, mfaToken)
+	if err != nil {
+		return nil, err
+	}
+	row, err := s.q.GetUserAuthState(ctx, toPg(gate.UserID))
+	if err != nil {
+		return nil, err
+	}
+	if row.Status != "active" {
+		return nil, ErrUserSuspended
+	}
+	if err := s.checkMFACode(ctx, gate.UserID, row.MfaSecret, code); err != nil {
+		return nil, err
+	}
+	token, sessionID, err := s.createSession(ctx, gate.UserID, gate.DeviceLabel, gate.IP, gate.UserAgent, gate.Provider)
+	if err != nil {
+		return nil, err
+	}
+	return &LoginResult{Token: token, SessionID: sessionID}, nil
+}
+
+// decryptMFA unwraps the AES-GCM envelope; plaintext TOTP never persists.
+func (s *Service) decryptMFA(blob []byte) (string, error) {
+	b, err := decryptBlob(s.dataKey, blob)
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
+}
+
+// checkMFACode validates a live TOTP against the encrypted secret, falling
+// back to a one-time recovery code (consumed on use).
+func (s *Service) checkMFACode(ctx context.Context, userID uuid.UUID, encSecret []byte, code string) error {
+	secret, err := s.decryptMFA(encSecret)
+	if err != nil {
+		return err
+	}
+	if totp.Validate(code, secret) {
+		return nil
+	}
+	if ok, err := s.ConsumeRecoveryCode(ctx, userID, code); err != nil || !ok {
+		return ErrMFACode
+	}
+	return nil
+}
+
+// SetupMFA encrypts + writes the confirmed secret and issues one-time
+// recovery codes (sha256(code+userID) hashes only — plaintext shown once).
 func (s *Service) SetupMFA(ctx context.Context, userID uuid.UUID, secret string) (codes []string, err error) {
 	codes = make([]string, 8)
 	hashes := make([]string, 8)
 	for i := range codes {
-		codes[i] = uuid.NewString()[:13] // e.g. "a1b2c3d4-e5f6-"
+		codes[i] = newRecoveryCode()
 		hashes[i] = recoveryHash(codes[i], userID)
 	}
 	b, _ := json.Marshal(hashes)
+	enc, err := encryptBlob(s.dataKey, []byte(secret))
+	if err != nil {
+		return nil, err
+	}
 	err = s.withTx(ctx, func(q *db.Queries) error {
-		if e := q.SetMFASecret(ctx, db.SetMFASecretParams{MfaSecret: []byte(secret), ID: toPg(userID)}); e != nil {
+		if e := q.SetMFASecret(ctx, db.SetMFASecretParams{MfaSecret: enc, ID: toPg(userID)}); e != nil {
 			return e
 		}
-		return q.SetRecoveryCodes(ctx, db.SetRecoveryCodesParams{MfaRecoveryCodes: b, ID: toPg(userID)})
+		if e := q.SetRecoveryCodes(ctx, db.SetRecoveryCodesParams{MfaRecoveryCodes: b, ID: toPg(userID)}); e != nil {
+			return e
+		}
+		return emit(ctx, q, "MFAEnabled", "user", userID, userID, nil)
 	})
 	return codes, err
+}
+
+// newRecoveryCode — 16 base32 chars (~80 bits) grouped xxxx-xxxx-xxxx-xxxx.
+func newRecoveryCode() string {
+	raw := make([]byte, 10)
+	_, _ = rand.Read(raw)
+	s := strings.ToLower(base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(raw))
+	return s[:4] + "-" + s[4:8] + "-" + s[8:12] + "-" + s[12:16]
 }
 
 func recoveryHash(code string, userID uuid.UUID) string {
@@ -375,31 +562,37 @@ func (s *Service) ConsumeRecoveryCode(ctx context.Context, userID uuid.UUID, cod
 	return true, s.q.SetRecoveryCodes(ctx, db.SetRecoveryCodesParams{MfaRecoveryCodes: b, ID: toPg(userID)})
 }
 
-// DisableMFA requires the account password + a live TOTP or recovery code.
+// DisableMFA requires the account password + a live TOTP or recovery code;
+// clears secret and all remaining recovery codes in one tx.
 func (s *Service) DisableMFA(ctx context.Context, userID uuid.UUID, password, code string) error {
 	row, err := s.q.GetUserAuthState(ctx, toPg(userID))
 	if err != nil {
 		return err
 	}
-	if row.MfaSecret == "" {
+	if len(row.MfaSecret) == 0 {
 		return ErrMFANotEnabled
 	}
 	if !row.PasswordHash.Valid || !CheckPassword(row.PasswordHash.String, password) {
 		return ErrBadCredentials
 	}
-	if !totp.Validate(code, row.MfaSecret) {
-		if ok, e := s.ConsumeRecoveryCode(ctx, userID, code); e != nil || !ok {
-			return ErrMFACode
-		}
+	if err := s.checkMFACode(ctx, userID, row.MfaSecret, code); err != nil {
+		return err
 	}
 	return s.withTx(ctx, func(q *db.Queries) error {
-		emit(ctx, q, "SessionRevoked", "user", userID, userID, map[string]any{"reason": "mfa_disabled"})
-		return q.SetMFASecret(ctx, db.SetMFASecretParams{MfaSecret: nil, ID: toPg(userID)})
+		if err := q.SetMFASecret(ctx, db.SetMFASecretParams{MfaSecret: nil, ID: toPg(userID)}); err != nil {
+			return err
+		}
+		if err := q.SetRecoveryCodes(ctx, db.SetRecoveryCodesParams{MfaRecoveryCodes: []byte("[]"), ID: toPg(userID)}); err != nil {
+			return err
+		}
+		return emit(ctx, q, "MFADisabled", "user", userID, userID, map[string]any{})
 	})
 }
 
-func (s *Service) MFASecret(ctx context.Context, userID uuid.UUID) (string, error) {
-	return s.q.GetMFASecret(ctx, toPg(userID))
+// MFAEnabled reports whether the account has a live TOTP secret.
+func (s *Service) MFAEnabled(ctx context.Context, userID uuid.UUID) (bool, error) {
+	b, err := s.q.GetMFASecret(ctx, toPg(userID))
+	return len(b) > 0, err
 }
 
 type SessionInfo struct {
@@ -433,11 +626,21 @@ func (s *Service) ListSessions(ctx context.Context, userID uuid.UUID) ([]Session
 	return out, nil
 }
 
-func (s *Service) RevokeSession(ctx context.Context, userID, sessionID uuid.UUID) error {
-	return s.withTx(ctx, func(q *db.Queries) error {
-		emit(ctx, q, "SessionRevoked", "session", sessionID, userID, map[string]any{"reason": "revoked_by_user"})
-		return q.RevokeSessionByID(ctx, db.RevokeSessionByIDParams{ID: toPg(sessionID), UserID: toPg(userID)})
+// RevokeSession revokes one of the caller's sessions; emits SessionRevoked
+// only when a row was actually revoked (no phantom events).
+func (s *Service) RevokeSession(ctx context.Context, userID, sessionID uuid.UUID) (bool, error) {
+	revoked := false
+	err := s.withTx(ctx, func(q *db.Queries) error {
+		if _, err := q.RevokeSessionByID(ctx, db.RevokeSessionByIDParams{ID: toPg(sessionID), UserID: toPg(userID)}); err != nil {
+			if err == pgx.ErrNoRows {
+				return nil // nothing to revoke — not an error
+			}
+			return err
+		}
+		revoked = true
+		return emit(ctx, q, "SessionRevoked", "session", sessionID, userID, map[string]any{"reason": "revoked_by_user"})
 	})
+	return revoked, err
 }
 
 func (s *Service) LinkOAuthProvider(ctx context.Context, userID uuid.UUID, provider, subject string) error {

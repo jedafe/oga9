@@ -16,7 +16,7 @@ SELECT r.id, p.node FROM user_roles r, permissions p
 WHERE r.slug = 'member' AND p.node IN (
   'org.members.view_own','org.finance.view_own','org.finance.statement_view',
   'org.finance.claims.submit_own','org.events.register_own','org.activities.view',
-  'org.comms.view','org.documents.view_any','org.chat.use','org.chat.post',
+  'org.comms.view','org.documents.view_any','org.chat.use','org.chat.post','org.members.view',
   'org.voice.join','org.welfare.request_own','api.keys.self_manage',
   'org.elections.vote_own');
 INSERT INTO role_permissions (role_id, permission)

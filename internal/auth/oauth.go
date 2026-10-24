@@ -12,12 +12,13 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jedafe/oga9/internal/db"
 	valkey "github.com/valkey-io/valkey-go"
-	"time"
 )
 
 type ProviderConfig struct {
@@ -59,11 +60,12 @@ type oidcUserinfo struct {
 }
 
 // OAuthCallback consumes state, exchanges code for tokens, fetches userinfo,
-// finds-or-provisions the user, links oauth_providers, and returns a session.
-func (s *Service) OAuthCallback(ctx context.Context, state, code, redirectURI string, p ProviderConfig, provider, deviceLabel, ip, ua string) (string, uuid.UUID, error) {
+// finds-or-provisions the user, links oauth_providers + japaconnect_user_id,
+// then runs the standard post-credential gate (status, verified, MFA).
+func (s *Service) OAuthCallback(ctx context.Context, state, code, redirectURI string, p ProviderConfig, provider, deviceLabel, ip, ua string) (*LoginResult, error) {
 	deleted, err := s.vk.Do(ctx, s.vk.B().Del().Key("oga9:oauth:state:"+state).Build()).AsInt64()
 	if err != nil || deleted != 1 {
-		return "", uuid.Nil, ErrOAuthState
+		return nil, ErrOAuthState
 	}
 
 	form := url.Values{
@@ -77,7 +79,7 @@ func (s *Service) OAuthCallback(ctx context.Context, state, code, redirectURI st
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	resp, err := oauthHTTP.Do(req)
 	if err != nil {
-		return "", uuid.Nil, err
+		return nil, err
 	}
 	defer resp.Body.Close()
 	var tok struct {
@@ -85,32 +87,48 @@ func (s *Service) OAuthCallback(ctx context.Context, state, code, redirectURI st
 		Error       string `json:"error"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&tok); err != nil || tok.AccessToken == "" {
-		return "", uuid.Nil, fmt.Errorf("oauth token exchange failed: %s", tok.Error)
+		return nil, fmt.Errorf("oauth token exchange failed: %s", tok.Error)
 	}
 
 	ureq, _ := http.NewRequestWithContext(ctx, "GET", p.UserinfoURL, nil)
 	ureq.Header.Set("Authorization", "Bearer "+tok.AccessToken)
 	uresp, err := oauthHTTP.Do(ureq)
 	if err != nil {
-		return "", uuid.Nil, err
+		return nil, err
 	}
 	defer uresp.Body.Close()
+	if uresp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("oauth userinfo returned %d", uresp.StatusCode)
+	}
 	var info oidcUserinfo
 	if err := json.NewDecoder(uresp.Body).Decode(&info); err != nil || info.Sub == "" {
-		return "", uuid.Nil, errors.New("oauth userinfo failed")
+		return nil, errors.New("oauth userinfo failed")
 	}
 
 	userID, err := s.findOrProvisionOAuthUser(ctx, provider, info)
 	if err != nil {
-		return "", uuid.Nil, err
+		return nil, err
 	}
-	return s.createSession(ctx, userID, deviceLabel, ip, ua, provider)
+
+	// Same gates as password login: suspended and unverified accounts get no
+	// session, whatever the provider asserted.
+	state2, err := s.q.GetUserAuthState(ctx, toPg(userID))
+	if err != nil {
+		return nil, err
+	}
+	if state2.Status != "active" {
+		return nil, ErrUserSuspended
+	}
+	if !state2.IsVerified {
+		return nil, ErrEmailNotVerified
+	}
+	return s.finishLogin(ctx, userID, state2.MfaSecret, "", deviceLabel, ip, ua, provider)
 }
 
 func (s *Service) findOrProvisionOAuthUser(ctx context.Context, provider string, info oidcUserinfo) (uuid.UUID, error) {
 	userID, err := s.userByOAuthSubject(ctx, provider, info.Sub)
 	if err == nil {
-		return userID, nil
+		return userID, s.linkJapaID(ctx, userID, provider, info.Sub)
 	}
 	if err != pgx.ErrNoRows {
 		return uuid.Nil, err
@@ -137,12 +155,52 @@ func (s *Service) findOrProvisionOAuthUser(ctx context.Context, provider string,
 				return e
 			}
 			userID = fromPg(id)
-			emit(ctx, q, "UserRegistered", "user", userID, userID, map[string]any{"provider": provider})
+			if e := emit(ctx, q, "UserRegistered", "user", userID, userID, map[string]any{"provider": provider}); e != nil {
+				return e
+			}
 			return q.LinkOAuthProvider(ctx, db.LinkOAuthProviderParams{
 				UserID: toPg(userID), Provider: provider, ProviderSubject: info.Sub,
 			})
 		})
-		return userID, err
+		if err != nil {
+			// concurrent first login for the same email — the other tx won;
+			// re-run the lookup instead of surfacing a 500.
+			var pgErr *pgconn.PgError
+			if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+				if id, e := s.userByOAuthSubject(ctx, provider, info.Sub); e == nil {
+					return id, nil
+				}
+				if id, e := s.UserIDByEmail(ctx, info.Email); e == nil {
+					userID = uuid.MustParse(id)
+					return userID, s.linkAndJapa(ctx, userID, provider, info.Sub)
+				}
+			}
+			return uuid.Nil, err
+		}
+		return userID, s.linkJapaID(ctx, userID, provider, info.Sub)
 	}
-	return userID, s.LinkOAuthProvider(ctx, userID, provider, info.Sub)
+	return userID, s.linkAndJapa(ctx, userID, provider, info.Sub)
+}
+
+// linkAndJapa records the provider link and — for japaconnect — the ADR-021
+// account link column (users.japaconnect_user_id = provider sub when it is a
+// UUID).
+func (s *Service) linkAndJapa(ctx context.Context, userID uuid.UUID, provider, sub string) error {
+	if err := s.LinkOAuthProvider(ctx, userID, provider, sub); err != nil {
+		return err
+	}
+	return s.linkJapaID(ctx, userID, provider, sub)
+}
+
+func (s *Service) linkJapaID(ctx context.Context, userID uuid.UUID, provider, sub string) error {
+	if provider != "japaconnect" {
+		return nil
+	}
+	jid, err := uuid.Parse(sub)
+	if err != nil {
+		return nil // non-uuid sub — oauth_providers link still recorded
+	}
+	return s.q.SetJapaconnectUserID(ctx, db.SetJapaconnectUserIDParams{
+		UserID: toPg(userID), JapaconnectUserID: toPg(jid),
+	})
 }

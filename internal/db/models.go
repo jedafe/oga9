@@ -44,6 +44,92 @@ type OauthProviders struct {
 	CreatedAt       pgtype.Timestamptz `json:"created_at"`
 }
 
+type OrgBranding struct {
+	OrganizationID pgtype.UUID `json:"organization_id"`
+	LogoMediaID    pgtype.UUID `json:"logo_media_id"`
+	PrimaryColor   pgtype.Text `json:"primary_color"`
+	SecondaryColor pgtype.Text `json:"secondary_color"`
+	Motto          pgtype.Text `json:"motto"`
+	FoundedYear    pgtype.Int4 `json:"founded_year"`
+	PortalConfig   []byte      `json:"portal_config"`
+}
+
+type OrgInvitations struct {
+	ID             pgtype.UUID        `json:"id"`
+	OrganizationID pgtype.UUID        `json:"organization_id"`
+	Email          pgtype.Text        `json:"email"`
+	Phone          pgtype.Text        `json:"phone"`
+	MemberNoHint   pgtype.Text        `json:"member_no_hint"`
+	Category       string             `json:"category"`
+	InvitedBy      pgtype.UUID        `json:"invited_by"`
+	Token          pgtype.UUID        `json:"token"`
+	Status         string             `json:"status"`
+	ExpiresAt      pgtype.Timestamptz `json:"expires_at"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+}
+
+type OrgSettings struct {
+	OrganizationID pgtype.UUID        `json:"organization_id"`
+	Key            string             `json:"key"`
+	Value          []byte             `json:"value"`
+	UpdatedAt      pgtype.Timestamptz `json:"updated_at"`
+}
+
+type OrgUnits struct {
+	ID             pgtype.UUID        `json:"id"`
+	OrganizationID pgtype.UUID        `json:"organization_id"`
+	ParentUnitID   pgtype.UUID        `json:"parent_unit_id"`
+	Type           string             `json:"type"`
+	LevelLabel     pgtype.Text        `json:"level_label"`
+	Name           string             `json:"name"`
+	Slug           string             `json:"slug"`
+	ArchivedAt     pgtype.Timestamptz `json:"archived_at"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+}
+
+type OrganizationMemberships struct {
+	ID             pgtype.UUID        `json:"id"`
+	OrganizationID pgtype.UUID        `json:"organization_id"`
+	UserID         pgtype.UUID        `json:"user_id"`
+	MemberNo       pgtype.Text        `json:"member_no"`
+	Category       string             `json:"category"`
+	LifecycleState string             `json:"lifecycle_state"`
+	UserGroupID    pgtype.UUID        `json:"user_group_id"`
+	JoinedAt       pgtype.Timestamptz `json:"joined_at"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+}
+
+type OrganizationRelationships struct {
+	ID             pgtype.UUID        `json:"id"`
+	OrganizationID pgtype.UUID        `json:"organization_id"`
+	RelatedOrgID   pgtype.UUID        `json:"related_org_id"`
+	Relationship   string             `json:"relationship"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+}
+
+type OrganizationTemplates struct {
+	Slug    string `json:"slug"`
+	Version int32  `json:"version"`
+	Label   string `json:"label"`
+	Seed    []byte `json:"seed"`
+}
+
+type Organizations struct {
+	ID             pgtype.UUID        `json:"id"`
+	TenantID       pgtype.UUID        `json:"tenant_id"`
+	ParentOrgID    pgtype.UUID        `json:"parent_org_id"`
+	Name           string             `json:"name"`
+	Slug           string             `json:"slug"`
+	TemplateSlug   pgtype.Text        `json:"template_slug"`
+	OrgType        string             `json:"org_type"`
+	CountryCode    pgtype.Text        `json:"country_code"`
+	City           pgtype.Text        `json:"city"`
+	IsPublicListed bool               `json:"is_public_listed"`
+	MaturityLevel  int32              `json:"maturity_level"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+	DeletedAt      pgtype.Timestamptz `json:"deleted_at"`
+}
+
 type Permissions struct {
 	Node        string             `json:"node"`
 	Label       string             `json:"label"`
@@ -139,8 +225,8 @@ type Users struct {
 	JapaconnectUserID pgtype.UUID        `json:"japaconnect_user_id"`
 	IsVerified        bool               `json:"is_verified"`
 	MfaSecret         []byte             `json:"mfa_secret"`
+	MfaRecoveryCodes  []byte             `json:"mfa_recovery_codes"`
 	Status            string             `json:"status"`
 	CreatedAt         pgtype.Timestamptz `json:"created_at"`
 	DeletedAt         pgtype.Timestamptz `json:"deleted_at"`
-	MfaRecoveryCodes  []byte             `json:"mfa_recovery_codes"`
 }
