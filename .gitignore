@@ -7,3 +7,6 @@ coverage/
 .DS_Store
 .env
 bin/
+apps/docs/node_modules/
+apps/docs/.svelte-kit/
+apps/docs/build/

@@ -5,6 +5,10 @@ entries reference engineering phases in `.oos/roadmaps/ROADMAP-BACKEND.md`.
 
 ## [Unreleased]
 
+### Added — docs surface
+-  — SvelteKit SSR public docs app (port 3012, docs.oga9.com),
+  markdown-driven content pipeline + nav tree, japa  pattern
+
 ### Added — Phase 03 lead-in
 - `audit_events` append-only audit trail + `internal/audit` tx-scoped writer (Rule 10 groundwork)
 - CI workflow: build, vet, gofmt, migration apply, sqlc-sync check, tests on Postgres 18 + Valkey
