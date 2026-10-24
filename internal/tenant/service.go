@@ -38,6 +38,7 @@ var (
 	ErrLimitExceeded    = errors.New("limit_exceeded")
 	ErrTenantRequired   = errors.New("tenant_required")
 	ErrNoTenant         = errors.New("no_administered_tenant")
+	ErrNotFound         = errors.New("not_found")
 )
 
 type Service struct {

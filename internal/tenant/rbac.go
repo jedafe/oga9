@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jedafe/oga9/internal/db"
 )
 
@@ -48,12 +49,6 @@ func (s *Service) ResolvePermissions(ctx context.Context, userID, orgID uuid.UUI
 		if sc.CommitteeID.Valid {
 			ps.Committee[sc.Permission] = true
 		}
-	}
-	// committee membership itself confers _committee scope for nodes the
-	// member otherwise holds — the unit ids matter to row filters, not the
-	// node union, so presence is enough to note scope exists.
-	if _, err := s.q.UserCommitteeUnits(ctx, db.UserCommitteeUnitsParams{OrgID: toPg(orgID), UserID: toPg(userID)}); err == nil {
-		// units listed — no node impact; scope rows already captured above
 	}
 	if b, err := json.Marshal(ps); err == nil {
 		_ = s.vk.Do(ctx, s.vk.B().Set().Key(key).Value(string(b)).ExSeconds(300).Build()).Error()
@@ -142,6 +137,25 @@ func (s *Service) AppointOfficer(ctx context.Context, oc *OrgCtx, termID, positi
 		if err != nil || fromPg(m.OrganizationID) != oc.OrgID {
 			return ErrNotMember
 		}
+		// position, term and scope units must all belong to this org —
+		// a foreign id would graft another org's grants into this one.
+		po, err := q.GetPositionOrg(ctx, toPg(positionID))
+		if err != nil || fromPg(po) != oc.OrgID {
+			return ErrNotFound
+		}
+		to, err := q.GetTermOrg(ctx, toPg(termID))
+		if err != nil || fromPg(to.OrganizationID) != oc.OrgID {
+			return ErrNotFound
+		}
+		for _, u := range []uuid.UUID{branchID, committeeID} {
+			if u == uuid.Nil {
+				continue
+			}
+			ur, err := q.GetUnit(ctx, toPg(u))
+			if err != nil || fromPg(ur.OrganizationID) != oc.OrgID {
+				return ErrNotFound
+			}
+		}
 		appointee = fromPg(m.UserID)
 		aid, err := q.AppointOfficer(ctx, db.AppointOfficerParams{
 			OrganizationID: toPg(oc.OrgID), TermID: toPg(termID), PositionID: toPg(positionID),
@@ -167,6 +181,9 @@ func (s *Service) EndAppointment(ctx context.Context, oc *OrgCtx, appointmentID 
 	err := s.withTx(ctx, func(q *db.Queries) error {
 		row, err := q.EndAppointment(ctx, db.EndAppointmentParams{ID: toPg(appointmentID), OrgID: toPg(oc.OrgID)})
 		if err != nil {
+			if err == pgx.ErrNoRows {
+				return ErrNotFound // unknown, ended, or foreign appointment
+			}
 			return err
 		}
 		m, err := q.GetMembershipByID(ctx, row.MemberID)
@@ -240,6 +257,9 @@ func (s *Service) RemoveCommitteeMember(ctx context.Context, oc *OrgCtx, cmID uu
 	err := s.withTx(ctx, func(q *db.Queries) error {
 		mid, err := q.RemoveCommitteeMember(ctx, db.RemoveCommitteeMemberParams{ID: toPg(cmID), OrgID: toPg(oc.OrgID)})
 		if err != nil {
+			if err == pgx.ErrNoRows {
+				return ErrNotFound
+			}
 			return err
 		}
 		m, err := q.GetMembershipByID(ctx, mid)

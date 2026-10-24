@@ -216,6 +216,33 @@ func (q *Queries) EndTermAppointments(ctx context.Context, termID pgtype.UUID) (
 	return items, nil
 }
 
+const getPositionOrg = `-- name: GetPositionOrg :one
+SELECT organization_id FROM org_positions WHERE id = $1::uuid
+`
+
+func (q *Queries) GetPositionOrg(ctx context.Context, id pgtype.UUID) (pgtype.UUID, error) {
+	row := q.db.QueryRow(ctx, getPositionOrg, id)
+	var organization_id pgtype.UUID
+	err := row.Scan(&organization_id)
+	return organization_id, err
+}
+
+const getTermOrg = `-- name: GetTermOrg :one
+SELECT organization_id, is_current FROM terms WHERE id = $1::uuid
+`
+
+type GetTermOrgRow struct {
+	OrganizationID pgtype.UUID `json:"organization_id"`
+	IsCurrent      bool        `json:"is_current"`
+}
+
+func (q *Queries) GetTermOrg(ctx context.Context, id pgtype.UUID) (GetTermOrgRow, error) {
+	row := q.db.QueryRow(ctx, getTermOrg, id)
+	var i GetTermOrgRow
+	err := row.Scan(&i.OrganizationID, &i.IsCurrent)
+	return i, err
+}
+
 const removeCommitteeMember = `-- name: RemoveCommitteeMember :one
 DELETE FROM committee_memberships
 WHERE id = $1::uuid AND organization_id = $2::uuid

@@ -57,6 +57,7 @@ type Querier interface {
 	GetMembershipByID(ctx context.Context, id pgtype.UUID) (GetMembershipByIDRow, error)
 	GetOrg(ctx context.Context, id pgtype.UUID) (GetOrgRow, error)
 	GetOrgSetting(ctx context.Context, arg GetOrgSettingParams) ([]byte, error)
+	GetPositionOrg(ctx context.Context, id pgtype.UUID) (pgtype.UUID, error)
 	GetRecoveryCodes(ctx context.Context, id pgtype.UUID) ([]byte, error)
 	GetSessionByJTI(ctx context.Context, jti pgtype.UUID) (GetSessionByJTIRow, error)
 	// Ref: oga9-engineering/conventions/system-settings-catalog.md
@@ -64,6 +65,7 @@ type Querier interface {
 	GetSystemSetting(ctx context.Context, key string) ([]byte, error)
 	GetTemplate(ctx context.Context, slug string) ([]byte, error)
 	GetTenant(ctx context.Context, id pgtype.UUID) (GetTenantRow, error)
+	GetTermOrg(ctx context.Context, id pgtype.UUID) (GetTermOrgRow, error)
 	GetUnit(ctx context.Context, id pgtype.UUID) (GetUnitRow, error)
 	GetUserAuthState(ctx context.Context, id pgtype.UUID) (GetUserAuthStateRow, error)
 	GetUserByEmail(ctx context.Context, email string) (GetUserByEmailRow, error)
