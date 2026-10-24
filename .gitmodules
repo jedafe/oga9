@@ -1,0 +1,4 @@
+[submodule ".oos"]
+	path = .oos
+	url = https://github.com/jedafe/oga9-engineering
+	branch = main
