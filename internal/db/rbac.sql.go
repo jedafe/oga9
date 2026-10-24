@@ -86,9 +86,10 @@ func (q *Queries) AssignPositionPermission(ctx context.Context, arg AssignPositi
 	return err
 }
 
-const closeTerm = `-- name: CloseTerm :exec
+const closeTerm = `-- name: CloseTerm :one
 UPDATE terms SET is_current = false
 WHERE id = $1 AND organization_id = $2::uuid AND is_current
+RETURNING id
 `
 
 type CloseTermParams struct {
@@ -97,9 +98,31 @@ type CloseTermParams struct {
 }
 
 // Closes the current term; appointments lose their is_current backing.
-func (q *Queries) CloseTerm(ctx context.Context, arg CloseTermParams) error {
-	_, err := q.db.Exec(ctx, closeTerm, arg.ID, arg.OrgID)
-	return err
+// RETURNING lets callers distinguish unknown/foreign/closed terms (404).
+func (q *Queries) CloseTerm(ctx context.Context, arg CloseTermParams) (pgtype.UUID, error) {
+	row := q.db.QueryRow(ctx, closeTerm, arg.ID, arg.OrgID)
+	var id pgtype.UUID
+	err := row.Scan(&id)
+	return id, err
+}
+
+const countPositionSeats = `-- name: CountPositionSeats :one
+SELECT count(*) FROM officer_appointments
+WHERE position_id = $1::uuid AND term_id = $2::uuid
+  AND (ends_at IS NULL OR ends_at >= CURRENT_DATE)
+`
+
+type CountPositionSeatsParams struct {
+	PositionID pgtype.UUID `json:"position_id"`
+	TermID     pgtype.UUID `json:"term_id"`
+}
+
+// Active seat occupancy for a position within a term (seats cap, §03).
+func (q *Queries) CountPositionSeats(ctx context.Context, arg CountPositionSeatsParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countPositionSeats, arg.PositionID, arg.TermID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
 }
 
 const createPosition = `-- name: CreatePosition :one
@@ -225,6 +248,17 @@ func (q *Queries) GetPositionOrg(ctx context.Context, id pgtype.UUID) (pgtype.UU
 	var organization_id pgtype.UUID
 	err := row.Scan(&organization_id)
 	return organization_id, err
+}
+
+const getPositionSeats = `-- name: GetPositionSeats :one
+SELECT seats FROM org_positions WHERE id = $1::uuid
+`
+
+func (q *Queries) GetPositionSeats(ctx context.Context, id pgtype.UUID) (int32, error) {
+	row := q.db.QueryRow(ctx, getPositionSeats, id)
+	var seats int32
+	err := row.Scan(&seats)
+	return seats, err
 }
 
 const getTermOrg = `-- name: GetTermOrg :one

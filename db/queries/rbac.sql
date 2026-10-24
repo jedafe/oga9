@@ -61,10 +61,12 @@ VALUES (sqlc.arg(organization_id), sqlc.arg(label), sqlc.arg(starts_at),
         sqlc.arg(ends_at), sqlc.arg(is_current))
 RETURNING id;
 
--- name: CloseTerm :exec
+-- name: CloseTerm :one
 -- Closes the current term; appointments lose their is_current backing.
+-- RETURNING lets callers distinguish unknown/foreign/closed terms (404).
 UPDATE terms SET is_current = false
-WHERE id = sqlc.arg(id) AND organization_id = sqlc.arg(org_id)::uuid AND is_current;
+WHERE id = sqlc.arg(id) AND organization_id = sqlc.arg(org_id)::uuid AND is_current
+RETURNING id;
 
 -- name: EndTermAppointments :many
 -- Ends every open appointment of the term; RETURNING rows feed
@@ -101,3 +103,12 @@ SELECT organization_id FROM org_positions WHERE id = sqlc.arg(id)::uuid;
 
 -- name: GetTermOrg :one
 SELECT organization_id, is_current FROM terms WHERE id = sqlc.arg(id)::uuid;
+
+-- name: GetPositionSeats :one
+SELECT seats FROM org_positions WHERE id = sqlc.arg(id)::uuid;
+
+-- name: CountPositionSeats :one
+-- Active seat occupancy for a position within a term (seats cap, §03).
+SELECT count(*) FROM officer_appointments
+WHERE position_id = sqlc.arg(position_id)::uuid AND term_id = sqlc.arg(term_id)::uuid
+  AND (ends_at IS NULL OR ends_at >= CURRENT_DATE);

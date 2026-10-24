@@ -105,6 +105,10 @@ func (s *Service) CreatePosition(ctx context.Context, oc *OrgCtx, name, slug str
 			IsExecutive: executive, Seats: seats,
 		})
 		if err != nil {
+			var pgErr *pgconn.PgError
+			if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+				return ErrSlugTaken
+			}
 			return err
 		}
 		id = fromPg(pid)
@@ -163,6 +167,23 @@ func (s *Service) AppointOfficer(ctx context.Context, oc *OrgCtx, termID, positi
 		to, err := q.GetTermOrg(ctx, toPg(termID))
 		if err != nil || fromPg(to.OrganizationID) != oc.OrgID {
 			return ErrNotFound
+		}
+		if !to.IsCurrent {
+			return ErrBadValue // appointing to a closed term grants nothing
+		}
+		// seats cap: §03 seats = concurrent holders per term
+		pseats, err := q.GetPositionSeats(ctx, toPg(positionID))
+		if err != nil {
+			return err
+		}
+		held, err := q.CountPositionSeats(ctx, db.CountPositionSeatsParams{
+			PositionID: toPg(positionID), TermID: toPg(termID),
+		})
+		if err != nil {
+			return err
+		}
+		if held >= int64(pseats) {
+			return ErrLimitExceeded
 		}
 		for _, u := range []uuid.UUID{branchID, committeeID} {
 			if u == uuid.Nil {
@@ -223,7 +244,10 @@ func (s *Service) EndAppointment(ctx context.Context, oc *OrgCtx, appointmentID 
 func (s *Service) CloseTerm(ctx context.Context, oc *OrgCtx, termID uuid.UUID) error {
 	var appointees []uuid.UUID
 	err := s.withTx(ctx, func(q *db.Queries) error {
-		if err := q.CloseTerm(ctx, db.CloseTermParams{ID: toPg(termID), OrgID: toPg(oc.OrgID)}); err != nil {
+		if _, err := q.CloseTerm(ctx, db.CloseTermParams{ID: toPg(termID), OrgID: toPg(oc.OrgID)}); err != nil {
+			if err == pgx.ErrNoRows {
+				return ErrNotFound // unknown, foreign, or already-closed term
+			}
 			return err
 		}
 		ended, err := q.EndTermAppointments(ctx, toPg(termID))

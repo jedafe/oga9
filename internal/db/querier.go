@@ -20,10 +20,13 @@ type Querier interface {
 	// Instantiate system role templates into tenant-scoped roles at org creation.
 	CloneTenantRoles(ctx context.Context, tenantID pgtype.UUID) error
 	// Closes the current term; appointments lose their is_current backing.
-	CloseTerm(ctx context.Context, arg CloseTermParams) error
+	// RETURNING lets callers distinguish unknown/foreign/closed terms (404).
+	CloseTerm(ctx context.Context, arg CloseTermParams) (pgtype.UUID, error)
 	// Atomic single-use burn: removes the hash and returns the row in one
 	// statement — concurrent logins can't both consume the same code.
 	ConsumeRecoveryCode(ctx context.Context, arg ConsumeRecoveryCodeParams) (pgtype.UUID, error)
+	// Active seat occupancy for a position within a term (seats cap, §03).
+	CountPositionSeats(ctx context.Context, arg CountPositionSeatsParams) (int64, error)
 	CountTenantOrgs(ctx context.Context, tenantID pgtype.UUID) (int64, error)
 	CreateCustomField(ctx context.Context, arg CreateCustomFieldParams) error
 	CreateCustomFieldGroup(ctx context.Context, arg CreateCustomFieldGroupParams) (pgtype.UUID, error)
@@ -58,6 +61,7 @@ type Querier interface {
 	GetOrg(ctx context.Context, id pgtype.UUID) (GetOrgRow, error)
 	GetOrgSetting(ctx context.Context, arg GetOrgSettingParams) ([]byte, error)
 	GetPositionOrg(ctx context.Context, id pgtype.UUID) (pgtype.UUID, error)
+	GetPositionSeats(ctx context.Context, id pgtype.UUID) (int32, error)
 	GetRecoveryCodes(ctx context.Context, id pgtype.UUID) ([]byte, error)
 	GetSessionByJTI(ctx context.Context, jti pgtype.UUID) (GetSessionByJTIRow, error)
 	// Ref: oga9-engineering/conventions/system-settings-catalog.md
