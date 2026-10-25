@@ -110,7 +110,7 @@ RETURNING id;
 -- name: RemoveCommitteeMember :one
 DELETE FROM committee_memberships
 WHERE id = sqlc.arg(id)::uuid AND organization_id = sqlc.arg(org_id)::uuid
-RETURNING member_id;
+RETURNING member_id, org_unit_id;
 
 -- name: GetPositionOrg :one
 SELECT organization_id FROM org_positions WHERE id = sqlc.arg(id)::uuid;

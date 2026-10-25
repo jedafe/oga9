@@ -61,7 +61,8 @@ func (d *Dispatcher) names() []string {
 // dispatcher runs at a time via the Valkey lease; a second tick while the
 // lease is held is a no-op.
 func (d *Dispatcher) ProcessTask(ctx context.Context, t *asynq.Task) error {
-	ok, err := d.vk.Do(ctx, d.vk.B().Set().Key(LockKey).Value("1").Nx().ExSeconds(lockTTL).Build()).AsBool()
+	token := uuid.NewString()
+	ok, err := d.vk.Do(ctx, d.vk.B().Set().Key(LockKey).Value(token).Nx().ExSeconds(lockTTL).Build()).AsBool()
 	if err != nil {
 		log.Printf("outbox: lock acquire failed (Valkey): %v", err)
 		return nil // next tick recovers
@@ -69,7 +70,11 @@ func (d *Dispatcher) ProcessTask(ctx context.Context, t *asynq.Task) error {
 	if !ok {
 		return nil // lease held by another dispatcher — spec no-op
 	}
-	defer d.vk.Do(ctx, d.vk.B().Del().Key(LockKey).Build())
+	// Fenced release: if our 60s lease expired mid-run and another dispatcher
+	// acquired it, the lock is theirs — only delete when we still hold it.
+	defer d.vk.Do(ctx, d.vk.B().Eval().
+		Script(`if redis.call("get", KEYS[1]) == ARGV[1] then return redis.call("del", KEYS[1]) else return 0 end`).
+		Numkeys(1).Key(LockKey).Arg(token).Build())
 
 	rows, err := d.q.FetchPendingEvents(ctx, db.FetchPendingEventsParams{
 		MaxAttempts: MaxAttempts, BatchSize: batchSize,

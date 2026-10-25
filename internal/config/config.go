@@ -39,6 +39,7 @@ type Config struct {
 	S3SecretKey    string
 	ImgproxyURL    string
 	BaseURL        string
+	AppURL         string // user-facing app origin for emailed links (app.oga9.com)
 	MailFrom       string
 	TrustedProxies []*net.IPNet
 }
@@ -76,6 +77,7 @@ func Load() (*Config, error) {
 		MailFrom:       env("OGA9_MAIL_FROM", "noreply@oga9.com"),
 		BaseURL:        env("OGA9_BASE_URL", "http://localhost:8080"),
 	}
+	cfg.AppURL = env("OGA9_APP_URL", cfg.BaseURL)
 	for _, c := range strings.Split(env("OGA9_TRUSTED_PROXIES", ""), ",") {
 		c = strings.TrimSpace(c)
 		if c == "" {

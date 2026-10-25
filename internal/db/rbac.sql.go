@@ -294,7 +294,7 @@ func (q *Queries) GetTermOrg(ctx context.Context, id pgtype.UUID) (GetTermOrgRow
 const removeCommitteeMember = `-- name: RemoveCommitteeMember :one
 DELETE FROM committee_memberships
 WHERE id = $1::uuid AND organization_id = $2::uuid
-RETURNING member_id
+RETURNING member_id, org_unit_id
 `
 
 type RemoveCommitteeMemberParams struct {
@@ -302,11 +302,16 @@ type RemoveCommitteeMemberParams struct {
 	OrgID pgtype.UUID `json:"org_id"`
 }
 
-func (q *Queries) RemoveCommitteeMember(ctx context.Context, arg RemoveCommitteeMemberParams) (pgtype.UUID, error) {
+type RemoveCommitteeMemberRow struct {
+	MemberID  pgtype.UUID `json:"member_id"`
+	OrgUnitID pgtype.UUID `json:"org_unit_id"`
+}
+
+func (q *Queries) RemoveCommitteeMember(ctx context.Context, arg RemoveCommitteeMemberParams) (RemoveCommitteeMemberRow, error) {
 	row := q.db.QueryRow(ctx, removeCommitteeMember, arg.ID, arg.OrgID)
-	var member_id pgtype.UUID
-	err := row.Scan(&member_id)
-	return member_id, err
+	var i RemoveCommitteeMemberRow
+	err := row.Scan(&i.MemberID, &i.OrgUnitID)
+	return i, err
 }
 
 const resolveOrgPermissions = `-- name: ResolveOrgPermissions :many

@@ -50,6 +50,14 @@ func orgErr(w http.ResponseWriter, err error) {
 		httpx.WriteErr(w, 400, "unknown_setting_key", "key not in the settings catalog")
 	case errors.Is(err, tenant.ErrBadValue):
 		httpx.WriteErr(w, 400, "validation_failed", "invalid request value")
+	case errors.Is(err, tenant.ErrBadSlug):
+		httpx.WriteErr(w, 400, "invalid_slug", "slug must be lowercase alphanumeric with interior hyphens")
+	case errors.Is(err, tenant.ErrBadCategory):
+		httpx.WriteErr(w, 400, "invalid_category", "category must be floor|executive|life|honorary|patron|trustee")
+	case errors.Is(err, tenant.ErrBadRole):
+		httpx.WriteErr(w, 400, "invalid_role", "committee role must be chairperson|secretary|member")
+	case errors.Is(err, tenant.ErrBadOrgType):
+		httpx.WriteErr(w, 400, "invalid_org_type", "org_type must be a known organization type")
 	case errors.Is(err, tenant.ErrBadBillingEmail):
 		httpx.WriteErr(w, 400, "invalid_billing_email", "billing_email must be a valid address")
 	case errors.Is(err, tenant.ErrBadScopeUnit):

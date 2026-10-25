@@ -171,6 +171,9 @@ func (s *Service) Register(ctx context.Context, email, password, displayName str
 }
 
 func (s *Service) Login(ctx context.Context, email, password, mfaCode, deviceLabel, ip, ua string) (*LoginResult, error) {
+	if addr, err := mail.ParseAddress(email); err == nil {
+		email = addr.Address // same normalization as Register
+	}
 	row, err := s.q.GetUserByEmail(ctx, email)
 	if err == pgx.ErrNoRows {
 		CheckPassword(dummyHash, password) // keep response time flat
@@ -329,6 +332,9 @@ func (s *Service) GetUser(ctx context.Context, id uuid.UUID) (*User, error) {
 }
 
 func (s *Service) UserIDByEmail(ctx context.Context, email string) (string, error) {
+	if addr, err := mail.ParseAddress(email); err == nil {
+		email = addr.Address
+	}
 	id, err := s.q.GetUserIDByEmail(ctx, email)
 	if err != nil {
 		return "", err
@@ -342,7 +348,10 @@ func (s *Service) VerifyEmail(ctx context.Context, token string) error {
 	if err != nil {
 		return err
 	}
-	uid := uuid.MustParse(userID)
+	uid, err := uuid.Parse(userID)
+	if err != nil {
+		return errors.New("malformed token subject")
+	}
 	err = s.withTx(ctx, func(q *db.Queries) error {
 		if err := q.SetUserVerified(ctx, toPg(uid)); err != nil {
 			return err
@@ -390,7 +399,11 @@ func (s *Service) ResetPassword(ctx context.Context, token, newPassword string) 
 		s.releaseActionToken(ctx, jti)
 		return err
 	}
-	uid := uuid.MustParse(userID)
+	uid, err := uuid.Parse(userID)
+	if err != nil {
+		s.releaseActionToken(ctx, jti)
+		return errors.New("malformed token subject")
+	}
 	var revokedJTIs []pgtype.UUID
 	err = s.withTx(ctx, func(q *db.Queries) error {
 		if err := q.UpdateUserPassword(ctx, db.UpdateUserPasswordParams{PasswordHash: pgText(hash), ID: toPg(uid)}); err != nil {
@@ -471,17 +484,17 @@ func (s *Service) dropMFAGate(ctx context.Context, nonce string) {
 // (mfa/confirm finished enrollment for a gated login).
 func (s *Service) DropMFAGate(ctx context.Context, nonce string) { s.dropMFAGate(ctx, nonce) }
 
-// ConsumeMFAGate reads + burns a gate nonce (single-use at completion).
+// ConsumeMFAGate reads + burns a gate nonce atomically (GETDEL) — truly
+// single-use; a concurrent complete can't replay the same nonce.
 func (s *Service) ConsumeMFAGate(ctx context.Context, nonce string) (mfaGate, error) {
 	var g mfaGate
-	raw, err := s.vk.Do(ctx, s.vk.B().Get().Key("oga9:auth:mfa_gate:"+nonce).Build()).AsBytes()
+	raw, err := s.vk.Do(ctx, s.vk.B().Getdel().Key("oga9:auth:mfa_gate:"+nonce).Build()).AsBytes()
 	if err != nil {
 		return g, ErrMFAGateInvalid
 	}
 	if err := json.Unmarshal(raw, &g); err != nil || g.UserID == uuid.Nil {
 		return g, ErrMFAGateInvalid
 	}
-	s.dropMFAGate(ctx, nonce)
 	return g, nil
 }
 

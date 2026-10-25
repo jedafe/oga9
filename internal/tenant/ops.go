@@ -18,8 +18,53 @@ import (
 )
 
 var ErrBadValue = errors.New("invalid json value")
+var ErrBadSlug = errors.New("invalid_slug")
+var ErrBadCategory = errors.New("invalid_category")
+var ErrBadRole = errors.New("invalid_role")
+var ErrBadOrgType = errors.New("invalid_org_type")
 
 var unitTypes = map[string]bool{"hq": true, "branch": true, "chapter": true, "committee": true, "wing": true}
+
+// Member categories per organization_memberships schema (§04).
+var memberCategories = map[string]bool{
+	"floor": true, "executive": true, "life": true,
+	"honorary": true, "patron": true, "trustee": true,
+}
+
+// Committee seat roles per committee_memberships schema (§03).
+var committeeRoles = map[string]bool{"chairperson": true, "secretary": true, "member": true}
+
+// Slugs are URL-path segments (directory, admin.{org}.host routing) —
+// lowercase alnum + interior hyphens only.
+func validSlug(s string) bool {
+	if s == "" || len(s) > 63 {
+		return false
+	}
+	for i, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+		case r == '-':
+			if i == 0 || i == len(s)-1 {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// humanizeSlug renders a seed slug for display: "welfare_officer" →
+// "Welfare Officer". Only used for template-seeded names.
+func humanizeSlug(s string) string {
+	parts := strings.FieldsFunc(s, func(r rune) bool { return r == '_' || r == '-' })
+	for i, p := range parts {
+		if p != "" {
+			parts[i] = strings.ToUpper(p[:1]) + p[1:]
+		}
+	}
+	return strings.Join(parts, " ")
+}
 
 // orgSettingsCatalog — every key registered in
 // conventions/system-settings-catalog.md (Rule 23 — unknown keys rejected).
@@ -92,6 +137,9 @@ func (s *Service) CreateUnit(ctx context.Context, oc *OrgCtx, parentID uuid.UUID
 	if !unitTypes[typ] {
 		return uuid.Nil, ErrBadUnitType
 	}
+	if !validSlug(slug) {
+		return uuid.Nil, ErrBadSlug
+	}
 	if parentID != uuid.Nil {
 		p, err := s.q.GetUnit(ctx, toPg(parentID))
 		if err != nil {
@@ -111,8 +159,17 @@ func (s *Service) CreateUnit(ctx context.Context, oc *OrgCtx, parentID uuid.UUID
 			return err
 		}
 		id = r
-		return events.Emit(ctx, q, oc.TenantID, oc.OrgID, "OrgUnitCreated", "org_unit", fromPg(r), oc.UserID, true,
-			map[string]any{"unit_id": fromPg(r), "org_id": oc.OrgID, "organization_id": oc.OrgID, "type": typ})
+		if err := events.Emit(ctx, q, oc.TenantID, oc.OrgID, "OrgUnitCreated", "org_unit", fromPg(r), oc.UserID, true,
+			map[string]any{"unit_id": fromPg(r), "org_id": oc.OrgID, "organization_id": oc.OrgID, "type": typ}); err != nil {
+			return err
+		}
+		// Committee units also fire the governance event — analytics-style
+		// consumers shouldn't have to know committees ride the unit tree.
+		if typ == "committee" {
+			return events.Emit(ctx, q, oc.TenantID, oc.OrgID, "CommitteeCreated", "org_unit", fromPg(r), oc.UserID, true,
+				map[string]any{"unit_id": fromPg(r), "org_id": oc.OrgID})
+		}
+		return nil
 	})
 	return fromPg(id), err
 }
@@ -136,28 +193,30 @@ func (s *Service) UpdateUnit(ctx context.Context, oc *OrgCtx, unitID, parentID u
 	if parentID == unitID {
 		return ErrUnitCycle
 	}
-	if parentID != uuid.Nil {
-		seen := map[uuid.UUID]bool{unitID: true}
-		cur := parentID
-		for cur != uuid.Nil {
-			if seen[cur] {
-				return ErrUnitCycle
-			}
-			seen[cur] = true
-			p, err := s.q.GetUnit(ctx, toPg(cur))
-			if err != nil {
-				if err == pgx.ErrNoRows {
+	return s.withTx(ctx, func(q *db.Queries) error {
+		// Walk the new parent chain inside the tx — the check and the write
+		// must be atomic or two concurrent reparents could form a cycle.
+		if parentID != uuid.Nil {
+			seen := map[uuid.UUID]bool{unitID: true}
+			cur := parentID
+			for cur != uuid.Nil {
+				if seen[cur] {
+					return ErrUnitCycle
+				}
+				seen[cur] = true
+				p, err := q.GetUnit(ctx, toPg(cur))
+				if err != nil {
+					if err == pgx.ErrNoRows {
+						return ErrUnitNotFound
+					}
+					return err
+				}
+				if fromPg(p.OrganizationID) != oc.OrgID {
 					return ErrUnitNotFound
 				}
-				return err
+				cur = fromPg(p.ParentUnitID)
 			}
-			if fromPg(p.OrganizationID) != oc.OrgID {
-				return ErrUnitNotFound
-			}
-			cur = fromPg(p.ParentUnitID)
 		}
-	}
-	return s.withTx(ctx, func(q *db.Queries) error {
 		if _, err := q.UpdateUnit(ctx, db.UpdateUnitParams{
 			ID: toPg(unitID), Name: name, ParentUnitID: pgUUIDPtr(parentID),
 			Type: typ, LevelLabel: pgText(label),
@@ -256,6 +315,9 @@ type Invitation struct {
 func (s *Service) CreateInvitation(ctx context.Context, oc *OrgCtx, email, phone, hint, category string) (*Invitation, error) {
 	if email == "" && phone == "" {
 		return nil, ErrInviteNoContact
+	}
+	if !memberCategories[category] {
+		return nil, ErrBadCategory
 	}
 	if email != "" {
 		// normalize "Name <a@b>" → "a@b" so the accept-time email binding

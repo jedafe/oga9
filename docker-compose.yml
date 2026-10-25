@@ -26,7 +26,9 @@ services:
       POSTGRES_USER: oga9
       POSTGRES_PASSWORD: oga9
     ports: ["5434:5432"]
-    volumes: [pgdata:/var/lib/postgresql]
+    volumes:
+      - pgdata:/var/lib/postgresql
+      - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql:ro
 
   valkey:
     image: valkey/valkey:8

@@ -84,6 +84,7 @@ type DomainEvents struct {
 	LastError      pgtype.Text        `json:"last_error"`
 	OrganizationID pgtype.UUID        `json:"organization_id"`
 	Sourced        bool               `json:"sourced"`
+	NextAttemptAt  pgtype.Timestamptz `json:"next_attempt_at"`
 }
 
 type EntityLinks struct {

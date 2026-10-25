@@ -78,6 +78,44 @@ entries reference engineering phases in `.oos/roadmaps/ROADMAP-BACKEND.md`.
   (sha256(code+user_id)), shown once, consumed on use
 
 ### Fixed (found in review sweeps)
+- `CreateOrg` masked every transaction error behind `GetOrg(uuid.Nil)` →
+  template_not_found, slug_taken, and DB errors now surface with their real
+  codes/statuses instead of a misleading 404 org_not_found
+- Emailed action links pointed at POST-only API routes (un-clickable in a
+  browser) → `OGA9_APP_URL` (default: `OGA9_BASE_URL`) now fronts user-facing
+  links (`/verify/{token}`, `/reset/{token}`); OAuth callback redirects to
+  `{app}/auth/callback` when an app origin is configured, JSON otherwise
+- Org create never instantiated template `positions`/`committees` → both now
+  land in the same tx (positions as executive org_positions, committees as
+  committee units); `TemplateInstantiated` deferred list shrinks to
+  `contribution_types` (Phase 09)
+- `ResolveOrgCtx` ignored membership lifecycle → ADR-014 terminal states
+  (suspended/expelled/resigned/deceased) now resolve to `not_a_member`
+- `oga9:outbox:lock` released unconditionally → fenced release (token +
+  compare-and-delete) so an expired-lease takeover isn't killed by the
+  prior holder
+- MFA gate consumed via GET→DEL race → atomic `GETDEL`
+- Outbox retries burned every dispatch tick → `next_attempt_at` exponential
+  backoff (10s·2^attempts, 1h cap) per §05 contract; migration 000046
+- Committee add/remove mutated state silently → `CommitteeMemberAdded` /
+  `CommitteeMemberRemoved` (catalogued, sourced) emitted in the same tx
+- Committee-type units emitted no governance event → `CommitteeCreated`
+  now fires alongside `OrgUnitCreated` (create + template paths)
+- Free-text enums: org/unit/position slugs validated (`a-z0-9-`, ≤63,
+  no edge hyphens); org_type must be a template-taxonomy type (defaults to
+  the template slug); invitation category + committee role whitelisted
+- `UpdateUnit` reparent cycle check ran outside the write tx (TOCTOU) →
+  parent-chain walk moved inside the transaction
+- `events.Emit` mutated the caller's payload map → copies before injecting
+  envelope keys
+- `uuid.MustParse` on action-token subjects could panic on malformed
+  (though signed) claims → graceful parse error
+- Login/forgot/resend didn't normalize `Name <a@b>` input → same
+  `mail.ParseAddress` normalization as Register
+- Dead `HasPermission` query (superseded by ResolveOrgPermissions) removed
+- GlitchTip compose service crash-looped on fresh clones (missing
+  `glitchtip` database) → `scripts/init-db.sql` creates it on volume init
+- Stale comments: `RequireOrgPermission` referenced pre-Phase-04 resolver
 - `/me` returned Go field names → proper snake_case JSON
 - Verify-email tokens reusable → single-use burn
 - DB errors masked as `email_taken`/`invalid_credentials`/`user_not_found` → honest 500 mapping

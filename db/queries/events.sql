@@ -13,11 +13,13 @@ VALUES (sqlc.arg(tenant_id), sqlc.arg(organization_id), sqlc.arg(actor_id),
         sqlc.arg(action), sqlc.arg(target_type), sqlc.arg(target_id), sqlc.arg(context));
 
 -- name: FetchPendingEvents :many
--- Outbox claim set: undelivered events under the attempt cap, oldest first.
+-- Outbox claim set: undelivered events under the attempt cap whose backoff
+-- has elapsed (next_attempt_at), oldest first.
 SELECT id, event_type, aggregate_type, aggregate_id, tenant_id, organization_id,
        actor_id, payload, occurred_at, attempts
 FROM domain_events
 WHERE dispatched_at IS NULL AND attempts < sqlc.arg(max_attempts)::int
+  AND (next_attempt_at IS NULL OR next_attempt_at <= now())
 ORDER BY occurred_at
 LIMIT sqlc.arg(batch_size)::int;
 
@@ -25,8 +27,11 @@ LIMIT sqlc.arg(batch_size)::int;
 UPDATE domain_events SET dispatched_at = now() WHERE id = $1;
 
 -- name: RecordEventAttempt :exec
--- Failed consumer pass — stays pending, retried on the next dispatch tick.
-UPDATE domain_events SET attempts = attempts + 1, last_error = $2 WHERE id = $1;
+-- Failed consumer pass — stays pending, retried after exponential backoff
+-- (10s * 2^attempts, capped at 1h — §05 "retry w/ backoff").
+UPDATE domain_events SET attempts = attempts + 1, last_error = $2,
+       next_attempt_at = now() + LEAST(interval '10 seconds' * power(2, attempts), interval '1 hour')
+WHERE id = $1;
 
 -- name: DeadLetterEvent :exec
 -- Attempt cap reached: pull the event out of the pending set and record the

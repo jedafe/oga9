@@ -108,7 +108,7 @@ func main() {
 		mux.HandleFunc(taskType, h)
 	}
 	authSvc := auth.NewService(pool, vk, cfg.JWTSecret, cfg.SessionTTL, cfg.DataKey)
-	authH := handler.NewAuthHandler(authSvc, queue, cfg.JWTSecret, cfg.BaseURL)
+	authH := handler.NewAuthHandler(authSvc, queue, cfg.JWTSecret, cfg.AppURL)
 	mfaH := handler.NewMFAHandler(authSvc)
 	providers := make(map[string]auth.ProviderConfig, 2)
 	for name, p := range cfg.OAuthProviders() {
@@ -117,7 +117,7 @@ func main() {
 			AuthURL: p.AuthURL, TokenURL: p.TokenURL, UserinfoURL: p.UserinfoURL,
 		}
 	}
-	oauthH := handler.NewOAuthHandler(authSvc, vk, providers, cfg.BaseURL, queue, cfg.JWTSecret)
+	oauthH := handler.NewOAuthHandler(authSvc, vk, providers, cfg.BaseURL, cfg.AppURL, queue, cfg.JWTSecret)
 	orgSvc := tenant.NewService(pool, vk)
 	orgH := handler.NewOrgHandler(orgSvc)
 

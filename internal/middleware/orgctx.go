@@ -42,9 +42,9 @@ func RequireOrgCtx(svc *tenant.Service) func(http.Handler) http.Handler {
 	}
 }
 
-// RequireOrgPermission gates on a permission node via tenant role →
-// role_permissions (Rule 20 — nodes, never position names). Positions +
-// scopes land in Phase 04 (§03); until then tenant-cloned roles carry grants.
+// RequireOrgPermission gates on a permission node via the org-scoped
+// resolver (tenant roles ∪ group roles ∪ current-term position grants +
+// _branch/_committee scopes — §03, Rule 20: nodes, never position names).
 func RequireOrgPermission(svc *tenant.Service, node string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

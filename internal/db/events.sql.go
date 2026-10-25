@@ -84,6 +84,7 @@ SELECT id, event_type, aggregate_type, aggregate_id, tenant_id, organization_id,
        actor_id, payload, occurred_at, attempts
 FROM domain_events
 WHERE dispatched_at IS NULL AND attempts < $1::int
+  AND (next_attempt_at IS NULL OR next_attempt_at <= now())
 ORDER BY occurred_at
 LIMIT $2::int
 `
@@ -106,7 +107,8 @@ type FetchPendingEventsRow struct {
 	Attempts       int32              `json:"attempts"`
 }
 
-// Outbox claim set: undelivered events under the attempt cap, oldest first.
+// Outbox claim set: undelivered events under the attempt cap whose backoff
+// has elapsed (next_attempt_at), oldest first.
 func (q *Queries) FetchPendingEvents(ctx context.Context, arg FetchPendingEventsParams) ([]FetchPendingEventsRow, error) {
 	rows, err := q.db.Query(ctx, fetchPendingEvents, arg.MaxAttempts, arg.BatchSize)
 	if err != nil {
@@ -223,7 +225,9 @@ func (q *Queries) MarkEventDispatched(ctx context.Context, id pgtype.UUID) error
 }
 
 const recordEventAttempt = `-- name: RecordEventAttempt :exec
-UPDATE domain_events SET attempts = attempts + 1, last_error = $2 WHERE id = $1
+UPDATE domain_events SET attempts = attempts + 1, last_error = $2,
+       next_attempt_at = now() + LEAST(interval '10 seconds' * power(2, attempts), interval '1 hour')
+WHERE id = $1
 `
 
 type RecordEventAttemptParams struct {
@@ -231,7 +235,8 @@ type RecordEventAttemptParams struct {
 	LastError pgtype.Text `json:"last_error"`
 }
 
-// Failed consumer pass — stays pending, retried on the next dispatch tick.
+// Failed consumer pass — stays pending, retried after exponential backoff
+// (10s * 2^attempts, capped at 1h — §05 "retry w/ backoff").
 func (q *Queries) RecordEventAttempt(ctx context.Context, arg RecordEventAttemptParams) error {
 	_, err := q.db.Exec(ctx, recordEventAttempt, arg.ID, arg.LastError)
 	return err

@@ -97,6 +97,9 @@ func (s *Service) InvalidatePermCache(ctx context.Context, userID, orgID uuid.UU
 // CreatePosition adds an org position; permission nodes attach via
 // SetPositionPermissions (nodes must be seeded — FK enforces catalog).
 func (s *Service) CreatePosition(ctx context.Context, oc *OrgCtx, name, slug string, executive bool, seats int32, nodes []string) (uuid.UUID, error) {
+	if !validSlug(slug) {
+		return uuid.Nil, ErrBadSlug
+	}
 	var id uuid.UUID
 	err := s.withTx(ctx, func(q *db.Queries) error {
 		pid, err := q.CreatePosition(ctx, db.CreatePositionParams{
@@ -315,6 +318,9 @@ func (s *Service) CloseTerm(ctx context.Context, oc *OrgCtx, termID uuid.UUID) e
 
 // AddCommitteeMember / RemoveCommitteeMember — Rule 6 triggers.
 func (s *Service) AddCommitteeMember(ctx context.Context, oc *OrgCtx, unitID, memberID uuid.UUID, role string) error {
+	if !committeeRoles[role] {
+		return ErrBadRole
+	}
 	var userID uuid.UUID
 	err := s.withTx(ctx, func(q *db.Queries) error {
 		m, err := q.GetMembershipByID(ctx, toPg(memberID))
@@ -326,7 +332,7 @@ func (s *Service) AddCommitteeMember(ctx context.Context, oc *OrgCtx, unitID, me
 			return ErrNotFound
 		}
 		userID = fromPg(m.UserID)
-		_, err = q.AddCommitteeMember(ctx, db.AddCommitteeMemberParams{
+		cmid, err := q.AddCommitteeMember(ctx, db.AddCommitteeMemberParams{
 			OrganizationID: toPg(oc.OrgID), OrgUnitID: toPg(unitID), MemberID: toPg(memberID), Role: role,
 		})
 		if err != nil {
@@ -336,7 +342,9 @@ func (s *Service) AddCommitteeMember(ctx context.Context, oc *OrgCtx, unitID, me
 			}
 			return err
 		}
-		return nil
+		return events.Emit(ctx, q, oc.TenantID, oc.OrgID, "CommitteeMemberAdded", "committee_membership", fromPg(cmid), oc.UserID, true,
+			map[string]any{"committee_membership_id": fromPg(cmid), "org_unit_id": unitID,
+				"member_id": memberID, "org_id": oc.OrgID})
 	})
 	if err == nil {
 		s.InvalidatePermCache(ctx, userID, oc.OrgID)
@@ -347,19 +355,21 @@ func (s *Service) AddCommitteeMember(ctx context.Context, oc *OrgCtx, unitID, me
 func (s *Service) RemoveCommitteeMember(ctx context.Context, oc *OrgCtx, cmID uuid.UUID) error {
 	var userID uuid.UUID
 	err := s.withTx(ctx, func(q *db.Queries) error {
-		mid, err := q.RemoveCommitteeMember(ctx, db.RemoveCommitteeMemberParams{ID: toPg(cmID), OrgID: toPg(oc.OrgID)})
+		row, err := q.RemoveCommitteeMember(ctx, db.RemoveCommitteeMemberParams{ID: toPg(cmID), OrgID: toPg(oc.OrgID)})
 		if err != nil {
 			if err == pgx.ErrNoRows {
 				return ErrNotFound
 			}
 			return err
 		}
-		m, err := q.GetMembershipByID(ctx, mid)
+		m, err := q.GetMembershipByID(ctx, row.MemberID)
 		if err != nil {
 			return err
 		}
 		userID = fromPg(m.UserID)
-		return nil
+		return events.Emit(ctx, q, oc.TenantID, oc.OrgID, "CommitteeMemberRemoved", "committee_membership", cmID, oc.UserID, true,
+			map[string]any{"committee_membership_id": cmID, "org_unit_id": fromPg(row.OrgUnitID),
+				"member_id": fromPg(row.MemberID), "org_id": oc.OrgID})
 	})
 	if err == nil {
 		s.InvalidatePermCache(ctx, userID, oc.OrgID)

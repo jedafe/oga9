@@ -67,6 +67,11 @@ func pgUUIDPtr(u uuid.UUID) pgtype.UUID {
 }
 func pgDate(t time.Time) pgtype.Date { return pgtype.Date{Time: t, Valid: !t.IsZero()} }
 
+// lifecycleBlocked — ADR-014 states that revoke org context entirely.
+var lifecycleBlocked = map[string]bool{
+	"suspended": true, "expelled": true, "resigned": true, "deceased": true,
+}
+
 // OrgCtx is the verified (user, org, membership) context injected into
 // request scope by ResolveOrgCtx (Rule 24).
 type OrgCtx struct {
@@ -101,6 +106,13 @@ func (s *Service) ResolveOrgCtx(ctx context.Context, userID, orgID uuid.UUID) (*
 	}
 	if err != nil {
 		return nil, err
+	}
+	// ADR-014 terminal states carry no org context — a suspended/expelled/
+	// resigned/deceased member loses access here, not just in UI. Transitional
+	// states (applied→registered) still resolve; Phase 08 refines per-state
+	// capabilities. Callers MUST InvalidateOrgCtx on lifecycle transitions.
+	if lifecycleBlocked[m.LifecycleState] {
+		return nil, ErrNotMember
 	}
 	oc := &OrgCtx{
 		OrgID: orgID, TenantID: fromPg(org.TenantID), UserID: userID,
@@ -181,6 +193,10 @@ func (s *Service) ListTemplates(ctx context.Context) ([]db.ListTemplatesRow, err
 type templateSeed struct {
 	Rules map[string]json.RawMessage `json:"rules"`
 	Theme map[string]any             `json:"theme"`
+	// Template officer positions + committees instantiate at org create
+	// (§10 test scenario 1); contribution_types wait for Phase 09 finance.
+	Positions  []string `json:"positions"`
+	Committees []string `json:"committees"`
 	// level_labels are org-defined tier names for hq depth — descriptive
 	// metadata for the unit tree UI, not units to create.
 	LevelLabels []string `json:"level_labels"`
@@ -235,8 +251,18 @@ func (s *Service) resolveOrgTenant(ctx context.Context, userID, requested uuid.U
 // entitlement service lands.
 func (s *Service) CreateOrg(ctx context.Context, userID uuid.UUID, name, slug, templateSlug, orgType, country, city, billingEmail string, requestedTenant uuid.UUID) (*Org, error) {
 	slug = strings.ToLower(strings.TrimSpace(slug))
-	if slug == "" || len(name) == 0 {
+	if len(name) == 0 {
 		return nil, ErrBadValue
+	}
+	if !validSlug(slug) {
+		return nil, ErrBadSlug
+	}
+	if orgType == "" {
+		orgType = templateSlug // the template defines the org's type taxonomy
+	} else if orgType != templateSlug {
+		if exists, err := s.q.TemplateExists(ctx, orgType); err != nil || !exists {
+			return nil, ErrBadOrgType
+		}
 	}
 	tenantID, provision, err := s.resolveOrgTenant(ctx, userID, requestedTenant)
 	if err != nil {
@@ -343,23 +369,53 @@ func (s *Service) CreateOrg(ctx context.Context, userID uuid.UUID, name, slug, t
 				return err
 			}
 		}
+		// Template instantiation (§10): positions + committees land now —
+		// contribution_types defer to their module phase (the deferred list
+		// lets the owning consumers finish from this event; template_slug
+		// is also on the org for backfill).
+		for _, ps := range seed.Positions {
+			pid, err := q.CreatePosition(ctx, db.CreatePositionParams{
+				OrganizationID: toPg(orgID), Name: humanizeSlug(ps), Slug: ps, IsExecutive: true, Seats: 1,
+			})
+			if err != nil {
+				return err
+			}
+			if err := events.Emit(ctx, q, tenantID, orgID, "PositionCreated", "org_position", fromPg(pid), userID, true,
+				map[string]any{"position_id": fromPg(pid), "org_id": orgID, "name": humanizeSlug(ps), "source": "template"}); err != nil {
+				return err
+			}
+		}
+		for _, cs := range seed.Committees {
+			uid, err := q.CreateUnit(ctx, db.CreateUnitParams{
+				OrganizationID: toPg(orgID), Type: "committee", Name: humanizeSlug(cs), Slug: cs,
+			})
+			if err != nil {
+				return err
+			}
+			if err := events.Emit(ctx, q, tenantID, orgID, "OrgUnitCreated", "org_unit", fromPg(uid), userID, true,
+				map[string]any{"unit_id": fromPg(uid), "org_id": orgID, "organization_id": orgID, "type": "committee", "source": "template"}); err != nil {
+				return err
+			}
+			if err := events.Emit(ctx, q, tenantID, orgID, "CommitteeCreated", "org_unit", fromPg(uid), userID, true,
+				map[string]any{"unit_id": fromPg(uid), "org_id": orgID}); err != nil {
+				return err
+			}
+		}
 		if err := events.Emit(ctx, q, tenantID, orgID, "OrganizationCreated", "organization", orgID, userID, true,
 			map[string]any{"org_id": orgID, "organization_id": orgID, "tenant_id": tenantID, "template_slug": templateSlug}); err != nil {
 			return err
 		}
-		// positions/committees/contribution_types instantiate with their
-		// modules — the deferred list lets Phase 04/09/12 consumers finish
-		// instantiation from this event (template_slug is also on the org).
 		if err := events.Emit(ctx, q, tenantID, orgID, "TemplateInstantiated", "organization", orgID, userID, false,
 			map[string]any{"org_id": orgID, "organization_id": orgID, "template_slug": templateSlug,
-				"deferred": []string{"positions", "committees", "contribution_types"}}); err != nil {
+				"deferred": []string{"contribution_types"}}); err != nil {
 			return err
 		}
 		return nil
 	})
-	if err == nil {
-		s.InvalidatePermCache(ctx, userID, orgID) // Rule 6: org_admin grant
-		s.InvalidateOrgCtx(ctx, userID, orgID)
+	if err != nil {
+		return nil, err // tx rolled back — orgID is nil; don't mask the real error
 	}
+	s.InvalidatePermCache(ctx, userID, orgID) // Rule 6: org_admin grant
+	s.InvalidateOrgCtx(ctx, userID, orgID)
 	return s.GetOrg(ctx, orgID)
 }

@@ -18,14 +18,14 @@ import (
 )
 
 type AuthHandler struct {
-	svc     *auth.Service
-	queue   *asynq.Client
-	secret  string
-	baseURL string
+	svc    *auth.Service
+	queue  *asynq.Client
+	secret string
+	appURL string
 }
 
-func NewAuthHandler(svc *auth.Service, q *asynq.Client, secret, baseURL string) *AuthHandler {
-	return &AuthHandler{svc: svc, queue: q, secret: secret, baseURL: baseURL}
+func NewAuthHandler(svc *auth.Service, q *asynq.Client, secret, appURL string) *AuthHandler {
+	return &AuthHandler{svc: svc, queue: q, secret: secret, appURL: appURL}
 }
 
 // enqueueMail is fire-and-forget (Rule 8): queue the mail task, never block.
@@ -74,9 +74,11 @@ func (h *AuthHandler) Register(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteErr(w, 500, "internal_error", "registration failed")
 		return
 	}
+	// Emailed links point at the app, not the API — browsers GET; the app
+	// page POSTs the token (same convention as §10's app/join/{token}).
 	h.enqueueMail(r.Context(), tasks.TypeSendVerification, u.Email,
 		"Verify your OGA9 account",
-		"Verify your account: "+h.baseURL+"/api/v1/auth/verify/"+verifyToken)
+		"Verify your account: "+h.appURL+"/verify/"+verifyToken)
 	httpx.WriteData(w, 201, map[string]any{"user_id": u.ID, "email": u.Email, "display_name": u.DisplayName})
 }
 
@@ -167,7 +169,7 @@ func (h *AuthHandler) ForgotPassword(w http.ResponseWriter, r *http.Request) {
 		token, _ := auth.SignActionToken(h.secret, uid, "password_reset", time.Hour)
 		h.enqueueMail(r.Context(), tasks.TypeSendPasswordReset, req.Email,
 			"OGA9 password reset",
-			"Reset your password: "+h.baseURL+"/api/v1/auth/password/reset\nToken: "+token)
+			"Reset your password: "+h.appURL+"/reset/"+token)
 	}
 	httpx.WriteData(w, 200, map[string]any{"sent": true})
 }
@@ -239,7 +241,7 @@ func (h *AuthHandler) ResendVerification(w http.ResponseWriter, r *http.Request)
 			token, _ := auth.SignActionToken(h.secret, uid, "verify_email", 24*time.Hour)
 			h.enqueueMail(r.Context(), tasks.TypeSendVerification, u.Email,
 				"Verify your OGA9 account",
-				"Verify your account: "+h.baseURL+"/api/v1/auth/verify/"+token)
+				"Verify your account: "+h.appURL+"/verify/"+token)
 		}
 	}
 	httpx.WriteData(w, 200, map[string]any{"sent": true})

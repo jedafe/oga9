@@ -563,29 +563,6 @@ func (q *Queries) GetUnit(ctx context.Context, id pgtype.UUID) (GetUnitRow, erro
 	return i, err
 }
 
-const hasPermission = `-- name: HasPermission :one
-SELECT EXISTS (
-  SELECT 1 FROM user_role_assignments ura
-  JOIN user_roles r ON r.id = ura.role_id
-  JOIN role_permissions rp ON rp.role_id = r.id
-  WHERE ura.user_id = $1 AND r.tenant_id = $2
-    AND rp.permission = $3
-) AS allowed
-`
-
-type HasPermissionParams struct {
-	UserID   pgtype.UUID `json:"user_id"`
-	TenantID pgtype.UUID `json:"tenant_id"`
-	Node     string      `json:"node"`
-}
-
-func (q *Queries) HasPermission(ctx context.Context, arg HasPermissionParams) (bool, error) {
-	row := q.db.QueryRow(ctx, hasPermission, arg.UserID, arg.TenantID, arg.Node)
-	var allowed bool
-	err := row.Scan(&allowed)
-	return allowed, err
-}
-
 const hasRoleInTenant = `-- name: HasRoleInTenant :one
 SELECT EXISTS(
   SELECT 1 FROM user_role_assignments ura
@@ -907,6 +884,17 @@ type SetTenantOwnerOrgParams struct {
 func (q *Queries) SetTenantOwnerOrg(ctx context.Context, arg SetTenantOwnerOrgParams) error {
 	_, err := q.db.Exec(ctx, setTenantOwnerOrg, arg.ID, arg.OwnerOrgID)
 	return err
+}
+
+const templateExists = `-- name: TemplateExists :one
+SELECT EXISTS(SELECT 1 FROM organization_templates WHERE slug = $1) AS exists
+`
+
+func (q *Queries) TemplateExists(ctx context.Context, slug string) (bool, error) {
+	row := q.db.QueryRow(ctx, templateExists, slug)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
 }
 
 const unitHasActiveChildren = `-- name: UnitHasActiveChildren :one

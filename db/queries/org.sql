@@ -79,6 +79,9 @@ SELECT slug, version, label FROM organization_templates ORDER BY label;
 -- name: GetTemplate :one
 SELECT seed FROM organization_templates WHERE slug = $1;
 
+-- name: TemplateExists :one
+SELECT EXISTS(SELECT 1 FROM organization_templates WHERE slug = $1) AS exists;
+
 -- name: CloneTenantRoles :exec
 -- Instantiate system role templates into tenant-scoped roles at org creation.
 INSERT INTO user_roles (tenant_id, user_group_id, name, slug, is_system)
@@ -96,15 +99,6 @@ WHERE nr.tenant_id = $1;
 INSERT INTO user_role_assignments (user_id, role_id, granted_by)
 SELECT $1, r.id, $3 FROM user_roles r WHERE r.tenant_id = $2 AND r.slug = $4
 ON CONFLICT (user_id, role_id) DO NOTHING;
-
--- name: HasPermission :one
-SELECT EXISTS (
-  SELECT 1 FROM user_role_assignments ura
-  JOIN user_roles r ON r.id = ura.role_id
-  JOIN role_permissions rp ON rp.role_id = r.id
-  WHERE ura.user_id = sqlc.arg(user_id) AND r.tenant_id = sqlc.arg(tenant_id)
-    AND rp.permission = sqlc.arg(node)
-) AS allowed;
 
 -- name: CreateUnit :one
 INSERT INTO org_units (organization_id, parent_unit_id, type, level_label, name, slug)

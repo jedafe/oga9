@@ -139,7 +139,7 @@ func TestOrgLifecycleFlow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("invite2: %v", err)
 	}
-	org2, err := svc.CreateOrg(ctx, stranger, "Other Club", "oc"+uuid.NewString()[:6], "social-club", "social", "NG", "Abuja", "stg@test.oga9", uuid.Nil)
+	org2, err := svc.CreateOrg(ctx, stranger, "Other Club", "oc"+uuid.NewString()[:6], "social-club", "", "NG", "Abuja", "stg@test.oga9", uuid.Nil)
 	if err != nil {
 		t.Fatalf("create org2: %v", err)
 	}

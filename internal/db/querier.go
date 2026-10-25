@@ -59,7 +59,8 @@ type Querier interface {
 	// Ends every open appointment of the term; RETURNING rows feed
 	// AppointmentEnded events + permission-cache invalidation.
 	EndTermAppointments(ctx context.Context, termID pgtype.UUID) ([]EndTermAppointmentsRow, error)
-	// Outbox claim set: undelivered events under the attempt cap, oldest first.
+	// Outbox claim set: undelivered events under the attempt cap whose backoff
+	// has elapsed (next_attempt_at), oldest first.
 	FetchPendingEvents(ctx context.Context, arg FetchPendingEventsParams) ([]FetchPendingEventsRow, error)
 	GetBranding(ctx context.Context, organizationID pgtype.UUID) (GetBrandingRow, error)
 	GetInvitationByToken(ctx context.Context, token pgtype.UUID) (GetInvitationByTokenRow, error)
@@ -84,7 +85,6 @@ type Querier interface {
 	GetUserByID(ctx context.Context, id pgtype.UUID) (GetUserByIDRow, error)
 	GetUserByOAuthSubject(ctx context.Context, arg GetUserByOAuthSubjectParams) (pgtype.UUID, error)
 	GetUserIDByEmail(ctx context.Context, email string) (pgtype.UUID, error)
-	HasPermission(ctx context.Context, arg HasPermissionParams) (bool, error)
 	HasRoleInTenant(ctx context.Context, arg HasRoleInTenantParams) (bool, error)
 	InsertAuditEvent(ctx context.Context, arg InsertAuditEventParams) error
 	LinkEntities(ctx context.Context, arg LinkEntitiesParams) error
@@ -102,12 +102,13 @@ type Querier interface {
 	// Inserted in the SAME tx as the consumer's own writes (§05 contract).
 	LogConsumerProcessed(ctx context.Context, arg LogConsumerProcessedParams) error
 	MarkEventDispatched(ctx context.Context, id pgtype.UUID) error
-	// Failed consumer pass — stays pending, retried on the next dispatch tick.
+	// Failed consumer pass — stays pending, retried after exponential backoff
+	// (10s * 2^attempts, capped at 1h — §05 "retry w/ backoff").
 	RecordEventAttempt(ctx context.Context, arg RecordEventAttemptParams) error
 	// ADR-015 "related" helper: bidirectional traversal of entity_links from a
 	// (type,id) seed, depth-capped to keep the walk bounded.
 	RelatedEntities(ctx context.Context, arg RelatedEntitiesParams) ([]RelatedEntitiesRow, error)
-	RemoveCommitteeMember(ctx context.Context, arg RemoveCommitteeMemberParams) (pgtype.UUID, error)
+	RemoveCommitteeMember(ctx context.Context, arg RemoveCommitteeMemberParams) (RemoveCommitteeMemberRow, error)
 	// Ref: oga9-engineering/sections/03-rbac-positions.md (Phase 04)
 	// RBAC + positions: permission resolution (group+direct+position+scope union),
 	// positions, terms, officer appointments, committee memberships.
@@ -128,6 +129,7 @@ type Querier interface {
 	SetRecoveryCodes(ctx context.Context, arg SetRecoveryCodesParams) error
 	SetTenantOwnerOrg(ctx context.Context, arg SetTenantOwnerOrgParams) error
 	SetUserVerified(ctx context.Context, id pgtype.UUID) error
+	TemplateExists(ctx context.Context, slug string) (bool, error)
 	UnitHasActiveChildren(ctx context.Context, parentUnitID pgtype.UUID) (bool, error)
 	// §10 archive guard: a unit still holding committee members or open
 	// officer appointments scoped to it counts as having dependents.

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"net/url"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -23,12 +24,13 @@ type OAuthHandler struct {
 	vk        valkey.Client
 	providers map[string]auth.ProviderConfig
 	baseURL   string
+	appURL    string
 	queue     *asynq.Client
 	secret    string
 }
 
-func NewOAuthHandler(svc *auth.Service, vk valkey.Client, providers map[string]auth.ProviderConfig, baseURL string, queue *asynq.Client, secret string) *OAuthHandler {
-	return &OAuthHandler{svc: svc, vk: vk, providers: providers, baseURL: baseURL, queue: queue, secret: secret}
+func NewOAuthHandler(svc *auth.Service, vk valkey.Client, providers map[string]auth.ProviderConfig, baseURL, appURL string, queue *asynq.Client, secret string) *OAuthHandler {
+	return &OAuthHandler{svc: svc, vk: vk, providers: providers, baseURL: baseURL, appURL: appURL, queue: queue, secret: secret}
 }
 
 func (h *OAuthHandler) provider(w http.ResponseWriter, r *http.Request) (auth.ProviderConfig, string, bool) {
@@ -91,7 +93,7 @@ func (h *OAuthHandler) Callback(w http.ResponseWriter, r *http.Request) {
 					token, _ := auth.SignActionToken(h.secret, uid, "verify_email", 24*time.Hour)
 					t, terr := tasks.NewEmailTask(tasks.TypeSendVerification,
 						tasks.SendEmailPayload{To: res.Email, Subject: "Verify your OGA9 account",
-							Body: "Verify your account: " + h.baseURL + "/api/v1/auth/verify/" + token})
+							Body: "Verify your account: " + h.appURL + "/verify/" + token})
 					if terr == nil {
 						if _, err := h.queue.EnqueueContext(context.WithoutCancel(r.Context()), t); err != nil {
 							log.Printf("mail enqueue failed (%s → %s): %v", tasks.TypeSendVerification, res.Email, err)
@@ -105,6 +107,13 @@ func (h *OAuthHandler) Callback(w http.ResponseWriter, r *http.Request) {
 		default:
 			httpx.WriteErr(w, 401, "oauth_failed", "provider authentication failed")
 		}
+		return
+	}
+	// A real app deployment redirects the browser back to the frontend with
+	// the session; pure-API installs (AppURL unset/same as base) get JSON.
+	if h.appURL != "" && h.appURL != h.baseURL {
+		q := url.Values{"token": {res.Token}, "session_id": {res.SessionID.String()}}
+		http.Redirect(w, r, h.appURL+"/auth/callback?"+q.Encode(), http.StatusFound)
 		return
 	}
 	httpx.WriteData(w, 200, map[string]any{"token": res.Token, "session_id": res.SessionID})

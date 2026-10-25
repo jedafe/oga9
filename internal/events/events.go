@@ -55,14 +55,17 @@ func pgUUID(u uuid.UUID) pgtype.UUID { return pgtype.UUID{Bytes: u, Valid: u != 
 // uuid.Nil → NULL scope columns (platform events); `sourced` marks ADR-004
 // replayable events per the domain-events catalog.
 func Emit(ctx context.Context, q *db.Queries, tenantID, orgID uuid.UUID, eventType, aggType string, aggID, actorID uuid.UUID, sourced bool, payload map[string]any) error {
-	if payload == nil {
-		payload = map[string]any{}
+	// Copy the caller's map before injecting envelope keys — Emit must not
+	// mutate a payload the caller may reuse across emits.
+	p := make(map[string]any, len(payload)+4)
+	for k, v := range payload {
+		p[k] = v
 	}
-	payload["actor_id"] = actorID
-	payload["aggregate_id"] = aggID
-	payload["aggregate_type"] = aggType
-	payload["occurred_at"] = time.Now().UTC()
-	b, err := json.Marshal(payload)
+	p["actor_id"] = actorID
+	p["aggregate_id"] = aggID
+	p["aggregate_type"] = aggType
+	p["occurred_at"] = time.Now().UTC()
+	b, err := json.Marshal(p)
 	if err != nil {
 		return err
 	}
