@@ -10,6 +10,25 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+type AppInstallations struct {
+	ID            pgtype.UUID        `json:"id"`
+	TenantID      pgtype.UUID        `json:"tenant_id"`
+	AppID         string             `json:"app_id"`
+	Status        string             `json:"status"`
+	Config        []byte             `json:"config"`
+	ActivatedAt   pgtype.Timestamptz `json:"activated_at"`
+	DeactivatedAt pgtype.Timestamptz `json:"deactivated_at"`
+}
+
+type AppRegistry struct {
+	AppID       string             `json:"app_id"`
+	Version     string             `json:"version"`
+	Label       string             `json:"label"`
+	Manifest    []byte             `json:"manifest"`
+	MvpRequired bool               `json:"mvp_required"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+}
+
 type AuditEvents struct {
 	ID             pgtype.UUID        `json:"id"`
 	TenantID       pgtype.UUID        `json:"tenant_id"`
@@ -20,6 +39,16 @@ type AuditEvents struct {
 	TargetID       pgtype.UUID        `json:"target_id"`
 	Context        []byte             `json:"context"`
 	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+}
+
+type BillingWebhookEvents struct {
+	ID          pgtype.UUID        `json:"id"`
+	Provider    string             `json:"provider"`
+	EventID     string             `json:"event_id"`
+	EventType   string             `json:"event_type"`
+	Payload     []byte             `json:"payload"`
+	ProcessedAt pgtype.Timestamptz `json:"processed_at"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
 }
 
 type CommitteeMemberships struct {
@@ -104,6 +133,17 @@ type EventConsumerLog struct {
 	Consumer    string             `json:"consumer"`
 	EventID     pgtype.UUID        `json:"event_id"`
 	ProcessedAt pgtype.Timestamptz `json:"processed_at"`
+}
+
+type Licenses struct {
+	ID           pgtype.UUID        `json:"id"`
+	TenantID     pgtype.UUID        `json:"tenant_id"`
+	DeploymentID string             `json:"deployment_id"`
+	Edition      string             `json:"edition"`
+	Entitlements []byte             `json:"entitlements"`
+	IssuedAt     pgtype.Timestamptz `json:"issued_at"`
+	ExpiresAt    pgtype.Timestamptz `json:"expires_at"`
+	Signature    []byte             `json:"signature"`
 }
 
 type OauthProviders struct {
@@ -261,6 +301,19 @@ type RolePermissions struct {
 	Permission string      `json:"permission"`
 }
 
+type Subscriptions struct {
+	ID               pgtype.UUID        `json:"id"`
+	TenantID         pgtype.UUID        `json:"tenant_id"`
+	PlanSlug         string             `json:"plan_slug"`
+	State            string             `json:"state"`
+	BillingTerm      string             `json:"billing_term"`
+	TrialEndsAt      pgtype.Timestamptz `json:"trial_ends_at"`
+	CurrentPeriodEnd pgtype.Timestamptz `json:"current_period_end"`
+	GraceEndsAt      pgtype.Timestamptz `json:"grace_ends_at"`
+	CancelledAt      pgtype.Timestamptz `json:"cancelled_at"`
+	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+}
+
 type SystemSettings struct {
 	Key       string             `json:"key"`
 	Value     []byte             `json:"value"`
@@ -285,6 +338,13 @@ type Terms struct {
 	StartsAt       pgtype.Date `json:"starts_at"`
 	EndsAt         pgtype.Date `json:"ends_at"`
 	IsCurrent      bool        `json:"is_current"`
+}
+
+type UsageMeters struct {
+	TenantID    pgtype.UUID `json:"tenant_id"`
+	LimitKey    string      `json:"limit_key"`
+	Used        int64       `json:"used"`
+	PeriodStart pgtype.Date `json:"period_start"`
 }
 
 type UserGroups struct {

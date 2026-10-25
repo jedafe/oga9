@@ -11,9 +11,11 @@ import (
 	"log"
 	"sync"
 
+	"github.com/google/uuid"
 	"github.com/hibiken/asynq"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/jedafe/oga9/internal/billing"
 	"github.com/jedafe/oga9/internal/db"
 	"github.com/jedafe/oga9/internal/events"
 	"github.com/jedafe/oga9/internal/mailer"
@@ -26,6 +28,7 @@ const (
 	TypeSendVerification  = "identity:send_verification"
 	TypeSendPasswordReset = "identity:send_password_reset"
 	TypeRetryPayment      = "billing:retry_payment"
+	TypeProcessWebhook    = "billing:process_webhook"
 	TypeSubscriptionSweep = "billing:subscription_state_sweep"
 	TypeLicenseReminder   = "license:renewal_reminder"
 	TypeTenantProvision   = "tenant:provision"
@@ -36,6 +39,16 @@ type SendEmailPayload struct {
 	To      string `json:"to"`
 	Subject string `json:"subject"`
 	Body    string `json:"body"`
+}
+
+// NewProcessWebhookTask builds the critical-tier webhook worker task —
+// payload is the durable raw-event id; the worker re-fetches (§07/§08).
+func NewProcessWebhookTask(rawEventID string) (*asynq.Task, error) {
+	b, err := json.Marshal(map[string]string{"raw_event_id": rawEventID})
+	if err != nil {
+		return nil, err
+	}
+	return asynq.NewTask(TypeProcessWebhook, b, asynq.Queue("critical"), asynq.MaxRetry(8)), nil
 }
 
 // NewEmailTask builds a queueable mail task. Handlers enqueue with
@@ -54,6 +67,7 @@ type Deps struct {
 	Mail      *mailer.Mailer
 	Pool      *pgxpool.Pool
 	RedisAddr string // asynq Inspector reports queue depth over the same conn
+	Billing   *billing.Service
 }
 
 // tickSweeps run inside each scheduler:tick — later phases append their
@@ -74,12 +88,14 @@ func Handlers(d Deps) map[string]asynq.HandlerFunc {
 		TypeSendPasswordReset: sendMail(d.Mail),
 		TypeRetryDead:         retryDead(d.Pool),
 		TypeSchedulerTick:     schedulerTick(d.RedisAddr, d.Pool),
+		TypeSubscriptionSweep: subscriptionSweep(d.Billing),
+		TypeProcessWebhook:    processWebhook(d.Billing),
 		// Stubs — registered now (catalog-reserved), implemented when their
-		// sections land: billing 07/09, license 14, provision 12.
-		TypeRetryPayment:      stub(TypeRetryPayment, "Phase 09"),
-		TypeSubscriptionSweep: stub(TypeSubscriptionSweep, "Phase 07"),
-		TypeLicenseReminder:   stub(TypeLicenseReminder, "Phase 14"),
-		TypeTenantProvision:   stub(TypeTenantProvision, "Phase 12"),
+		// sections land: retry_payment needs §12 payments; license 14;
+		// provision 12.
+		TypeRetryPayment:    stub(TypeRetryPayment, "Phase 12"),
+		TypeLicenseReminder: stub(TypeLicenseReminder, "Phase 14"),
+		TypeTenantProvision: stub(TypeTenantProvision, "Phase 12"),
 	}
 }
 
@@ -122,6 +138,32 @@ func retryDead(pool *pgxpool.Pool) asynq.HandlerFunc {
 			log.Printf("events:retry_dead re-drove %d dead-lettered event(s)", n)
 		}
 		return nil
+	}
+}
+
+// subscriptionSweep drives the §07 lifecycle machine's time-based
+// transitions (trial→grace→restricted).
+func subscriptionSweep(b *billing.Service) asynq.HandlerFunc {
+	return func(ctx context.Context, t *asynq.Task) error {
+		return b.SweepStates(ctx)
+	}
+}
+
+// processWebhook applies a recorded billing webhook event — idempotent via
+// processed_at (§07, Rule 27).
+func processWebhook(b *billing.Service) asynq.HandlerFunc {
+	return func(ctx context.Context, t *asynq.Task) error {
+		var p struct {
+			RawEventID string `json:"raw_event_id"`
+		}
+		if err := json.Unmarshal(t.Payload(), &p); err != nil {
+			return err
+		}
+		id, err := uuid.Parse(p.RawEventID)
+		if err != nil {
+			return nil // malformed payload — retrying won't fix it; archive
+		}
+		return b.ProcessWebhook(ctx, id)
 	}
 }
 

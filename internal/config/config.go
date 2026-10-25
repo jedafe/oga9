@@ -29,6 +29,9 @@ type Config struct {
 	// §08 job queue cadences
 	SchedulerTickInterval time.Duration // scheduler:tick cron driver
 	RetryDeadInterval     time.Duration // events:retry_dead DLQ re-drive
+	BillingSweepInterval  time.Duration // billing:subscription_state_sweep cadence (§07)
+	LicenseSignKey        []byte        // HMAC key for self-hosted license files (§07, Rule 29)
+	WebhookSecret         []byte        // billing webhook signature secret (Rule 9)
 	SMTPHost              string
 	SMTPPort              int
 	SMTPUser              string
@@ -67,6 +70,7 @@ func Load() (*Config, error) {
 		OutboxInterval:        envDur(&errs, "OGA9_OUTBOX_DISPATCH_INTERVAL", 10*time.Second),
 		SchedulerTickInterval: envDur(&errs, "OGA9_SCHEDULER_TICK_INTERVAL", 5*time.Minute),
 		RetryDeadInterval:     envDur(&errs, "OGA9_EVENTS_RETRY_DEAD_INTERVAL", time.Minute),
+		BillingSweepInterval:  envDur(&errs, "OGA9_BILLING_SWEEP_INTERVAL", time.Hour),
 		SMTPHost:              env("OGA9_SMTP_HOST", "localhost"),
 		SMTPPort:              envInt(&errs, "OGA9_SMTP_PORT", 1025),
 		SMTPUser:              env("OGA9_SMTP_USERNAME", ""),
@@ -95,6 +99,8 @@ func Load() (*Config, error) {
 		}
 	}
 	cfg.DataKey = dataKey(env("OGA9_DATA_ENCRYPTION_KEY", ""), cfg.JWTSecret)
+	cfg.LicenseSignKey = dataKey(env("OGA9_LICENSE_SIGNING_KEY", ""), "license:"+cfg.JWTSecret)
+	cfg.WebhookSecret = []byte(env("OGA9_BILLING_WEBHOOK_SECRET", "")) // empty → endpoint rejects providers
 	if cfg.JWTSecret == "change-me" && cfg.Env == "production" {
 		errs = append(errs, errors.New("OGA9_JWT_SECRET must be set in production"))
 	}

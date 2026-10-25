@@ -18,6 +18,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	valkey "github.com/valkey-io/valkey-go"
 
+	"github.com/jedafe/oga9/internal/billing"
 	"github.com/jedafe/oga9/internal/db"
 	"github.com/jedafe/oga9/internal/events"
 )
@@ -133,6 +134,20 @@ func (s *Service) InvalidateOrgCtx(ctx context.Context, userID, orgID uuid.UUID)
 
 // HasTenantRole reports whether the user holds the named role in the tenant —
 // used by tenant resolution where org context doesn't exist yet.
+// AdminTenants returns the tenants where the user holds org_admin — the
+// server-side basis for billing-tenant resolution (Rule 24).
+func (s *Service) AdminTenants(ctx context.Context, userID uuid.UUID) ([]uuid.UUID, error) {
+	rows, err := s.q.ListOrgAdminTenants(ctx, toPg(userID))
+	if err != nil {
+		return nil, err
+	}
+	out := make([]uuid.UUID, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, uuid.UUID(r.Bytes))
+	}
+	return out, nil
+}
+
 func (s *Service) HasTenantRole(ctx context.Context, userID, tenantID uuid.UUID, slug string) bool {
 	ok, err := s.q.HasRoleInTenant(ctx, db.HasRoleInTenantParams{
 		UserID: toPg(userID), TenantID: toPg(tenantID), Slug: slug,
@@ -318,10 +333,9 @@ func (s *Service) CreateOrg(ctx context.Context, userID uuid.UUID, name, slug, t
 				return err
 			}
 			tenantID = fromPg(tid)
-			// platform-scoped event (no org yet); plan_slug stays null until
-			// subscriptions land in Phase 07 (§07 entitlement consumer).
+			// platform-scoped event (no org yet); starter trial lands below.
 			if err := events.Emit(ctx, q, tenantID, uuid.Nil, "TenantProvisioned", "tenant", tenantID, userID, true,
-				map[string]any{"tenant_id": tenantID, "plan_slug": nil}); err != nil {
+				map[string]any{"tenant_id": tenantID, "plan_slug": "starter"}); err != nil {
 				return err
 			}
 			// clone the system role templates into the new tenant
@@ -329,6 +343,24 @@ func (s *Service) CreateOrg(ctx context.Context, userID uuid.UUID, name, slug, t
 				return err
 			}
 			if err := q.CloneTenantRolePermissions(ctx, tid); err != nil {
+				return err
+			}
+			// §07: every tenant starts on a starter-plan trial (the
+			// subscription is the plan source of truth — tenants carry no
+			// plan column). §06: MVP apps install at provision.
+			trialDays := int64(14)
+			if v, err := q.GetSystemSetting(ctx, "billing.trial_days"); err == nil {
+				var n json.Number
+				if json.Unmarshal(v, &n) == nil {
+					if i, err := n.Int64(); err == nil {
+						trialDays = i
+					}
+				}
+			}
+			if err := billing.ProvisionTrial(ctx, q, tenantID, userID, trialDays); err != nil {
+				return err
+			}
+			if err := provisionMVPApps(ctx, q, tenantID); err != nil {
 				return err
 			}
 		}

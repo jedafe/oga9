@@ -5,6 +5,44 @@ entries reference engineering phases in `.oos/roadmaps/ROADMAP-BACKEND.md`.
 
 ## [Unreleased]
 
+### Added — Phase 07 (App Framework & Entitlements, §06/§07)
+- Group-7 migrations (000050–000057): `app_registry` + 6 MVP app seeds with
+  manifests (requires/permissions/events/entitlements), `app_installations`,
+  `subscriptions`, `usage_meters`, `licenses`, `billing_webhook_events`
+  (Rule 9 durable record), `billing.trial_days` setting seed; 000058 seeds a
+  `platform_admin` role granting `platform.*` nodes
+- App activation graph (`internal/tenant/apps.go`): activate requires the
+  dependency closure active + the manifest's entitlement feature (Rule 25,
+  402 not_entitled); deactivate rejects mvp_required and active-dependents
+  (`app_has_dependents`, 409) — deactivation disables, never deletes
+- `internal/entitlements` service: `IsEnabled`/`Limit`/`CheckLimit`/`Set`,
+  merged plan ∪ license resolution (starter floor for pre-existing tenants),
+  `oga9:entitlements:{tenant_id}` 10-min cache + invalidation via a
+  registered outbox consumer on SubscriptionChanged/AppActivated/
+  AppDeactivated/LicenseIssued
+- Subscription lifecycle (trial→active⇄past_due→grace→restricted→cancelled):
+  provision now creates a starter trial + installs mvp_required apps in the
+  same tx; `billing:subscription_state_sweep` (critical, hourly) drives
+  time-based transitions; every transition emits `SubscriptionChanged`
+  same-tx
+- Licenses (Rule 29): `POST /platform/licenses` issues signed license files
+  (HMAC-SHA256, `OGA9_LICENSE_SIGNING_KEY`); `POST /license/validate` is the
+  unauthenticated deployment callback verifying the signature
+- Billing webhook (Rule 9): `POST /webhooks/billing/{provider}` verifies
+  HMAC-SHA256 (`X-Webhook-Signature`), durably records
+  `UNIQUE(provider,event_id)` = replay guard, enqueues
+  `billing:process_webhook` (critical) which applies the transition and
+  marks `processed_at` — idempotent
+- Routes: `GET /platform/apps`, `GET /platform/plans`,
+  `GET/POST/DELETE /orgs/{id}/apps[/{app_id}]`, `GET/POST
+  /billing/subscription`, `POST /billing/change-plan`, `POST
+  /billing/cancel`, `GET /billing/invoices` (empty until g13),
+  `GET /me/entitlements`; billing tenant resolved server-side from the
+  caller's org_admin tenants (Rule 24)
+- `RequirePlatformNode` middleware — platform.* nodes via NULL-tenant roles
+- New config: `OGA9_BILLING_SWEEP_INTERVAL` (1h),
+  `OGA9_LICENSE_SIGNING_KEY`, `OGA9_BILLING_WEBHOOK_SECRET`
+
 ### Added — review-fix sweep + governance reads
 - GET list routes for governance (catalogued): `/orgs/{id}/positions`,
   `/terms`, `/appointments`, `/units/{id}/members` — member-visible reads

@@ -11,7 +11,11 @@ import (
 )
 
 type Querier interface {
+	// Re-activation is an upsert: clears the deactivated marker (idempotent —
+	// activating an active app is a no-op state-wise).
+	ActivateApp(ctx context.Context, arg ActivateAppParams) error
 	AddCommitteeMember(ctx context.Context, arg AddCommitteeMemberParams) (pgtype.UUID, error)
+	AddUsage(ctx context.Context, arg AddUsageParams) (int64, error)
 	AppointOfficer(ctx context.Context, arg AppointOfficerParams) (pgtype.UUID, error)
 	ArchiveUnit(ctx context.Context, id pgtype.UUID) (pgtype.UUID, error)
 	AssignPositionPermission(ctx context.Context, arg AssignPositionPermissionParams) error
@@ -42,6 +46,7 @@ type Querier interface {
 	CreateOrg(ctx context.Context, arg CreateOrgParams) (CreateOrgRow, error)
 	CreatePosition(ctx context.Context, arg CreatePositionParams) (pgtype.UUID, error)
 	CreateSession(ctx context.Context, arg CreateSessionParams) (pgtype.UUID, error)
+	CreateSubscription(ctx context.Context, arg CreateSubscriptionParams) (pgtype.UUID, error)
 	// Ref: oga9-engineering/sections/04-tenancy-organizations.md, 10-organization-core.md
 	// sqlc queries for tenants, organizations, memberships, units, settings,
 	// invitations, branding (Phase 03).
@@ -51,6 +56,7 @@ type Querier interface {
 	// Ref: oga9-engineering/sections/02-identity-authentication-sessions.md
 	// sqlc queries for users, sessions, oauth links (Phase 02).
 	CreateUser(ctx context.Context, arg CreateUserParams) (CreateUserRow, error)
+	DeactivateApp(ctx context.Context, arg DeactivateAppParams) error
 	// Attempt cap reached: pull the event out of the pending set and record the
 	// terminal error. `events:retry_dead` (Phase 06) can reset dispatched_at.
 	DeadLetterEvent(ctx context.Context, arg DeadLetterEventParams) error
@@ -64,17 +70,25 @@ type Querier interface {
 	// Outbox claim set: undelivered events under the attempt cap whose backoff
 	// has elapsed (next_attempt_at), oldest first.
 	FetchPendingEvents(ctx context.Context, arg FetchPendingEventsParams) ([]FetchPendingEventsRow, error)
+	GetApp(ctx context.Context, appID string) (GetAppRow, error)
 	GetBranding(ctx context.Context, organizationID pgtype.UUID) (GetBrandingRow, error)
 	GetInvitationByToken(ctx context.Context, token pgtype.UUID) (GetInvitationByTokenRow, error)
+	// Entitlement merge source: unexpired license for the tenant, newest first.
+	GetLatestLicense(ctx context.Context, tenantID pgtype.UUID) (GetLatestLicenseRow, error)
+	GetLicenseByDeployment(ctx context.Context, deploymentID string) (GetLicenseByDeploymentRow, error)
 	GetMFASecret(ctx context.Context, id pgtype.UUID) ([]byte, error)
 	GetMembership(ctx context.Context, arg GetMembershipParams) (GetMembershipRow, error)
 	GetMembershipByID(ctx context.Context, id pgtype.UUID) (GetMembershipByIDRow, error)
 	GetOrg(ctx context.Context, id pgtype.UUID) (GetOrgRow, error)
 	GetOrgSetting(ctx context.Context, arg GetOrgSettingParams) ([]byte, error)
+	GetPlanCapabilities(ctx context.Context, planSlug string) ([]string, error)
+	GetPlanLimits(ctx context.Context, planSlug string) ([]GetPlanLimitsRow, error)
 	GetPositionOrg(ctx context.Context, id pgtype.UUID) (pgtype.UUID, error)
 	GetPositionSeats(ctx context.Context, id pgtype.UUID) (int32, error)
 	GetRecoveryCodes(ctx context.Context, id pgtype.UUID) ([]byte, error)
 	GetSessionByJTI(ctx context.Context, jti pgtype.UUID) (GetSessionByJTIRow, error)
+	// Latest subscription row is the current one.
+	GetSubscription(ctx context.Context, tenantID pgtype.UUID) (Subscriptions, error)
 	// Ref: oga9-engineering/conventions/system-settings-catalog.md
 	// Platform-level settings (Rule 3: hot-reloadable via GetSetting).
 	GetSystemSetting(ctx context.Context, key string) ([]byte, error)
@@ -82,23 +96,41 @@ type Querier interface {
 	GetTenant(ctx context.Context, id pgtype.UUID) (GetTenantRow, error)
 	GetTermOrg(ctx context.Context, id pgtype.UUID) (GetTermOrgRow, error)
 	GetUnit(ctx context.Context, id pgtype.UUID) (GetUnitRow, error)
+	GetUsage(ctx context.Context, arg GetUsageParams) (int64, error)
 	GetUserAuthState(ctx context.Context, id pgtype.UUID) (GetUserAuthStateRow, error)
 	GetUserByEmail(ctx context.Context, email string) (GetUserByEmailRow, error)
 	GetUserByID(ctx context.Context, id pgtype.UUID) (GetUserByIDRow, error)
 	GetUserByOAuthSubject(ctx context.Context, arg GetUserByOAuthSubjectParams) (pgtype.UUID, error)
 	GetUserIDByEmail(ctx context.Context, email string) (pgtype.UUID, error)
+	GetWebhookEvent(ctx context.Context, id pgtype.UUID) (GetWebhookEventRow, error)
+	// platform.* nodes resolve via NULL-tenant roles only (super-admin scope —
+	// org role clones never carry platform nodes).
+	HasPlatformNode(ctx context.Context, arg HasPlatformNodeParams) (bool, error)
 	HasRoleInTenant(ctx context.Context, arg HasRoleInTenantParams) (bool, error)
 	InsertAuditEvent(ctx context.Context, arg InsertAuditEventParams) error
+	InsertLicense(ctx context.Context, arg InsertLicenseParams) (pgtype.UUID, error)
+	// Durable raw record + replay guard (UNIQUE provider,event_id) — a replay
+	// returns no row so the endpoint can ack and skip.
+	InsertWebhookEvent(ctx context.Context, arg InsertWebhookEventParams) (pgtype.UUID, error)
 	LinkEntities(ctx context.Context, arg LinkEntitiesParams) error
 	LinkOAuthProvider(ctx context.Context, arg LinkOAuthProviderParams) error
+	ListActiveApps(ctx context.Context, tenantID pgtype.UUID) ([]string, error)
 	// Governance roster: appointment + position/term/officer display names.
 	ListAppointments(ctx context.Context, orgID pgtype.UUID) ([]ListAppointmentsRow, error)
+	// Ref: oga9-engineering/sections/06-app-framework-registry.md
+	ListApps(ctx context.Context) ([]ListAppsRow, error)
 	ListCommitteeMembers(ctx context.Context, arg ListCommitteeMembersParams) ([]ListCommitteeMembersRow, error)
+	// Sweep set: trials past expiry, and past_due/grace rows past their grace
+	// deadline — the state machine moves each one step per pass.
+	ListDueSubscriptions(ctx context.Context) ([]ListDueSubscriptionsRow, error)
+	ListInstallations(ctx context.Context, tenantID pgtype.UUID) ([]ListInstallationsRow, error)
 	// Tenants where the caller holds the org_admin role — the server-side
 	// "my tenant" resolution for POST /orgs (Rule 24).
 	ListOrgAdminTenants(ctx context.Context, userID pgtype.UUID) ([]pgtype.UUID, error)
 	ListOrgSettings(ctx context.Context, organizationID pgtype.UUID) ([]ListOrgSettingsRow, error)
 	ListPendingInvitations(ctx context.Context, organizationID pgtype.UUID) ([]ListPendingInvitationsRow, error)
+	// Ref: oga9-engineering/sections/07-entitlements-subscriptions.md
+	ListPlans(ctx context.Context) ([]ListPlansRow, error)
 	ListPositions(ctx context.Context, orgID pgtype.UUID) ([]ListPositionsRow, error)
 	ListPublicOrgs(ctx context.Context) ([]ListPublicOrgsRow, error)
 	ListTemplates(ctx context.Context) ([]ListTemplatesRow, error)
@@ -109,6 +141,9 @@ type Querier interface {
 	// Inserted in the SAME tx as the consumer's own writes (§05 contract).
 	LogConsumerProcessed(ctx context.Context, arg LogConsumerProcessedParams) error
 	MarkEventDispatched(ctx context.Context, id pgtype.UUID) error
+	// Idempotent worker completion — a redrive sees processed_at set and skips.
+	MarkWebhookProcessed(ctx context.Context, id pgtype.UUID) (int64, error)
+	PlanExists(ctx context.Context, slug string) (bool, error)
 	// Failed consumer pass — stays pending, retried after exponential backoff
 	// (10s * 2^attempts, capped at 1h — §05 "retry w/ backoff").
 	RecordEventAttempt(ctx context.Context, arg RecordEventAttemptParams) error
@@ -138,6 +173,10 @@ type Querier interface {
 	SetJapaconnectUserID(ctx context.Context, arg SetJapaconnectUserIDParams) error
 	SetMFASecret(ctx context.Context, arg SetMFASecretParams) error
 	SetRecoveryCodes(ctx context.Context, arg SetRecoveryCodesParams) error
+	SetSubscriptionPlan(ctx context.Context, arg SetSubscriptionPlanParams) error
+	// Lifecycle machine writes: state + whichever deadline columns the
+	// transition touches (NULL args leave columns unchanged).
+	SetSubscriptionState(ctx context.Context, arg SetSubscriptionStateParams) error
 	SetTenantOwnerOrg(ctx context.Context, arg SetTenantOwnerOrgParams) error
 	SetUserVerified(ctx context.Context, id pgtype.UUID) error
 	TemplateExists(ctx context.Context, slug string) (bool, error)

@@ -21,7 +21,9 @@ import (
 	valkey "github.com/valkey-io/valkey-go"
 
 	"github.com/jedafe/oga9/internal/auth"
+	"github.com/jedafe/oga9/internal/billing"
 	"github.com/jedafe/oga9/internal/config"
+	"github.com/jedafe/oga9/internal/entitlements"
 	"github.com/jedafe/oga9/internal/events"
 	"github.com/jedafe/oga9/internal/handler"
 	"github.com/jedafe/oga9/internal/mailer"
@@ -104,8 +106,10 @@ func main() {
 	mail := mailer.New(cfg.SMTPHost, cfg.SMTPPort, cfg.MailFrom, cfg.SMTPUser, cfg.SMTPPass)
 	queue := asynq.NewClient(asynq.RedisClientOpt{Addr: cfg.ValkeyAddr})
 	defer queue.Close()
+	entSvc := entitlements.NewService(pool, vk)
+	billSvc := billing.NewService(pool, vk, cfg.LicenseSignKey, cfg.WebhookSecret)
 	for taskType, h := range tasks.Handlers(tasks.Deps{
-		Mail: mail, Pool: pool, RedisAddr: cfg.ValkeyAddr,
+		Mail: mail, Pool: pool, RedisAddr: cfg.ValkeyAddr, Billing: billSvc,
 	}) {
 		mux.HandleFunc(taskType, h)
 	}
@@ -123,9 +127,14 @@ func main() {
 	orgSvc := tenant.NewService(pool, vk)
 	orgH := handler.NewOrgHandler(orgSvc)
 
+	// §06/§07 app framework + entitlements/billing
+	appsH := handler.NewAppsHandler(orgSvc, entSvc)
+	billH := handler.NewBillingHandler(billSvc, orgSvc, entSvc, queue)
+
 	// §05 outbox dispatcher: lease-locked claim + consumer-log dedupe.
 	dispatcher := events.NewDispatcher(pool, vk)
 	dispatcher.Register("entity_links", events.EntityLinksConsumer)
+	dispatcher.Register("entitlements_cache", entSvc.InvalidateConsumer)
 	mux.HandleFunc(events.TypeDispatchOutbox, dispatcher.ProcessTask)
 	if _, err := scheduler.Register(
 		"@every "+cfg.OutboxInterval.String(),
@@ -145,6 +154,13 @@ func main() {
 		); err != nil {
 			log.Fatalf("schedule %s: %v", typ, err)
 		}
+	}
+	// §07 lifecycle sweep — critical tier (billing-adjacent, per catalog).
+	if _, err := scheduler.Register(
+		"@every "+cfg.BillingSweepInterval.String(),
+		asynq.NewTask(tasks.TypeSubscriptionSweep, nil, asynq.Queue("critical")),
+	); err != nil {
+		log.Fatalf("schedule %s: %v", tasks.TypeSubscriptionSweep, err)
 	}
 
 	r.Use(middleware.ResolveIP(cfg.TrustedProxies))
@@ -166,6 +182,11 @@ func main() {
 		r.With(middleware.RateLimit(vk, "mfa", 10, time.Minute)).Post("/auth/mfa/complete", mfaH.Complete)
 		r.With(middleware.RateLimit(vk, "directory", 30, time.Minute)).Get("/directory/organizations", orgH.Directory)
 
+		// §07 self-hosted callback + provider webhook — no session auth;
+		// the signed material / HMAC signature is the credential (Rules 9/29).
+		r.With(middleware.RateLimit(vk, "license", 30, time.Minute)).Post("/license/validate", billH.ValidateLicense)
+		r.With(middleware.RateLimit(vk, "webhook", 60, time.Minute)).Post("/webhooks/billing/{provider}", billH.Webhook)
+
 		// authed — session JWT or mfa_token both reach the mfa enrollment routes
 		r.Group(func(r chi.Router) {
 			r.Use(middleware.RequireAuthOrMFAGate(authSvc, cfg.JWTSecret))
@@ -181,6 +202,20 @@ func main() {
 			r.Get("/me/sessions", authH.Sessions)
 			r.Delete("/me/sessions/{session_id}", authH.RevokeSession)
 			r.Post("/auth/mfa/disable", mfaH.Disable)
+
+			// §06/§07 platform surfaces — platform.* nodes resolve via
+			// NULL-tenant roles only (RequirePlatformNode).
+			r.With(middleware.RequirePlatformNode(pool, "platform.apps.view")).Get("/platform/apps", appsH.Registry)
+			r.With(middleware.RequirePlatformNode(pool, "platform.plans.view")).Get("/platform/plans", billH.Plans)
+			r.With(middleware.RequirePlatformNode(pool, "platform.licenses.issue")).Post("/platform/licenses", billH.IssueLicense)
+			// §07 billing — tenant resolves server-side from the caller's
+			// org_admin tenants (tenantFor in the handler, Rule 24).
+			r.Get("/me/entitlements", billH.Entitlements)
+			r.Get("/billing/subscription", billH.Subscription)
+			r.Post("/billing/subscription", billH.CreateSubscription)
+			r.Post("/billing/change-plan", billH.ChangePlan)
+			r.Post("/billing/cancel", billH.Cancel)
+			r.Get("/billing/invoices", billH.Invoices)
 
 			// §04/§10 tenancy + organization core
 			r.Get("/me/organizations", orgH.MyOrgs)
@@ -202,6 +237,9 @@ func main() {
 				r.With(middleware.RequireOrgPermission(orgSvc, "org.members.invite")).Post("/orgs/{org_id}/invitations", orgH.Invite)
 				r.With(middleware.RequireOrgPermission(orgSvc, "org.members.invite")).Delete("/orgs/{org_id}/invitations/{invitation_id}", orgH.RevokeInvitation)
 				r.With(middleware.RequireOrgPermission(orgSvc, "org.admin.branding")).Patch("/orgs/{org_id}/branding", orgH.Branding)
+				r.With(middleware.RequireOrgPermission(orgSvc, "org.admin.settings")).Get("/orgs/{org_id}/apps", appsH.OrgApps)
+				r.With(middleware.RequireOrgPermission(orgSvc, "org.admin.settings")).Post("/orgs/{org_id}/apps/{app_id}", appsH.Activate)
+				r.With(middleware.RequireOrgPermission(orgSvc, "org.admin.settings")).Delete("/orgs/{org_id}/apps/{app_id}", appsH.Deactivate)
 				r.With(middleware.RequireOrgPermission(orgSvc, "org.members.view")).Get("/orgs/{org_id}/positions", orgH.ListPositions)
 				r.With(middleware.RequireOrgPermission(orgSvc, "org.members.view")).Get("/orgs/{org_id}/terms", orgH.ListTerms)
 				r.With(middleware.RequireOrgPermission(orgSvc, "org.members.view")).Get("/orgs/{org_id}/appointments", orgH.ListAppointments)
