@@ -12,6 +12,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jedafe/oga9/internal/db"
 	"github.com/jedafe/oga9/internal/events"
@@ -156,6 +157,10 @@ func (s *Service) CreateUnit(ctx context.Context, oc *OrgCtx, parentID uuid.UUID
 			Type: typ, LevelLabel: pgText(label), Name: name, Slug: slug,
 		})
 		if err != nil {
+			var pgErr *pgconn.PgError
+			if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+				return ErrSlugTaken // sibling slug collision
+			}
 			return err
 		}
 		id = r
@@ -189,6 +194,16 @@ func (s *Service) UpdateUnit(ctx context.Context, oc *OrgCtx, unitID, parentID u
 	}
 	if !unitTypes[typ] {
 		return ErrBadUnitType
+	}
+	// Retyping a committee with seats/scoped appointments strands them —
+	// the seat tables would keep resolving scope for a unit that no longer
+	// is a committee. Same dependents guard as ArchiveUnit.
+	if u.Type != typ {
+		if has, err := s.q.UnitHasActiveMembers(ctx, toPg(unitID)); err != nil {
+			return err
+		} else if has {
+			return ErrUnitDependents
+		}
 	}
 	if parentID == unitID {
 		return ErrUnitCycle

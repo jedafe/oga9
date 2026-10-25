@@ -115,6 +115,37 @@ RETURNING member_id, org_unit_id;
 -- name: GetPositionOrg :one
 SELECT organization_id FROM org_positions WHERE id = sqlc.arg(id)::uuid;
 
+-- name: ListPositions :many
+SELECT id, name, slug, is_executive, seats, created_at FROM org_positions
+WHERE organization_id = sqlc.arg(org_id)::uuid ORDER BY name;
+
+-- name: ListTerms :many
+SELECT id, label, starts_at, ends_at, is_current FROM terms
+WHERE organization_id = sqlc.arg(org_id)::uuid ORDER BY starts_at DESC;
+
+-- name: ListAppointments :many
+-- Governance roster: appointment + position/term/officer display names.
+SELECT a.id, a.term_id, a.position_id, a.member_id, a.branch_id, a.committee_id,
+       a.starts_at, a.ends_at, p.name AS position_name, t.label AS term_label,
+       u.display_name AS officer_name
+FROM officer_appointments a
+JOIN org_positions p ON p.id = a.position_id
+JOIN terms t ON t.id = a.term_id
+JOIN organization_memberships m ON m.id = a.member_id
+JOIN users u ON u.id = m.user_id
+WHERE a.organization_id = sqlc.arg(org_id)::uuid
+ORDER BY a.starts_at DESC;
+
+-- name: ListCommitteeMembers :many
+SELECT cm.id, cm.member_id, cm.role, cm.created_at,
+       u.id AS user_id, u.display_name AS member_name
+FROM committee_memberships cm
+JOIN organization_memberships m ON m.id = cm.member_id
+JOIN users u ON u.id = m.user_id
+WHERE cm.org_unit_id = sqlc.arg(unit_id)::uuid
+  AND cm.organization_id = sqlc.arg(org_id)::uuid
+ORDER BY cm.created_at;
+
 -- name: GetTermOrg :one
 SELECT organization_id, is_current FROM terms WHERE id = sqlc.arg(id)::uuid;
 

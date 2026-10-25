@@ -336,6 +336,15 @@ type positionReq struct {
 	Permissions []string `json:"permissions"`
 }
 
+func (h *OrgHandler) ListPositions(w http.ResponseWriter, r *http.Request) {
+	rows, err := h.svc.ListPositions(r.Context(), middleware.OrgCtx(r.Context()))
+	if err != nil {
+		orgErr(w, err)
+		return
+	}
+	httpx.WriteData(w, 200, rows)
+}
+
 func (h *OrgHandler) CreatePosition(w http.ResponseWriter, r *http.Request) {
 	var req positionReq
 	if err := httpx.Decode(w, r, &req); err != nil || req.Name == "" || req.Slug == "" {
@@ -361,6 +370,24 @@ type termReq struct {
 func parseDate(s string) (time.Time, bool) {
 	t, err := time.Parse("2006-01-02", s)
 	return t, err == nil
+}
+
+func (h *OrgHandler) ListTerms(w http.ResponseWriter, r *http.Request) {
+	rows, err := h.svc.ListTerms(r.Context(), middleware.OrgCtx(r.Context()))
+	if err != nil {
+		orgErr(w, err)
+		return
+	}
+	httpx.WriteData(w, 200, rows)
+}
+
+func (h *OrgHandler) ListAppointments(w http.ResponseWriter, r *http.Request) {
+	rows, err := h.svc.ListAppointments(r.Context(), middleware.OrgCtx(r.Context()))
+	if err != nil {
+		orgErr(w, err)
+		return
+	}
+	httpx.WriteData(w, 200, rows)
 }
 
 func (h *OrgHandler) CreateTerm(w http.ResponseWriter, r *http.Request) {
@@ -448,6 +475,20 @@ func (h *OrgHandler) EndAppointment(w http.ResponseWriter, r *http.Request) {
 type committeeMemberReq struct {
 	MemberID uuid.UUID `json:"member_id"`
 	Role     string    `json:"role"`
+}
+
+func (h *OrgHandler) ListMembers(w http.ResponseWriter, r *http.Request) {
+	unitID, err := uuid.Parse(chi.URLParam(r, "unit_id"))
+	if err != nil {
+		httpx.WriteErr(w, 400, "invalid_request", "invalid unit_id")
+		return
+	}
+	rows, err := h.svc.ListCommitteeMembers(r.Context(), middleware.OrgCtx(r.Context()), unitID)
+	if err != nil {
+		orgErr(w, err)
+		return
+	}
+	httpx.WriteData(w, 200, rows)
 }
 
 func (h *OrgHandler) AddCommitteeMember(w http.ResponseWriter, r *http.Request) {

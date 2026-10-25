@@ -5,6 +5,27 @@ entries reference engineering phases in `.oos/roadmaps/ROADMAP-BACKEND.md`.
 
 ## [Unreleased]
 
+### Added — review-fix sweep + governance reads
+- GET list routes for governance (catalogued): `/orgs/{id}/positions`,
+  `/terms`, `/appointments`, `/units/{id}/members` — member-visible reads
+  gated on `org.members.view`, joining position/term/officer display names
+- `events:retry_dead` re-drive cap: `redrive_count` column (migration
+  000047), max 3 cycles so permanently-poison events can't loop forever
+- Template position seeds accept `{"slug","executive"}` objects alongside
+  bare slugs — non-EXCO seed roles expressible without schema change
+
+### Fixed (deep-review sweep)
+- `UpdateUnit` retyping a committee with seats/scoped appointments now
+  rejects with `unit_dependents` — same guard as ArchiveUnit
+- `CreateUnit` sibling-slug collisions → `slug_taken` 409 (was raw 500)
+- Mailer sent no `From:` header — strict receivers showed a blank sender
+- OAuth app callback moved token to `#fragment` (no server-log/Referer
+  exposure)
+- `scheduler:tick` sweeps run concurrently with panic containment — a slow
+  or crashing sweep can't stall the tick
+- Stub task handlers fail (retry→archive) instead of silently acking, so
+  an early enqueue surfaces in the archived-depth metric
+
 ### Added — Phase 06 (Job Queue Conventions, §08)
 - `internal/tasks` becomes the code-side task registry: all nine §08
   foundation seeds registered (Rule 7) — `identity:send_verification`,

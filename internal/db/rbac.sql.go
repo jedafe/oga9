@@ -291,6 +291,198 @@ func (q *Queries) GetTermOrg(ctx context.Context, id pgtype.UUID) (GetTermOrgRow
 	return i, err
 }
 
+const listAppointments = `-- name: ListAppointments :many
+SELECT a.id, a.term_id, a.position_id, a.member_id, a.branch_id, a.committee_id,
+       a.starts_at, a.ends_at, p.name AS position_name, t.label AS term_label,
+       u.display_name AS officer_name
+FROM officer_appointments a
+JOIN org_positions p ON p.id = a.position_id
+JOIN terms t ON t.id = a.term_id
+JOIN organization_memberships m ON m.id = a.member_id
+JOIN users u ON u.id = m.user_id
+WHERE a.organization_id = $1::uuid
+ORDER BY a.starts_at DESC
+`
+
+type ListAppointmentsRow struct {
+	ID           pgtype.UUID `json:"id"`
+	TermID       pgtype.UUID `json:"term_id"`
+	PositionID   pgtype.UUID `json:"position_id"`
+	MemberID     pgtype.UUID `json:"member_id"`
+	BranchID     pgtype.UUID `json:"branch_id"`
+	CommitteeID  pgtype.UUID `json:"committee_id"`
+	StartsAt     pgtype.Date `json:"starts_at"`
+	EndsAt       pgtype.Date `json:"ends_at"`
+	PositionName string      `json:"position_name"`
+	TermLabel    string      `json:"term_label"`
+	OfficerName  string      `json:"officer_name"`
+}
+
+// Governance roster: appointment + position/term/officer display names.
+func (q *Queries) ListAppointments(ctx context.Context, orgID pgtype.UUID) ([]ListAppointmentsRow, error) {
+	rows, err := q.db.Query(ctx, listAppointments, orgID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListAppointmentsRow
+	for rows.Next() {
+		var i ListAppointmentsRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.TermID,
+			&i.PositionID,
+			&i.MemberID,
+			&i.BranchID,
+			&i.CommitteeID,
+			&i.StartsAt,
+			&i.EndsAt,
+			&i.PositionName,
+			&i.TermLabel,
+			&i.OfficerName,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listCommitteeMembers = `-- name: ListCommitteeMembers :many
+SELECT cm.id, cm.member_id, cm.role, cm.created_at,
+       u.id AS user_id, u.display_name AS member_name
+FROM committee_memberships cm
+JOIN organization_memberships m ON m.id = cm.member_id
+JOIN users u ON u.id = m.user_id
+WHERE cm.org_unit_id = $1::uuid
+  AND cm.organization_id = $2::uuid
+ORDER BY cm.created_at
+`
+
+type ListCommitteeMembersParams struct {
+	UnitID pgtype.UUID `json:"unit_id"`
+	OrgID  pgtype.UUID `json:"org_id"`
+}
+
+type ListCommitteeMembersRow struct {
+	ID         pgtype.UUID        `json:"id"`
+	MemberID   pgtype.UUID        `json:"member_id"`
+	Role       string             `json:"role"`
+	CreatedAt  pgtype.Timestamptz `json:"created_at"`
+	UserID     pgtype.UUID        `json:"user_id"`
+	MemberName string             `json:"member_name"`
+}
+
+func (q *Queries) ListCommitteeMembers(ctx context.Context, arg ListCommitteeMembersParams) ([]ListCommitteeMembersRow, error) {
+	rows, err := q.db.Query(ctx, listCommitteeMembers, arg.UnitID, arg.OrgID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListCommitteeMembersRow
+	for rows.Next() {
+		var i ListCommitteeMembersRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.MemberID,
+			&i.Role,
+			&i.CreatedAt,
+			&i.UserID,
+			&i.MemberName,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listPositions = `-- name: ListPositions :many
+SELECT id, name, slug, is_executive, seats, created_at FROM org_positions
+WHERE organization_id = $1::uuid ORDER BY name
+`
+
+type ListPositionsRow struct {
+	ID          pgtype.UUID        `json:"id"`
+	Name        string             `json:"name"`
+	Slug        string             `json:"slug"`
+	IsExecutive bool               `json:"is_executive"`
+	Seats       int32              `json:"seats"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+}
+
+func (q *Queries) ListPositions(ctx context.Context, orgID pgtype.UUID) ([]ListPositionsRow, error) {
+	rows, err := q.db.Query(ctx, listPositions, orgID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListPositionsRow
+	for rows.Next() {
+		var i ListPositionsRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Name,
+			&i.Slug,
+			&i.IsExecutive,
+			&i.Seats,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listTerms = `-- name: ListTerms :many
+SELECT id, label, starts_at, ends_at, is_current FROM terms
+WHERE organization_id = $1::uuid ORDER BY starts_at DESC
+`
+
+type ListTermsRow struct {
+	ID        pgtype.UUID `json:"id"`
+	Label     string      `json:"label"`
+	StartsAt  pgtype.Date `json:"starts_at"`
+	EndsAt    pgtype.Date `json:"ends_at"`
+	IsCurrent bool        `json:"is_current"`
+}
+
+func (q *Queries) ListTerms(ctx context.Context, orgID pgtype.UUID) ([]ListTermsRow, error) {
+	rows, err := q.db.Query(ctx, listTerms, orgID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListTermsRow
+	for rows.Next() {
+		var i ListTermsRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Label,
+			&i.StartsAt,
+			&i.EndsAt,
+			&i.IsCurrent,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const removeCommitteeMember = `-- name: RemoveCommitteeMember :one
 DELETE FROM committee_memberships
 WHERE id = $1::uuid AND organization_id = $2::uuid

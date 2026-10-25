@@ -28,6 +28,6 @@ func (m *Mailer) Send(to, subject, body string) error {
 	if m.user != "" {
 		auth = smtp.PlainAuth("", m.user, m.pass, m.host)
 	}
-	msg := []byte(fmt.Sprintf("To: %s\r\nSubject: %s\r\n\r\n%s\r\n", to, subject, body))
+	msg := []byte(fmt.Sprintf("From: %s\r\nTo: %s\r\nSubject: %s\r\n\r\n%s\r\n", m.from, to, subject, body))
 	return smtp.SendMail(fmt.Sprintf("%s:%d", m.host, m.port), auth, m.from, []string{to}, msg)
 }

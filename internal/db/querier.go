@@ -91,13 +91,18 @@ type Querier interface {
 	InsertAuditEvent(ctx context.Context, arg InsertAuditEventParams) error
 	LinkEntities(ctx context.Context, arg LinkEntitiesParams) error
 	LinkOAuthProvider(ctx context.Context, arg LinkOAuthProviderParams) error
+	// Governance roster: appointment + position/term/officer display names.
+	ListAppointments(ctx context.Context, orgID pgtype.UUID) ([]ListAppointmentsRow, error)
+	ListCommitteeMembers(ctx context.Context, arg ListCommitteeMembersParams) ([]ListCommitteeMembersRow, error)
 	// Tenants where the caller holds the org_admin role — the server-side
 	// "my tenant" resolution for POST /orgs (Rule 24).
 	ListOrgAdminTenants(ctx context.Context, userID pgtype.UUID) ([]pgtype.UUID, error)
 	ListOrgSettings(ctx context.Context, organizationID pgtype.UUID) ([]ListOrgSettingsRow, error)
 	ListPendingInvitations(ctx context.Context, organizationID pgtype.UUID) ([]ListPendingInvitationsRow, error)
+	ListPositions(ctx context.Context, orgID pgtype.UUID) ([]ListPositionsRow, error)
 	ListPublicOrgs(ctx context.Context) ([]ListPublicOrgsRow, error)
 	ListTemplates(ctx context.Context) ([]ListTemplatesRow, error)
+	ListTerms(ctx context.Context, orgID pgtype.UUID) ([]ListTermsRow, error)
 	ListUnits(ctx context.Context, organizationID pgtype.UUID) ([]ListUnitsRow, error)
 	ListUserOrgs(ctx context.Context, userID pgtype.UUID) ([]ListUserOrgsRow, error)
 	ListUserSessions(ctx context.Context, userID pgtype.UUID) ([]ListUserSessionsRow, error)

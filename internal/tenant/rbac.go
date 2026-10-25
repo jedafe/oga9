@@ -352,6 +352,24 @@ func (s *Service) AddCommitteeMember(ctx context.Context, oc *OrgCtx, unitID, me
 	return err
 }
 
+// List* — member-visible governance reads (catalogued GET routes; org
+// membership is the gate, same as the other org detail routes).
+func (s *Service) ListPositions(ctx context.Context, oc *OrgCtx) ([]db.ListPositionsRow, error) {
+	return s.q.ListPositions(ctx, toPg(oc.OrgID))
+}
+
+func (s *Service) ListTerms(ctx context.Context, oc *OrgCtx) ([]db.ListTermsRow, error) {
+	return s.q.ListTerms(ctx, toPg(oc.OrgID))
+}
+
+func (s *Service) ListAppointments(ctx context.Context, oc *OrgCtx) ([]db.ListAppointmentsRow, error) {
+	return s.q.ListAppointments(ctx, toPg(oc.OrgID))
+}
+
+func (s *Service) ListCommitteeMembers(ctx context.Context, oc *OrgCtx, unitID uuid.UUID) ([]db.ListCommitteeMembersRow, error) {
+	return s.q.ListCommitteeMembers(ctx, db.ListCommitteeMembersParams{OrgID: toPg(oc.OrgID), UnitID: toPg(unitID)})
+}
+
 func (s *Service) RemoveCommitteeMember(ctx context.Context, oc *OrgCtx, cmID uuid.UUID) error {
 	var userID uuid.UUID
 	err := s.withTx(ctx, func(q *db.Queries) error {
