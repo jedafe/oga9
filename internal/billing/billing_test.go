@@ -261,6 +261,44 @@ func TestLicenseIssueValidateRenew(t *testing.T) {
 	}
 }
 
+// Compare-and-set: a stale read can't regress a subscription that already
+// moved on — the transition is a silent no-op (no event, no state change).
+func TestTransitionCAS(t *testing.T) {
+	svc, pool := testSvc(t)
+	ctx := context.Background()
+	tenant := mkTenant(t, pool)
+	if _, err := svc.CreateSubscription(ctx, tenant, "starter", "monthly", ""); err != nil {
+		t.Fatal(err)
+	}
+	stale, err := svc.GetSubscription(ctx, tenant) // reads state='trial'
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx,
+		"UPDATE subscriptions SET state='active' WHERE tenant_id=$1", tenant); err != nil {
+		t.Fatal(err)
+	}
+	// a payment.failed arriving after the sub already activated must not
+	// drag it back to past_due
+	q := db.New(pool)
+	if err := svc.transition(ctx, q, stale, "past_due", time.Now(), time.Time{}, uuid.Nil); err != nil {
+		t.Fatal(err)
+	}
+	cur, _ := svc.GetSubscription(ctx, tenant)
+	if cur.State != "active" {
+		t.Fatalf("stale transition regressed state to %s", cur.State)
+	}
+	var n int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM domain_events WHERE event_type='SubscriptionChanged' AND payload->>'to'='past_due' AND tenant_id=$1`,
+		tenant).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatal("CAS no-op emitted a phantom SubscriptionChanged")
+	}
+}
+
 func TestStaleWebhookRedrive(t *testing.T) {
 	svc, pool := testSvc(t)
 	ctx := context.Background()

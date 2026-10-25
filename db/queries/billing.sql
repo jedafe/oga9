@@ -41,6 +41,17 @@ WHERE id = sqlc.arg(id)::uuid;
 UPDATE subscriptions SET plan_slug = sqlc.arg(plan_slug)
 WHERE id = sqlc.arg(id)::uuid;
 
+-- name: TransitionSubscriptionState :execrows
+-- Compare-and-set: fires only while the subscription still holds the state
+-- the caller read — concurrent lifecycle writers can't regress or
+-- double-emit. 0 rows = another transition already moved it.
+UPDATE subscriptions SET
+  state = sqlc.arg(to_state),
+  grace_ends_at = COALESCE(sqlc.arg(grace_ends_at)::timestamptz, grace_ends_at),
+  current_period_end = COALESCE(sqlc.arg(current_period_end)::timestamptz, current_period_end),
+  cancelled_at = COALESCE(sqlc.arg(cancelled_at)::timestamptz, cancelled_at)
+WHERE id = sqlc.arg(id)::uuid AND state = sqlc.arg(from_state);
+
 -- name: ListDueSubscriptions :many
 -- Sweep set: trials past expiry, past_due/grace rows past their grace
 -- deadline, and active rows whose period lapsed without a provider event
@@ -84,6 +95,12 @@ RETURNING id;
 -- name: GetWebhookEvent :one
 SELECT id, provider, event_id, event_type, payload, processed_at
 FROM billing_webhook_events WHERE id = sqlc.arg(id)::uuid;
+
+-- name: GetWebhookEventForUpdate :one
+-- Row lock serializes concurrent processors of the same event (Rule 27 —
+-- processed_at rechecked under lock inside the tx).
+SELECT id, provider, event_id, event_type, payload, processed_at
+FROM billing_webhook_events WHERE id = sqlc.arg(id)::uuid FOR UPDATE;
 
 -- name: MarkWebhookProcessed :execrows
 -- Idempotent worker completion — a redrive sees processed_at set and skips.

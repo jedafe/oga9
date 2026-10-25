@@ -22,6 +22,8 @@ type Querier interface {
 	AssignRoleBySlug(ctx context.Context, arg AssignRoleBySlugParams) error
 	CloneTenantRolePermissions(ctx context.Context, tenantID pgtype.UUID) error
 	// Instantiate system role templates into tenant-scoped roles at org creation.
+	// Roles carrying platform.* nodes are control-plane only and must never be
+	// cloned into a tenant (they'd be assignable to tenant members otherwise).
 	CloneTenantRoles(ctx context.Context, tenantID pgtype.UUID) error
 	// Auto-close the org's live term when a new current term is created (§03).
 	CloseCurrentTerm(ctx context.Context, orgID pgtype.UUID) (pgtype.UUID, error)
@@ -106,6 +108,9 @@ type Querier interface {
 	GetUserByOAuthSubject(ctx context.Context, arg GetUserByOAuthSubjectParams) (pgtype.UUID, error)
 	GetUserIDByEmail(ctx context.Context, email string) (pgtype.UUID, error)
 	GetWebhookEvent(ctx context.Context, id pgtype.UUID) (GetWebhookEventRow, error)
+	// Row lock serializes concurrent processors of the same event (Rule 27 —
+	// processed_at rechecked under lock inside the tx).
+	GetWebhookEventForUpdate(ctx context.Context, id pgtype.UUID) (GetWebhookEventForUpdateRow, error)
 	// platform.* nodes resolve via NULL-tenant roles only (super-admin scope —
 	// org role clones never carry platform nodes).
 	HasPlatformNode(ctx context.Context, arg HasPlatformNodeParams) (bool, error)
@@ -196,6 +201,10 @@ type Querier interface {
 	SetTenantOwnerOrg(ctx context.Context, arg SetTenantOwnerOrgParams) error
 	SetUserVerified(ctx context.Context, id pgtype.UUID) error
 	TemplateExists(ctx context.Context, slug string) (bool, error)
+	// Compare-and-set: fires only while the subscription still holds the state
+	// the caller read — concurrent lifecycle writers can't regress or
+	// double-emit. 0 rows = another transition already moved it.
+	TransitionSubscriptionState(ctx context.Context, arg TransitionSubscriptionStateParams) (int64, error)
 	UnitHasActiveChildren(ctx context.Context, parentUnitID pgtype.UUID) (bool, error)
 	// §10 archive guard: a unit still holding committee members or open
 	// officer appointments scoped to it counts as having dependents.

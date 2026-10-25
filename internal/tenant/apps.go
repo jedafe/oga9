@@ -159,6 +159,9 @@ func (s *Service) DeactivateApp(ctx context.Context, oc *OrgCtx, appID string) e
 	}
 	return s.withTx(ctx, func(q *db.Queries) error {
 		iid, err := q.DeactivateApp(ctx, db.DeactivateAppParams{TenantID: toPg(oc.TenantID), AppID: appID})
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil // concurrent deactivate won the race — idempotent no-op
+		}
 		if err != nil {
 			return err
 		}

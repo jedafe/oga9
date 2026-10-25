@@ -84,8 +84,15 @@ SELECT EXISTS(SELECT 1 FROM organization_templates WHERE slug = $1) AS exists;
 
 -- name: CloneTenantRoles :exec
 -- Instantiate system role templates into tenant-scoped roles at org creation.
+-- Roles carrying platform.* nodes are control-plane only and must never be
+-- cloned into a tenant (they'd be assignable to tenant members otherwise).
 INSERT INTO user_roles (tenant_id, user_group_id, name, slug, is_system)
-SELECT $1, r.user_group_id, r.name, r.slug, true FROM user_roles r WHERE r.tenant_id IS NULL;
+SELECT $1, r.user_group_id, r.name, r.slug, true FROM user_roles r
+WHERE r.tenant_id IS NULL
+  AND NOT EXISTS (
+    SELECT 1 FROM role_permissions rp
+    WHERE rp.role_id = r.id AND rp.permission LIKE 'platform.%'
+  );
 
 -- name: CloneTenantRolePermissions :exec
 INSERT INTO role_permissions (role_id, permission)

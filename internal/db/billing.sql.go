@@ -262,6 +262,36 @@ func (q *Queries) GetWebhookEvent(ctx context.Context, id pgtype.UUID) (GetWebho
 	return i, err
 }
 
+const getWebhookEventForUpdate = `-- name: GetWebhookEventForUpdate :one
+SELECT id, provider, event_id, event_type, payload, processed_at
+FROM billing_webhook_events WHERE id = $1::uuid FOR UPDATE
+`
+
+type GetWebhookEventForUpdateRow struct {
+	ID          pgtype.UUID        `json:"id"`
+	Provider    string             `json:"provider"`
+	EventID     string             `json:"event_id"`
+	EventType   string             `json:"event_type"`
+	Payload     []byte             `json:"payload"`
+	ProcessedAt pgtype.Timestamptz `json:"processed_at"`
+}
+
+// Row lock serializes concurrent processors of the same event (Rule 27 —
+// processed_at rechecked under lock inside the tx).
+func (q *Queries) GetWebhookEventForUpdate(ctx context.Context, id pgtype.UUID) (GetWebhookEventForUpdateRow, error) {
+	row := q.db.QueryRow(ctx, getWebhookEventForUpdate, id)
+	var i GetWebhookEventForUpdateRow
+	err := row.Scan(
+		&i.ID,
+		&i.Provider,
+		&i.EventID,
+		&i.EventType,
+		&i.Payload,
+		&i.ProcessedAt,
+	)
+	return i, err
+}
+
 const hasPlatformNode = `-- name: HasPlatformNode :one
 SELECT EXISTS (
   SELECT 1 FROM user_role_assignments ura
@@ -561,4 +591,40 @@ func (q *Queries) SetSubscriptionState(ctx context.Context, arg SetSubscriptionS
 		arg.ID,
 	)
 	return err
+}
+
+const transitionSubscriptionState = `-- name: TransitionSubscriptionState :execrows
+UPDATE subscriptions SET
+  state = $1,
+  grace_ends_at = COALESCE($2::timestamptz, grace_ends_at),
+  current_period_end = COALESCE($3::timestamptz, current_period_end),
+  cancelled_at = COALESCE($4::timestamptz, cancelled_at)
+WHERE id = $5::uuid AND state = $6
+`
+
+type TransitionSubscriptionStateParams struct {
+	ToState          string             `json:"to_state"`
+	GraceEndsAt      pgtype.Timestamptz `json:"grace_ends_at"`
+	CurrentPeriodEnd pgtype.Timestamptz `json:"current_period_end"`
+	CancelledAt      pgtype.Timestamptz `json:"cancelled_at"`
+	ID               pgtype.UUID        `json:"id"`
+	FromState        string             `json:"from_state"`
+}
+
+// Compare-and-set: fires only while the subscription still holds the state
+// the caller read — concurrent lifecycle writers can't regress or
+// double-emit. 0 rows = another transition already moved it.
+func (q *Queries) TransitionSubscriptionState(ctx context.Context, arg TransitionSubscriptionStateParams) (int64, error) {
+	result, err := q.db.Exec(ctx, transitionSubscriptionState,
+		arg.ToState,
+		arg.GraceEndsAt,
+		arg.CurrentPeriodEnd,
+		arg.CancelledAt,
+		arg.ID,
+		arg.FromState,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }

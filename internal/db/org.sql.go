@@ -62,10 +62,17 @@ func (q *Queries) CloneTenantRolePermissions(ctx context.Context, tenantID pgtyp
 
 const cloneTenantRoles = `-- name: CloneTenantRoles :exec
 INSERT INTO user_roles (tenant_id, user_group_id, name, slug, is_system)
-SELECT $1, r.user_group_id, r.name, r.slug, true FROM user_roles r WHERE r.tenant_id IS NULL
+SELECT $1, r.user_group_id, r.name, r.slug, true FROM user_roles r
+WHERE r.tenant_id IS NULL
+  AND NOT EXISTS (
+    SELECT 1 FROM role_permissions rp
+    WHERE rp.role_id = r.id AND rp.permission LIKE 'platform.%'
+  )
 `
 
 // Instantiate system role templates into tenant-scoped roles at org creation.
+// Roles carrying platform.* nodes are control-plane only and must never be
+// cloned into a tenant (they'd be assignable to tenant members otherwise).
 func (q *Queries) CloneTenantRoles(ctx context.Context, tenantID pgtype.UUID) error {
 	_, err := q.db.Exec(ctx, cloneTenantRoles, tenantID)
 	return err

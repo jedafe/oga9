@@ -12,7 +12,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"log"
 	"time"
 
@@ -201,15 +200,23 @@ func ProvisionTrial(ctx context.Context, q *db.Queries, tenantID, actorID uuid.U
 
 // transition moves the subscription one step and emits SubscriptionChanged
 // in the same tx. graceEnd/cancelledAt zero-value → column untouched.
+// The write is compare-and-set on the read state — a concurrent transition
+// that already moved the row makes this a no-op (no regressed state, no
+// phantom event).
 func (s *Service) transition(ctx context.Context, q *db.Queries, sub *db.Subscriptions, to string, graceEnd, cancelledAt time.Time, actor uuid.UUID) error {
 	from := sub.State
 	if from == to {
 		return nil
 	}
-	if err := q.SetSubscriptionState(ctx, db.SetSubscriptionStateParams{
-		ID: sub.ID, State: to, GraceEndsAt: pgTime(graceEnd), CancelledAt: pgTime(cancelledAt),
-	}); err != nil {
+	n, err := q.TransitionSubscriptionState(ctx, db.TransitionSubscriptionStateParams{
+		ID: sub.ID, ToState: to, FromState: from,
+		GraceEndsAt: pgTime(graceEnd), CancelledAt: pgTime(cancelledAt),
+	})
+	if err != nil {
 		return err
+	}
+	if n == 0 {
+		return nil // another writer moved it past `from` — nothing to emit
 	}
 	return events.Emit(ctx, q, uuid.UUID(sub.TenantID.Bytes), uuid.Nil, "SubscriptionChanged",
 		"subscription", uuid.UUID(sub.ID.Bytes), actor, true,
@@ -346,8 +353,16 @@ func canonicalJSON(b []byte) []byte {
 	return out
 }
 
+// licensePayload encodes the signed tuple as JSON — a plain delimiter format
+// would let a deployment_id containing the separator shift bytes between
+// fields and forge cross-field signatures.
 func (s *Service) licensePayload(deploymentID string, expiresAt time.Time, entitlements []byte) []byte {
-	return []byte(fmt.Sprintf("%s|%s|%s", deploymentID, expiresAt.UTC().Format(time.RFC3339), string(canonicalJSON(entitlements))))
+	b, _ := json.Marshal(map[string]any{
+		"deployment_id": deploymentID,
+		"entitlements":  json.RawMessage(canonicalJSON(entitlements)),
+		"expires_at":    expiresAt.UTC().Format(time.RFC3339),
+	})
+	return b
 }
 
 // sign produces an ed25519 signature — asymmetric so deployments verify
@@ -454,7 +469,8 @@ func (s *Service) RecordWebhook(ctx context.Context, provider string, body, sign
 }
 
 // ProcessWebhook is the billing:process_webhook worker — idempotent:
-// already-processed events skip; unknown types are acknowledged. The
+// already-processed events skip; unknown types are acknowledged. The event
+// row is taken FOR UPDATE so concurrent processors serialize; the
 // transition and processed_at mark commit atomically so a crash can't
 // re-apply a transition (e.g. double-extending current_period_end).
 func (s *Service) ProcessWebhook(ctx context.Context, rawEventID uuid.UUID) error {
@@ -463,41 +479,54 @@ func (s *Service) ProcessWebhook(ctx context.Context, rawEventID uuid.UUID) erro
 		return err
 	}
 	if ev.ProcessedAt.Valid {
-		return nil
-	}
-	var p struct {
-		TenantID string `json:"tenant_id"`
-	}
-	_ = json.Unmarshal(ev.Payload, &p)
-	tenantID, err := uuid.Parse(p.TenantID)
-	if err != nil {
-		return s.markProcessed(ctx, rawEventID) // unrouteable — ack, don't retry forever
-	}
-	sub, err := s.GetSubscription(ctx, tenantID)
-	if err != nil {
-		if errors.Is(err, ErrNoSubscription) {
-			return s.markProcessed(ctx, rawEventID) // tenant-less event — ack, don't retry forever
-		}
-		return err // transient lookup failure → retry, don't drop
+		return nil // fast path — rechecked under the row lock
 	}
 	return s.withTx(ctx, func(q *db.Queries) error {
+		ev, err := q.GetWebhookEventForUpdate(ctx, toPg(rawEventID))
+		if err == pgx.ErrNoRows {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if ev.ProcessedAt.Valid {
+			return nil
+		}
+		mark := func() error {
+			_, err := q.MarkWebhookProcessed(ctx, toPg(rawEventID))
+			return err
+		}
+		var p struct {
+			TenantID string `json:"tenant_id"`
+		}
+		_ = json.Unmarshal(ev.Payload, &p)
+		tenantID, err := uuid.Parse(p.TenantID)
+		if err != nil {
+			return mark() // unrouteable — ack, don't retry forever
+		}
+		sub, err := q.GetSubscription(ctx, toPg(tenantID))
+		if err == pgx.ErrNoRows {
+			return mark() // tenant-less event — ack, don't retry forever
+		}
+		if err != nil {
+			return err // transient lookup failure → retry, don't drop
+		}
 		switch ev.EventType {
 		case "invoice.paid", "payment.succeeded", "checkout.completed":
-			if err := s.activate(ctx, q, sub); err != nil {
+			if err := s.activate(ctx, q, &sub); err != nil {
 				return err
 			}
 		case "invoice.payment_failed", "payment.failed":
 			graceEnd := time.Now().Add(time.Duration(s.settingInt(ctx, "billing.grace_period_days", 14)) * 24 * time.Hour)
-			if err := s.transition(ctx, q, sub, "past_due", graceEnd, time.Time{}, uuid.Nil); err != nil {
+			if err := s.transition(ctx, q, &sub, "past_due", graceEnd, time.Time{}, uuid.Nil); err != nil {
 				return err
 			}
 		case "subscription.cancelled":
-			if err := s.transition(ctx, q, sub, "cancelled", time.Time{}, time.Now(), uuid.Nil); err != nil {
+			if err := s.transition(ctx, q, &sub, "cancelled", time.Time{}, time.Now(), uuid.Nil); err != nil {
 				return err
 			}
 		}
-		_, err := q.MarkWebhookProcessed(ctx, toPg(rawEventID))
-		return err
+		return mark()
 	})
 }
 
@@ -513,9 +542,4 @@ func (s *Service) StaleWebhookEvents(ctx context.Context) ([]uuid.UUID, error) {
 		out = append(out, uuid.UUID(r.Bytes))
 	}
 	return out, nil
-}
-
-func (s *Service) markProcessed(ctx context.Context, rawEventID uuid.UUID) error {
-	_, err := s.q.MarkWebhookProcessed(ctx, toPg(rawEventID))
-	return err
 }

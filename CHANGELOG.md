@@ -5,6 +5,19 @@ entries reference engineering phases in `.oos/roadmaps/ROADMAP-BACKEND.md`.
 
 ## [Unreleased]
 
+### Fixed — Phase 07 review, round 3
+- `CloneTenantRoles` no longer clones platform.*-carrying roles into
+  tenants — `platform_admin` is control-plane only (000060 removes clones
+  that already landed)
+- Subscription transitions are compare-and-set (`WHERE state = from`) — a
+  stale read can't regress state or emit a phantom `SubscriptionChanged`
+  (e.g. late `payment.failed` overwriting a processed `invoice.paid`)
+- `ProcessWebhook` locks the event row `FOR UPDATE` — concurrent workers
+  serialize; `processed_at` is rechecked under lock
+- License signed payloads are JSON-encoded — a `deployment_id` containing
+  the old `|` separator could shift bytes between fields
+- `DeactivateApp` treats a lost race (`ErrNoRows`) as an idempotent no-op
+
 ### Fixed — Phase 07 review, round 2
 - `ProcessWebhook` no longer drops events on transient `GetSubscription`
   failures — only `subscription_not_found` acks; other errors retry

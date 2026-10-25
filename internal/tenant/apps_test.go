@@ -133,6 +133,27 @@ func TestAppLifecycle(t *testing.T) {
 	}
 }
 
+// platform_admin is control-plane only — the tenant role clone must never
+// carry platform.* nodes into a provisioned tenant.
+func TestNoPlatformAdminClone(t *testing.T) {
+	svc, pool := testSvc(t)
+	ctx := context.Background()
+	owner := mkUser(t, pool, "padm"+uuid.NewString()[:8]+"@test.oga9")
+	org, err := svc.CreateOrg(ctx, owner, "Clone Union", "cl"+uuid.NewString()[:6], "union", "union", "NG", "Lagos", "o@t.co", uuid.Nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM user_roles r JOIN role_permissions rp ON rp.role_id = r.id
+		 WHERE r.tenant_id = $1 AND rp.permission LIKE 'platform.%'`, org.TenantID).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("tenant holds %d platform.* grants via cloned roles", n)
+	}
+}
+
 // Billing-tenant resolution is node-based (org.admin.billing), not a role
 // name — api-routes-catalog + Rule 20.
 func TestTenantsWithNode(t *testing.T) {

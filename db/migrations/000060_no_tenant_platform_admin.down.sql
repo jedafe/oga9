@@ -1,0 +1,2 @@
+-- Not reversible: tenant-scoped platform_admin clones were invalid rows;
+-- restoring them would re-introduce the privilege-escalation surface.
