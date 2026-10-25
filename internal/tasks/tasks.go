@@ -7,6 +7,7 @@ package tasks
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 
 	"github.com/hibiken/asynq"
@@ -61,9 +62,11 @@ var tickSweeps []func(context.Context) error
 // OnTick registers a periodic sweep driven by scheduler:tick.
 func OnTick(fn func(context.Context) error) { tickSweeps = append(tickSweeps, fn) }
 
-// Handlers returns the full registry: implemented handlers + explicit no-op
-// stubs for seeds whose schema lands with their owning phase (each stub is
-// pinned to its phase so an early enqueue can't silently do real work).
+// Handlers returns the full registry: implemented handlers + explicit stubs
+// for seeds whose schema lands with their owning phase. A stub FAILS (not
+// acks): an early enqueue retries then archives — the missing implementation
+// stays visible in the archived-depth metric instead of being silently
+// swallowed.
 func Handlers(d Deps) map[string]asynq.HandlerFunc {
 	return map[string]asynq.HandlerFunc{
 		TypeSendVerification:  sendMail(d.Mail),
@@ -93,12 +96,12 @@ func sendMail(m *mailer.Mailer) asynq.HandlerFunc {
 	}
 }
 
-// stub is an idempotent no-op placeholder for a catalogued task whose
-// domain schema hasn't landed yet.
+// stub is a placeholder for a catalogued task whose domain schema hasn't
+// landed yet — it returns an error so an early enqueue retries then parks
+// in the DLQ where the queue-depth metric can see it.
 func stub(taskType, phase string) asynq.HandlerFunc {
 	return func(ctx context.Context, t *asynq.Task) error {
-		log.Printf("task %s: no-op stub (implementation lands in %s)", taskType, phase)
-		return nil
+		return fmt.Errorf("task %s not implemented until %s", taskType, phase)
 	}
 }
 
