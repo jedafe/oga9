@@ -108,8 +108,9 @@ func main() {
 	defer queue.Close()
 	entSvc := entitlements.NewService(pool, vk)
 	billSvc := billing.NewService(pool, cfg.LicenseSignKey, cfg.WebhookSecret)
+	orgSvc := tenant.NewService(pool, vk)
 	for taskType, h := range tasks.Handlers(tasks.Deps{
-		Mail: mail, Pool: pool, RedisAddr: cfg.ValkeyAddr, Billing: billSvc, Queue: queue,
+		Mail: mail, Pool: pool, RedisAddr: cfg.ValkeyAddr, Billing: billSvc, Queue: queue, Tenant: orgSvc,
 	}) {
 		mux.HandleFunc(taskType, h)
 	}
@@ -124,12 +125,12 @@ func main() {
 		}
 	}
 	oauthH := handler.NewOAuthHandler(authSvc, vk, providers, cfg.BaseURL, cfg.AppURL, queue, cfg.JWTSecret)
-	orgSvc := tenant.NewService(pool, vk)
 	orgH := handler.NewOrgHandler(orgSvc, entSvc)
 
 	// §06/§07 app framework + entitlements/billing
 	appsH := handler.NewAppsHandler(orgSvc, entSvc)
 	billH := handler.NewBillingHandler(billSvc, orgSvc, entSvc, queue)
+	memberH := handler.NewMemberHandler(orgSvc, queue)
 
 	// §05 outbox dispatcher: lease-locked claim + consumer-log dedupe.
 	dispatcher := events.NewDispatcher(pool, vk)
@@ -181,6 +182,7 @@ func main() {
 		r.With(middleware.RateLimit(vk, "oauth", 20, time.Minute)).Get("/auth/oauth/{provider}/callback", oauthH.Callback)
 		r.With(middleware.RateLimit(vk, "mfa", 10, time.Minute)).Post("/auth/mfa/complete", mfaH.Complete)
 		r.With(middleware.RateLimit(vk, "directory", 30, time.Minute)).Get("/directory/organizations", orgH.Directory)
+		r.With(middleware.RateLimit(vk, "directory_apply", 10, time.Minute)).Post("/directory/orgs/{slug}/apply", memberH.PublicApply)
 
 		// §07 self-hosted callback + provider webhook — no session auth;
 		// the signed material / HMAC signature is the credential (Rules 9/29).
@@ -219,6 +221,7 @@ func main() {
 
 			// §04/§10 tenancy + organization core
 			r.Get("/me/organizations", orgH.MyOrgs)
+			r.Get("/me/memberships", memberH.MyMemberships)
 			r.Get("/org-templates", orgH.Templates)
 			r.Post("/orgs", orgH.Create)
 			r.With(middleware.RateLimit(vk, "invite_accept", 10, time.Minute)).Post("/invitations/{token}/accept", orgH.Accept)
@@ -251,6 +254,24 @@ func main() {
 				r.With(middleware.RequireOrgPermission(orgSvc, "org.governance.appointments.manage")).Delete("/orgs/{org_id}/appointments/{appointment_id}", orgH.EndAppointment)
 				r.With(middleware.RequireOrgPermission(orgSvc, "org.governance.committees.manage")).Post("/orgs/{org_id}/units/{unit_id}/members", orgH.AddCommitteeMember)
 				r.With(middleware.RequireOrgPermission(orgSvc, "org.governance.committees.manage")).Delete("/orgs/{org_id}/units/{unit_id}/members/{cm_id}", orgH.RemoveCommitteeMember)
+
+				// §11 members module — gated on the `members` app being
+				// active for this tenant (RequireAppActive seam, §06).
+				r.Group(func(r chi.Router) {
+					r.Use(middleware.RequireAppActive(orgSvc, "members"))
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.members.view_any")).Get("/orgs/{org_id}/members", memberH.Members)
+					r.Get("/orgs/{org_id}/members/{member_id}", memberH.Member) // view_any or self — checked inside
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.members.manage")).Patch("/orgs/{org_id}/members/{member_id}", memberH.PatchMember)
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.members.manage")).Post("/orgs/{org_id}/members/{member_id}/transition", memberH.Transition)
+					r.Post("/orgs/{org_id}/members/{member_id}/renew", memberH.Renew) // manage or self
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.members.card.issue")).Post("/orgs/{org_id}/members/{member_id}/card", memberH.Card)
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.members.view_any")).Get("/orgs/{org_id}/members/{member_id}/history", memberH.History)
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.members.manage")).Post("/orgs/{org_id}/applications", memberH.Apply)
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.members.approve")).Get("/orgs/{org_id}/applications", memberH.Applications)
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.members.approve")).Post("/orgs/{org_id}/applications/{application_id}/decision", memberH.Decide)
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.members.import")).Post("/orgs/{org_id}/members/import", memberH.Import)
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.members.export")).Get("/orgs/{org_id}/members/export", memberH.Export)
+				})
 			})
 		})
 	})

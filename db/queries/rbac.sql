@@ -12,6 +12,11 @@ SELECT DISTINCT permission FROM (
   JOIN user_roles r ON r.id = ura.role_id
   JOIN role_permissions rp ON rp.role_id = r.id
   JOIN organizations o ON o.id = sqlc.arg(org_id)::uuid
+  -- ADR-014: suspended/terminal membership states block all grants —
+  -- the membership join also scopes the direct grant to this org.
+  JOIN organization_memberships m ON m.organization_id = o.id
+    AND m.user_id = ura.user_id
+    AND m.lifecycle_state NOT IN ('suspended','expelled','resigned','deceased')
   WHERE ura.user_id = sqlc.arg(user_id)::uuid AND r.tenant_id = o.tenant_id
   UNION
   -- §03 union term: the member's org group → roles bound to that group
@@ -27,6 +32,7 @@ SELECT DISTINCT permission FROM (
   JOIN role_permissions rp ON rp.role_id = r.id
   WHERE m.organization_id = sqlc.arg(org_id)::uuid
     AND m.user_id = sqlc.arg(user_id)::uuid
+    AND m.lifecycle_state NOT IN ('suspended','expelled','resigned','deceased')
   UNION
   -- Only UNSCOPED appointments confer the base node; a branch/committee-
   -- scoped seat must not satisfy the unsuffixed check — its grants feed
@@ -38,6 +44,7 @@ SELECT DISTINCT permission FROM (
   JOIN position_permissions pp ON pp.position_id = oa.position_id
   WHERE oa.organization_id = sqlc.arg(org_id)::uuid
     AND m.user_id = sqlc.arg(user_id)::uuid
+    AND m.lifecycle_state NOT IN ('suspended','expelled','resigned','deceased')
     AND oa.starts_at <= CURRENT_DATE
     AND (oa.ends_at IS NULL OR oa.ends_at >= CURRENT_DATE)
     AND oa.branch_id IS NULL AND oa.committee_id IS NULL
@@ -53,6 +60,7 @@ JOIN organization_memberships m ON m.id = oa.member_id
 JOIN position_permissions pp ON pp.position_id = oa.position_id
 WHERE oa.organization_id = sqlc.arg(org_id)::uuid
   AND m.user_id = sqlc.arg(user_id)::uuid
+  AND m.lifecycle_state NOT IN ('suspended','expelled','resigned','deceased')
   AND oa.starts_at <= CURRENT_DATE
   AND (oa.ends_at IS NULL OR oa.ends_at >= CURRENT_DATE)
   AND (oa.branch_id IS NOT NULL OR oa.committee_id IS NOT NULL);
@@ -60,7 +68,8 @@ WHERE oa.organization_id = sqlc.arg(org_id)::uuid
 -- name: UserCommitteeUnits :many
 SELECT cm.org_unit_id FROM committee_memberships cm
 JOIN organization_memberships m ON m.id = cm.member_id
-WHERE cm.organization_id = sqlc.arg(org_id)::uuid AND m.user_id = sqlc.arg(user_id)::uuid;
+WHERE cm.organization_id = sqlc.arg(org_id)::uuid AND m.user_id = sqlc.arg(user_id)::uuid
+  AND m.lifecycle_state NOT IN ('suspended','expelled','resigned','deceased');
 
 -- name: CreatePosition :one
 INSERT INTO org_positions (organization_id, name, slug, is_executive, seats)

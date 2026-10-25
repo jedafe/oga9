@@ -5,6 +5,54 @@ entries reference engineering phases in `.oos/roadmaps/ROADMAP-BACKEND.md`.
 
 ## [Unreleased]
 
+### Added — Phase 08: Members (§11)
+- g9 migrations 000070–000074: `membership_applications`, `member_sponsors`,
+  `membership_cards`, `member_imports` (+`data` payload column for the
+  async worker), `membership_renewals`; `organization_memberships` gains
+  `dues_standing` + `last_renewed_at`; `organizations` gains
+  `member_no_seq` (atomic per-org member number sequence).
+- ADR-014 state machine in `tenant/members.go`: invited→applied→screened
+  →approved→registered→active + suspended/expelled/resigned/deceased/
+  life_member. API verbs map onto legal transitions; illegal moves return
+  `invalid_state_transition` (409). Transitions are CAS (`WHERE state =
+  from`) so concurrent moves can't double-apply.
+- Application pipeline: `POST /orgs/{id}/applications` (manage) + public
+  `POST /directory/orgs/{slug}/apply` (listed orgs, pre-signup); decisions
+  screen/approve/reject/withdraw (`org.members.approve`). Approve
+  materializes the membership, mints `member_no` from
+  `org.membership.number_format` ({SLUG}-{YYYY}-{seq5}), records sponsors
+  + `SponsorshipRecorded` — pre-signup apps defer the membership until the
+  user registers (Phase-02 hook).
+- `approved→registered` is a no-gate transition for now — the registration
+  payment guard lands with §12 finance (payment event consumer).
+- `POST …/transition` side effects in-tx: activation grants the `member`
+  role + stamps `joined_at`; terminal transitions vacate appointments
+  (AppointmentEnded each), clear committee seats, revoke cards. Every
+  transition emits its catalogued event + invalidates perm/org-ctx caches
+  (Rules 6/12).
+- Resolver now filters `lifecycle_state NOT IN ('suspended','expelled',
+  'resigned','deceased')` across role, group, position and committee
+  paths — suspended members lose grants immediately (ADR-014).
+- Renewals: `POST …/renew` (manage or self) → `membership_renewals`
+  (UNIQUE period → `renewal_exists` 409) + `last_renewed_at` +
+  `MembershipRenewed`.
+- Cards: `POST …/card` (`org.members.card.issue`) → unique serial +
+  `CardIssued`; revoke on terminal transitions.
+- Directory: `GET /orgs/{id}/members` (`view_any`, category/state
+  filters), `GET …/{mid}` (view_any or self), `PATCH` (manage, category),
+  `GET …/history` (sourced event stream), `GET /me/memberships`.
+- Import: `POST …/import` (`org.members.import`) → durable
+  `member_imports` row + `membership:import` worker → rows become
+  `applied` applications (never direct members), per-row errors in
+  `errors`; `membership:export` registered as Phase-14 stub (sync CSV
+  export serves the route meanwhile).
+- Members routes sit behind `RequireAppActive("members")` — first real
+  consumer of the §06 activation seam.
+- `Eligible(state, dues)` computed helper — eligibility is never stored.
+- Tests: full lifecycle + sponsor guard + invalid transitions +
+  suspend-grant-drop + card/renew/duplicate + terminal teardown
+  (`member_test.go`), import row semantics.
+
 ### Fixed — Phase 04–07 review, round 4
 - Migration numbering: `000060_no_tenant_platform_admin` squatted on a
   group-8 slot held by `000060_org_invitations` — golang-migrate refused

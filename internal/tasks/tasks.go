@@ -19,6 +19,7 @@ import (
 	"github.com/jedafe/oga9/internal/db"
 	"github.com/jedafe/oga9/internal/events"
 	"github.com/jedafe/oga9/internal/mailer"
+	"github.com/jedafe/oga9/internal/tenant"
 )
 
 // Task names — the code-side mirror of conventions/asynq-tasks-catalog.md.
@@ -33,6 +34,8 @@ const (
 	TypeLicenseReminder   = "license:renewal_reminder"
 	TypeTenantProvision   = "tenant:provision"
 	TypeSchedulerTick     = "scheduler:tick"
+	TypeMemberImport      = "membership:import"
+	TypeMemberExport      = "membership:export"
 )
 
 type SendEmailPayload struct {
@@ -49,6 +52,16 @@ func NewProcessWebhookTask(rawEventID string) (*asynq.Task, error) {
 		return nil, err
 	}
 	return asynq.NewTask(TypeProcessWebhook, b, asynq.Queue("critical"), asynq.MaxRetry(8)), nil
+}
+
+// NewMemberImportTask builds the default-tier import worker — payload is
+// the durable member_imports row id; rows become applications (§11).
+func NewMemberImportTask(importID uuid.UUID) (*asynq.Task, error) {
+	b, err := json.Marshal(map[string]string{"import_id": importID.String()})
+	if err != nil {
+		return nil, err
+	}
+	return asynq.NewTask(TypeMemberImport, b, asynq.Queue("default"), asynq.MaxRetry(8)), nil
 }
 
 // NewEmailTask builds a queueable mail task. Handlers enqueue with
@@ -69,6 +82,7 @@ type Deps struct {
 	RedisAddr string // asynq Inspector reports queue depth over the same conn
 	Billing   *billing.Service
 	Queue     *asynq.Client // sweep handlers re-drive durable rows
+	Tenant    *tenant.Service
 }
 
 // tickSweeps run inside each scheduler:tick — later phases append their
@@ -91,6 +105,10 @@ func Handlers(d Deps) map[string]asynq.HandlerFunc {
 		TypeSchedulerTick:     schedulerTick(d.RedisAddr, d.Pool),
 		TypeSubscriptionSweep: subscriptionSweep(d.Billing, d.Queue),
 		TypeProcessWebhook:    processWebhook(d.Billing),
+		TypeMemberImport:      memberImport(d.Tenant),
+		// membership:export needs blob storage for the produced file —
+		// catalog-reserved stub until Phase 14.
+		TypeMemberExport: stub(TypeMemberExport, "Phase 14"),
 		// Stubs — registered now (catalog-reserved), implemented when their
 		// sections land: retry_payment needs §12 payments (Phase 09);
 		// license 14; provision 12.
@@ -165,6 +183,26 @@ func subscriptionSweep(b *billing.Service, queue *asynq.Client) asynq.HandlerFun
 			}
 		}
 		return nil
+	}
+}
+
+// memberImport turns the durable import row into 'applied' applications —
+// per-row failures land in errors, never the DLQ (idempotent re-run safe:
+// a crashed worker replays into duplicate applications, so the row-level
+// `data` stays the single retry unit).
+func memberImport(svc *tenant.Service) asynq.HandlerFunc {
+	return func(ctx context.Context, t *asynq.Task) error {
+		var p struct {
+			ImportID string `json:"import_id"`
+		}
+		if err := json.Unmarshal(t.Payload(), &p); err != nil {
+			return err
+		}
+		id, err := uuid.Parse(p.ImportID)
+		if err != nil {
+			return nil // malformed payload — retrying won't fix it; archive
+		}
+		return svc.ProcessImport(ctx, id)
 	}
 }
 

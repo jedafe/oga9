@@ -146,6 +146,60 @@ type Licenses struct {
 	Signature    []byte             `json:"signature"`
 }
 
+type MemberImports struct {
+	ID             pgtype.UUID        `json:"id"`
+	OrganizationID pgtype.UUID        `json:"organization_id"`
+	UploadedBy     pgtype.UUID        `json:"uploaded_by"`
+	Filename       string             `json:"filename"`
+	RowCount       pgtype.Int4        `json:"row_count"`
+	OkCount        pgtype.Int4        `json:"ok_count"`
+	ErrCount       pgtype.Int4        `json:"err_count"`
+	Data           []byte             `json:"data"`
+	Errors         []byte             `json:"errors"`
+	Status         string             `json:"status"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+}
+
+type MemberSponsors struct {
+	MembershipID    pgtype.UUID        `json:"membership_id"`
+	SponsorMemberID pgtype.UUID        `json:"sponsor_member_id"`
+	Kind            string             `json:"kind"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+}
+
+type MembershipApplications struct {
+	ID              pgtype.UUID        `json:"id"`
+	OrganizationID  pgtype.UUID        `json:"organization_id"`
+	UserID          pgtype.UUID        `json:"user_id"`
+	Email           pgtype.Text        `json:"email"`
+	Phone           pgtype.Text        `json:"phone"`
+	Answers         []byte             `json:"answers"`
+	SponsorMemberID pgtype.UUID        `json:"sponsor_member_id"`
+	Status          string             `json:"status"`
+	ScreenedBy      pgtype.UUID        `json:"screened_by"`
+	DecidedAt       pgtype.Timestamptz `json:"decided_at"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+}
+
+type MembershipCards struct {
+	ID           pgtype.UUID        `json:"id"`
+	MembershipID pgtype.UUID        `json:"membership_id"`
+	Serial       string             `json:"serial"`
+	Design       []byte             `json:"design"`
+	IssuedAt     pgtype.Timestamptz `json:"issued_at"`
+	RevokedAt    pgtype.Timestamptz `json:"revoked_at"`
+}
+
+type MembershipRenewals struct {
+	ID           pgtype.UUID        `json:"id"`
+	MembershipID pgtype.UUID        `json:"membership_id"`
+	PeriodLabel  string             `json:"period_label"`
+	StartsAt     pgtype.Date        `json:"starts_at"`
+	EndsAt       pgtype.Date        `json:"ends_at"`
+	PaymentID    pgtype.UUID        `json:"payment_id"`
+	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+}
+
 type OauthProviders struct {
 	ID              pgtype.UUID        `json:"id"`
 	UserID          pgtype.UUID        `json:"user_id"`
@@ -230,6 +284,8 @@ type OrganizationMemberships struct {
 	UserGroupID    pgtype.UUID        `json:"user_group_id"`
 	JoinedAt       pgtype.Timestamptz `json:"joined_at"`
 	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+	DuesStanding   string             `json:"dues_standing"`
+	LastRenewedAt  pgtype.Timestamptz `json:"last_renewed_at"`
 }
 
 type OrganizationRelationships struct {
@@ -261,6 +317,7 @@ type Organizations struct {
 	MaturityLevel  int32              `json:"maturity_level"`
 	CreatedAt      pgtype.Timestamptz `json:"created_at"`
 	DeletedAt      pgtype.Timestamptz `json:"deleted_at"`
+	MemberNoSeq    int64              `json:"member_no_seq"`
 }
 
 type Permissions struct {
