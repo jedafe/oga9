@@ -309,17 +309,20 @@ func (q *Queries) RelatedEntities(ctx context.Context, arg RelatedEntitiesParams
 
 const retryDeadEvents = `-- name: RetryDeadEvents :execrows
 UPDATE domain_events SET dispatched_at = NULL, attempts = 0,
-       last_error = NULL, next_attempt_at = NULL
+       last_error = NULL, next_attempt_at = NULL,
+       redrive_count = redrive_count + 1
 WHERE id IN (
   SELECT id FROM domain_events
   WHERE dispatched_at IS NOT NULL AND attempts >= $1::int
+    AND redrive_count < $2::int
   ORDER BY occurred_at
-  LIMIT $2::int
+  LIMIT $3::int
 )
 `
 
 type RetryDeadEventsParams struct {
 	MaxAttempts int32 `json:"max_attempts"`
+	MaxRedrives int32 `json:"max_redrives"`
 	BatchSize   int32 `json:"batch_size"`
 }
 
@@ -327,7 +330,7 @@ type RetryDeadEventsParams struct {
 // dispatched_at set AND attempts at cap. Reset makes them claimable again;
 // next_attempt_at cleared so they retry on the next tick. Idempotent.
 func (q *Queries) RetryDeadEvents(ctx context.Context, arg RetryDeadEventsParams) (int64, error) {
-	result, err := q.db.Exec(ctx, retryDeadEvents, arg.MaxAttempts, arg.BatchSize)
+	result, err := q.db.Exec(ctx, retryDeadEvents, arg.MaxAttempts, arg.MaxRedrives, arg.BatchSize)
 	if err != nil {
 		return 0, err
 	}

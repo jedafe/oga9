@@ -85,6 +85,7 @@ type DomainEvents struct {
 	OrganizationID pgtype.UUID        `json:"organization_id"`
 	Sourced        bool               `json:"sourced"`
 	NextAttemptAt  pgtype.Timestamptz `json:"next_attempt_at"`
+	RedriveCount   int32              `json:"redrive_count"`
 }
 
 type EntityLinks struct {

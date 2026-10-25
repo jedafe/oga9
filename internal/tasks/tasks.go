@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"sync"
 
 	"github.com/hibiken/asynq"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -112,7 +113,7 @@ func retryDead(pool *pgxpool.Pool) asynq.HandlerFunc {
 	q := db.New(pool)
 	return func(ctx context.Context, t *asynq.Task) error {
 		n, err := q.RetryDeadEvents(ctx, db.RetryDeadEventsParams{
-			MaxAttempts: events.MaxAttempts, BatchSize: 100,
+			MaxAttempts: events.MaxAttempts, BatchSize: 100, MaxRedrives: 3,
 		})
 		if err != nil {
 			return err
@@ -149,11 +150,24 @@ func schedulerTick(redisAddr string, pool *pgxpool.Pool) asynq.HandlerFunc {
 		if dead, err := q.CountDeadEvents(ctx, events.MaxAttempts); err == nil && dead > 0 {
 			log.Printf("events DLQ depth: %d", dead)
 		}
+		// Sweeps run concurrently — a slow one can't stall the tick or the
+		// others; a panic is contained to its own sweep.
+		var wg sync.WaitGroup
 		for _, sweep := range tickSweeps {
-			if err := sweep(ctx); err != nil {
-				log.Printf("scheduler tick sweep failed: %v", err) // sweeps are independent
-			}
+			wg.Add(1)
+			go func(sw func(context.Context) error) {
+				defer wg.Done()
+				defer func() {
+					if r := recover(); r != nil {
+						log.Printf("scheduler tick sweep panic: %v", r)
+					}
+				}()
+				if err := sw(ctx); err != nil {
+					log.Printf("scheduler tick sweep failed: %v", err)
+				}
+			}(sweep)
 		}
+		wg.Wait()
 		return nil
 	}
 }

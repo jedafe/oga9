@@ -44,10 +44,12 @@ WHERE id = $1;
 -- dispatched_at set AND attempts at cap. Reset makes them claimable again;
 -- next_attempt_at cleared so they retry on the next tick. Idempotent.
 UPDATE domain_events SET dispatched_at = NULL, attempts = 0,
-       last_error = NULL, next_attempt_at = NULL
+       last_error = NULL, next_attempt_at = NULL,
+       redrive_count = redrive_count + 1
 WHERE id IN (
   SELECT id FROM domain_events
   WHERE dispatched_at IS NOT NULL AND attempts >= sqlc.arg(max_attempts)::int
+    AND redrive_count < sqlc.arg(max_redrives)::int
   ORDER BY occurred_at
   LIMIT sqlc.arg(batch_size)::int
 );

@@ -190,13 +190,39 @@ func (s *Service) ListTemplates(ctx context.Context) ([]db.ListTemplatesRow, err
 	return s.q.ListTemplates(ctx)
 }
 
+// positionSeed accepts either "slug" or {"slug","executive"} seed entries —
+// a bare slug is an officer-slate position (executive defaults true).
+type positionSeed struct {
+	Slug      string
+	Executive bool
+}
+
+func (p *positionSeed) UnmarshalJSON(b []byte) error {
+	if len(b) > 0 && b[0] == '"' {
+		if err := json.Unmarshal(b, &p.Slug); err != nil {
+			return err
+		}
+		p.Executive = true
+		return nil
+	}
+	var o struct {
+		Slug      string `json:"slug"`
+		Executive *bool  `json:"executive"`
+	}
+	if err := json.Unmarshal(b, &o); err != nil {
+		return err
+	}
+	p.Slug, p.Executive = o.Slug, o.Executive == nil || *o.Executive
+	return nil
+}
+
 type templateSeed struct {
 	Rules map[string]json.RawMessage `json:"rules"`
 	Theme map[string]any             `json:"theme"`
 	// Template officer positions + committees instantiate at org create
 	// (§10 test scenario 1); contribution_types wait for Phase 09 finance.
-	Positions  []string `json:"positions"`
-	Committees []string `json:"committees"`
+	Positions  []positionSeed `json:"positions"`
+	Committees []string       `json:"committees"`
 	// level_labels are org-defined tier names for hq depth — descriptive
 	// metadata for the unit tree UI, not units to create.
 	LevelLabels []string `json:"level_labels"`
@@ -375,13 +401,13 @@ func (s *Service) CreateOrg(ctx context.Context, userID uuid.UUID, name, slug, t
 		// is also on the org for backfill).
 		for _, ps := range seed.Positions {
 			pid, err := q.CreatePosition(ctx, db.CreatePositionParams{
-				OrganizationID: toPg(orgID), Name: humanizeSlug(ps), Slug: ps, IsExecutive: true, Seats: 1,
+				OrganizationID: toPg(orgID), Name: humanizeSlug(ps.Slug), Slug: ps.Slug, IsExecutive: ps.Executive, Seats: 1,
 			})
 			if err != nil {
 				return err
 			}
 			if err := events.Emit(ctx, q, tenantID, orgID, "PositionCreated", "org_position", fromPg(pid), userID, true,
-				map[string]any{"position_id": fromPg(pid), "org_id": orgID, "name": humanizeSlug(ps), "source": "template"}); err != nil {
+				map[string]any{"position_id": fromPg(pid), "org_id": orgID, "name": humanizeSlug(ps.Slug), "source": "template"}); err != nil {
 				return err
 			}
 		}

@@ -112,8 +112,10 @@ func (h *OAuthHandler) Callback(w http.ResponseWriter, r *http.Request) {
 	// A real app deployment redirects the browser back to the frontend with
 	// the session; pure-API installs (AppURL unset/same as base) get JSON.
 	if h.appURL != "" && h.appURL != h.baseURL {
+		// Fragment, not query — bearer material must not hit server logs or
+		// leak via Referer; the app page reads window.location.hash.
 		q := url.Values{"token": {res.Token}, "session_id": {res.SessionID.String()}}
-		http.Redirect(w, r, h.appURL+"/auth/callback?"+q.Encode(), http.StatusFound)
+		http.Redirect(w, r, h.appURL+"/auth/callback#"+q.Encode(), http.StatusFound)
 		return
 	}
 	httpx.WriteData(w, 200, map[string]any{"token": res.Token, "session_id": res.SessionID})
