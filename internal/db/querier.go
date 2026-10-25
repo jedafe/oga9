@@ -81,6 +81,7 @@ type Querier interface {
 	GetMembershipByID(ctx context.Context, id pgtype.UUID) (GetMembershipByIDRow, error)
 	GetOrg(ctx context.Context, id pgtype.UUID) (GetOrgRow, error)
 	GetOrgSetting(ctx context.Context, arg GetOrgSettingParams) ([]byte, error)
+	GetPlan(ctx context.Context, slug string) (GetPlanRow, error)
 	GetPlanCapabilities(ctx context.Context, planSlug string) ([]string, error)
 	GetPlanLimits(ctx context.Context, planSlug string) ([]GetPlanLimitsRow, error)
 	GetPositionOrg(ctx context.Context, id pgtype.UUID) (pgtype.UUID, error)
@@ -108,10 +109,13 @@ type Querier interface {
 	HasPlatformNode(ctx context.Context, arg HasPlatformNodeParams) (bool, error)
 	HasRoleInTenant(ctx context.Context, arg HasRoleInTenantParams) (bool, error)
 	InsertAuditEvent(ctx context.Context, arg InsertAuditEventParams) error
+	// Re-issue on the same deployment_id is a renewal: rotate the signed
+	// material in place (UNIQUE deployment_id is one-license-per-deployment).
 	InsertLicense(ctx context.Context, arg InsertLicenseParams) (pgtype.UUID, error)
 	// Durable raw record + replay guard (UNIQUE provider,event_id) — a replay
 	// returns no row so the endpoint can ack and skip.
 	InsertWebhookEvent(ctx context.Context, arg InsertWebhookEventParams) (pgtype.UUID, error)
+	IsAppActive(ctx context.Context, arg IsAppActiveParams) (bool, error)
 	LinkEntities(ctx context.Context, arg LinkEntitiesParams) error
 	LinkOAuthProvider(ctx context.Context, arg LinkOAuthProviderParams) error
 	ListActiveApps(ctx context.Context, tenantID pgtype.UUID) ([]string, error)
@@ -120,8 +124,10 @@ type Querier interface {
 	// Ref: oga9-engineering/sections/06-app-framework-registry.md
 	ListApps(ctx context.Context) ([]ListAppsRow, error)
 	ListCommitteeMembers(ctx context.Context, arg ListCommitteeMembersParams) ([]ListCommitteeMembersRow, error)
-	// Sweep set: trials past expiry, and past_due/grace rows past their grace
-	// deadline — the state machine moves each one step per pass.
+	// Sweep set: trials past expiry, past_due/grace rows past their grace
+	// deadline, and active rows whose period lapsed without a provider event
+	// (silent provider → lapse to past_due, never free-forever). The state
+	// machine moves each one step per pass.
 	ListDueSubscriptions(ctx context.Context) ([]ListDueSubscriptionsRow, error)
 	ListInstallations(ctx context.Context, tenantID pgtype.UUID) ([]ListInstallationsRow, error)
 	// Tenants where the caller holds the org_admin role — the server-side
@@ -133,7 +139,14 @@ type Querier interface {
 	ListPlans(ctx context.Context) ([]ListPlansRow, error)
 	ListPositions(ctx context.Context, orgID pgtype.UUID) ([]ListPositionsRow, error)
 	ListPublicOrgs(ctx context.Context) ([]ListPublicOrgsRow, error)
+	// Rule 9 durability floor: rows recorded but never processed because the
+	// enqueue failed. The sweep re-drives them into billing:process_webhook.
+	ListStaleWebhookEvents(ctx context.Context) ([]pgtype.UUID, error)
 	ListTemplates(ctx context.Context) ([]ListTemplatesRow, error)
+	// Billing-tenant resolution (Rule 24): tenants where the caller holds a
+	// tenant-scoped role granting the permission node — the api-routes-catalog
+	// gate for /billing/* is org.admin.billing, not a role name (Rule 20).
+	ListTenantsWithNode(ctx context.Context, arg ListTenantsWithNodeParams) ([]pgtype.UUID, error)
 	ListTerms(ctx context.Context, orgID pgtype.UUID) ([]ListTermsRow, error)
 	ListUnits(ctx context.Context, organizationID pgtype.UUID) ([]ListUnitsRow, error)
 	ListUserOrgs(ctx context.Context, userID pgtype.UUID) ([]ListUserOrgsRow, error)

@@ -7,6 +7,10 @@ FROM plans WHERE is_public ORDER BY sort;
 -- name: PlanExists :one
 SELECT EXISTS(SELECT 1 FROM plans WHERE slug = $1) AS exists;
 
+-- name: GetPlan :one
+SELECT slug, price_monthly_minor, price_annual_minor, is_public
+FROM plans WHERE slug = $1;
+
 -- name: GetPlanCapabilities :many
 SELECT capability FROM plan_capabilities WHERE plan_slug = $1;
 
@@ -41,16 +45,25 @@ UPDATE subscriptions SET plan_slug = sqlc.arg(plan_slug)
 WHERE id = sqlc.arg(id)::uuid;
 
 -- name: ListDueSubscriptions :many
--- Sweep set: trials past expiry, and past_due/grace rows past their grace
--- deadline — the state machine moves each one step per pass.
+-- Sweep set: trials past expiry, past_due/grace rows past their grace
+-- deadline, and active rows whose period lapsed without a provider event
+-- (silent provider → lapse to past_due, never free-forever). The state
+-- machine moves each one step per pass.
 SELECT id, tenant_id, plan_slug, state FROM subscriptions
 WHERE (state = 'trial' AND trial_ends_at IS NOT NULL AND trial_ends_at < now())
-   OR (state IN ('past_due','grace') AND grace_ends_at IS NOT NULL AND grace_ends_at < now());
+   OR (state IN ('past_due','grace') AND grace_ends_at IS NOT NULL AND grace_ends_at < now())
+   OR (state = 'active' AND current_period_end IS NOT NULL AND current_period_end < now());
 
 -- name: InsertLicense :one
+-- Re-issue on the same deployment_id is a renewal: rotate the signed
+-- material in place (UNIQUE deployment_id is one-license-per-deployment).
 INSERT INTO licenses (tenant_id, deployment_id, edition, entitlements, expires_at, signature)
 VALUES (sqlc.arg(tenant_id)::uuid, sqlc.arg(deployment_id), sqlc.arg(edition),
         sqlc.arg(entitlements)::jsonb, sqlc.arg(expires_at), sqlc.arg(signature))
+ON CONFLICT (deployment_id) DO UPDATE SET
+  tenant_id = EXCLUDED.tenant_id, edition = EXCLUDED.edition,
+  entitlements = EXCLUDED.entitlements, expires_at = EXCLUDED.expires_at,
+  signature = EXCLUDED.signature, issued_at = now()
 RETURNING id;
 
 -- name: GetLicenseByDeployment :one
@@ -80,6 +93,13 @@ FROM billing_webhook_events WHERE id = sqlc.arg(id)::uuid;
 UPDATE billing_webhook_events SET processed_at = now()
 WHERE id = sqlc.arg(id)::uuid AND processed_at IS NULL;
 
+-- name: ListStaleWebhookEvents :many
+-- Rule 9 durability floor: rows recorded but never processed because the
+-- enqueue failed. The sweep re-drives them into billing:process_webhook.
+SELECT id FROM billing_webhook_events
+WHERE processed_at IS NULL AND created_at < now() - interval '5 minutes'
+ORDER BY created_at LIMIT 200;
+
 -- name: GetUsage :one
 SELECT used FROM usage_meters
 WHERE tenant_id = sqlc.arg(tenant_id)::uuid AND limit_key = sqlc.arg(limit_key)
@@ -90,6 +110,16 @@ INSERT INTO usage_meters (tenant_id, limit_key, used, period_start)
 VALUES (sqlc.arg(tenant_id)::uuid, sqlc.arg(limit_key), sqlc.arg(delta)::bigint,
         sqlc.arg(period_start)::date)
 ON CONFLICT (tenant_id, limit_key, period_start) DO UPDATE SET used = usage_meters.used + sqlc.arg(delta);
+
+-- name: ListTenantsWithNode :many
+-- Billing-tenant resolution (Rule 24): tenants where the caller holds a
+-- tenant-scoped role granting the permission node — the api-routes-catalog
+-- gate for /billing/* is org.admin.billing, not a role name (Rule 20).
+SELECT DISTINCT r.tenant_id FROM user_role_assignments ura
+JOIN user_roles r ON r.id = ura.role_id
+JOIN role_permissions rp ON rp.role_id = r.id
+WHERE ura.user_id = sqlc.arg(user_id)::uuid
+  AND r.tenant_id IS NOT NULL AND rp.permission = sqlc.arg(node);
 
 -- name: HasPlatformNode :one
 -- platform.* nodes resolve via NULL-tenant roles only (super-admin scope —

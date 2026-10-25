@@ -30,7 +30,7 @@ type Config struct {
 	SchedulerTickInterval time.Duration // scheduler:tick cron driver
 	RetryDeadInterval     time.Duration // events:retry_dead DLQ re-drive
 	BillingSweepInterval  time.Duration // billing:subscription_state_sweep cadence (§07)
-	LicenseSignKey        []byte        // HMAC key for self-hosted license files (§07, Rule 29)
+	LicenseSignKey        []byte        // ed25519 seed for self-hosted license files (§07, Rule 29)
 	WebhookSecret         []byte        // billing webhook signature secret (Rule 9)
 	SMTPHost              string
 	SMTPPort              int
@@ -99,7 +99,7 @@ func Load() (*Config, error) {
 		}
 	}
 	cfg.DataKey = dataKey(env("OGA9_DATA_ENCRYPTION_KEY", ""), cfg.JWTSecret)
-	cfg.LicenseSignKey = dataKey(env("OGA9_LICENSE_SIGNING_KEY", ""), "license:"+cfg.JWTSecret)
+	cfg.LicenseSignKey = licenseSeed(env("OGA9_LICENSE_SIGNING_KEY", ""), cfg.JWTSecret)
 	cfg.WebhookSecret = []byte(env("OGA9_BILLING_WEBHOOK_SECRET", "")) // empty → endpoint rejects providers
 	if cfg.JWTSecret == "change-me" && cfg.Env == "production" {
 		errs = append(errs, errors.New("OGA9_JWT_SECRET must be set in production"))
@@ -130,6 +130,24 @@ func dataKey(raw, jwtSecret string) []byte {
 	k := make([]byte, 32)
 	copy(k, sum[:])
 	return k
+}
+
+// licenseSeed resolves the 32-byte ed25519 seed for license signing:
+// explicit OGA9_LICENSE_SIGNING_KEY (hex/base64/raw) wins; otherwise a stable
+// derivation from the JWT secret keeps dev installs zero-config. Only the
+// public half ships to self-hosted deployments (Rule 29).
+func licenseSeed(raw, jwtSecret string) []byte {
+	sum := sha256.Sum256([]byte("oga9-license-seed|" + jwtSecret))
+	if raw != "" {
+		if b, err := base64.StdEncoding.DecodeString(raw); err == nil {
+			sum = sha256.Sum256(b)
+		} else if b, err := hex.DecodeString(raw); err == nil {
+			sum = sha256.Sum256(b)
+		} else {
+			sum = sha256.Sum256([]byte(raw))
+		}
+	}
+	return sum[:]
 }
 
 func (c *Config) IsProduction() bool { return c.Env == "production" }

@@ -68,6 +68,7 @@ type Deps struct {
 	Pool      *pgxpool.Pool
 	RedisAddr string // asynq Inspector reports queue depth over the same conn
 	Billing   *billing.Service
+	Queue     *asynq.Client // sweep handlers re-drive durable rows
 }
 
 // tickSweeps run inside each scheduler:tick — later phases append their
@@ -88,7 +89,7 @@ func Handlers(d Deps) map[string]asynq.HandlerFunc {
 		TypeSendPasswordReset: sendMail(d.Mail),
 		TypeRetryDead:         retryDead(d.Pool),
 		TypeSchedulerTick:     schedulerTick(d.RedisAddr, d.Pool),
-		TypeSubscriptionSweep: subscriptionSweep(d.Billing),
+		TypeSubscriptionSweep: subscriptionSweep(d.Billing, d.Queue),
 		TypeProcessWebhook:    processWebhook(d.Billing),
 		// Stubs — registered now (catalog-reserved), implemented when their
 		// sections land: retry_payment needs §12 payments; license 14;
@@ -142,10 +143,28 @@ func retryDead(pool *pgxpool.Pool) asynq.HandlerFunc {
 }
 
 // subscriptionSweep drives the §07 lifecycle machine's time-based
-// transitions (trial→grace→restricted).
-func subscriptionSweep(b *billing.Service) asynq.HandlerFunc {
+// transitions (trial→grace→restricted, lapsed active→past_due) and
+// re-drives durable webhook rows whose enqueue failed (Rule 9 — the
+// durable record exists precisely so nothing is lost).
+func subscriptionSweep(b *billing.Service, queue *asynq.Client) asynq.HandlerFunc {
 	return func(ctx context.Context, t *asynq.Task) error {
-		return b.SweepStates(ctx)
+		if err := b.SweepStates(ctx); err != nil {
+			return err
+		}
+		ids, err := b.StaleWebhookEvents(ctx)
+		if err != nil {
+			return err
+		}
+		for _, id := range ids {
+			task, err := NewProcessWebhookTask(id.String())
+			if err != nil {
+				return err
+			}
+			if _, err := queue.EnqueueContext(ctx, task); err != nil {
+				return err // leave the rest for the next pass
+			}
+		}
+		return nil
 	}
 }
 

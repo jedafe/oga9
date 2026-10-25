@@ -36,11 +36,13 @@ func NewBillingHandler(svc *billing.Service, orgSvc *tenant.Service, ent *entitl
 	return &BillingHandler{svc: svc, orgSvc: orgSvc, ent: ent, queue: queue}
 }
 
-// tenantFor resolves the billing tenant server-side (Rule 24): the caller's
-// org_admin tenants; an explicit ?tenant_id must belong to that set.
+// tenantFor resolves the billing tenant server-side (Rule 24): tenants where
+// the caller holds the org.admin.billing node (api-routes-catalog, Rule 20 —
+// node, not role name). An explicit ?tenant_id must belong to that set;
+// multi-tenant callers must disambiguate.
 func (h *BillingHandler) tenantFor(w http.ResponseWriter, r *http.Request) (uuid.UUID, bool) {
 	userID := middleware.UserID(r.Context())
-	admins, err := h.orgSvc.AdminTenants(r.Context(), userID)
+	admins, err := h.orgSvc.TenantsWithNode(r.Context(), userID, "org.admin.billing")
 	if err != nil || len(admins) == 0 {
 		httpx.WriteErr(w, 403, "billing_forbidden", "no administered tenant")
 		return uuid.Nil, false
@@ -56,7 +58,11 @@ func (h *BillingHandler) tenantFor(w http.ResponseWriter, r *http.Request) (uuid
 				return id, true
 			}
 		}
-		httpx.WriteErr(w, 403, "billing_forbidden", "not an admin of that tenant")
+		httpx.WriteErr(w, 403, "billing_forbidden", "missing org.admin.billing on that tenant")
+		return uuid.Nil, false
+	}
+	if len(admins) > 1 {
+		httpx.WriteErr(w, 400, "tenant_required", "multiple billing tenants — pass ?tenant_id")
 		return uuid.Nil, false
 	}
 	return admins[0], true
@@ -119,6 +125,10 @@ func (h *BillingHandler) CreateSubscription(w http.ResponseWriter, r *http.Reque
 		httpx.WriteErr(w, 404, "plan_not_found", "unknown plan")
 	case errors.Is(err, billing.ErrBadBillingTerm):
 		httpx.WriteErr(w, 400, "invalid_billing_term", "monthly|annual|enterprise_contract")
+	case errors.Is(err, billing.ErrSubscriptionExists):
+		httpx.WriteErr(w, 409, "subscription_exists", "use change-plan to switch plans")
+	case errors.Is(err, billing.ErrPaymentRequired):
+		httpx.WriteErr(w, 402, "payment_required", "paid plans start through provider checkout")
 	default:
 		httpx.WriteErr(w, 500, "internal_error", "subscription create failed")
 	}
@@ -144,6 +154,8 @@ func (h *BillingHandler) ChangePlan(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteErr(w, 404, "plan_not_found", "unknown plan")
 	case errors.Is(err, billing.ErrBadTransition):
 		httpx.WriteErr(w, 409, "invalid_state_transition", "cancelled subscriptions can't change plan")
+	case errors.Is(err, billing.ErrPaymentRequired):
+		httpx.WriteErr(w, 402, "payment_required", "upgrades go through provider checkout")
 	default:
 		httpx.WriteErr(w, 500, "internal_error", "plan change failed")
 	}
@@ -221,16 +233,21 @@ func (h *BillingHandler) IssueLicense(w http.ResponseWriter, r *http.Request) {
 		req.Edition = "self_hosted"
 	}
 	id, err := h.svc.IssueLicense(r.Context(), tenantID, req.DeploymentID, req.Edition, req.Entitlements, exp, middleware.UserID(r.Context()))
-	if err != nil {
+	switch {
+	case err == nil:
+		httpx.WriteData(w, 201, map[string]uuid.UUID{"license_id": id})
+	case errors.Is(err, billing.ErrTenantNotFound):
+		httpx.WriteErr(w, 404, "tenant_not_found", "unknown tenant")
+	case errors.Is(err, billing.ErrBadExpiry):
+		httpx.WriteErr(w, 400, "invalid_expiry", "expires_at must be in the future")
+	default:
 		httpx.WriteErr(w, 500, "internal_error", "license issue failed")
-		return
 	}
-	httpx.WriteData(w, 201, map[string]uuid.UUID{"license_id": id})
 }
 
 type validateReq struct {
 	DeploymentID string `json:"deployment_id"`
-	Signature    string `json:"signature"` // hex HMAC from the issued license file
+	Signature    string `json:"signature"` // hex ed25519 from the issued license file
 }
 
 // ValidateLicense is the self-hosted callback — no auth; the signed

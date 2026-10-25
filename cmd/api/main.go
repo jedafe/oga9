@@ -107,9 +107,9 @@ func main() {
 	queue := asynq.NewClient(asynq.RedisClientOpt{Addr: cfg.ValkeyAddr})
 	defer queue.Close()
 	entSvc := entitlements.NewService(pool, vk)
-	billSvc := billing.NewService(pool, vk, cfg.LicenseSignKey, cfg.WebhookSecret)
+	billSvc := billing.NewService(pool, cfg.LicenseSignKey, cfg.WebhookSecret)
 	for taskType, h := range tasks.Handlers(tasks.Deps{
-		Mail: mail, Pool: pool, RedisAddr: cfg.ValkeyAddr, Billing: billSvc,
+		Mail: mail, Pool: pool, RedisAddr: cfg.ValkeyAddr, Billing: billSvc, Queue: queue,
 	}) {
 		mux.HandleFunc(taskType, h)
 	}

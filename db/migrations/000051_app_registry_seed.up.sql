@@ -30,7 +30,7 @@ INSERT INTO app_registry (app_id, version, label, mvp_required, manifest) VALUES
 ('comms_documents','1.0.0','Comms & Documents',true,'{
   "id":"comms_documents","version":"1.0.0","requires":["organization_core"],
   "permissions":["org.comms.view","org.comms.broadcast","org.documents.view_any","org.documents.manage"],
-  "events":{"publishes":["AnnouncementPosted"],"consumes":[]},
+  "events":{"publishes":["AnnouncementPublished"],"consumes":[]},
   "entitlements":{"feature":"app.comms_documents"}
 }'),
 ('subscription_admin','1.0.0','Subscription Admin',true,'{

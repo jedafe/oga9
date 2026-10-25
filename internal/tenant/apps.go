@@ -10,6 +10,7 @@ import (
 	"errors"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/jedafe/oga9/internal/db"
 	"github.com/jedafe/oga9/internal/entitlements"
@@ -82,27 +83,32 @@ func (s *Service) OrgApps(ctx context.Context, oc *OrgCtx) ([]OrgApp, error) {
 // Re-activation is idempotent (upsert).
 func (s *Service) ActivateApp(ctx context.Context, oc *OrgCtx, ent *entitlements.Service, appID string) error {
 	row, err := s.q.GetApp(ctx, appID)
-	if err != nil {
+	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrAppNotFound
+	}
+	if err != nil {
+		return err
 	}
 	m := manifestOf(row.Manifest)
 	if m.Entitlements.Feature != "" && !ent.IsEnabled(ctx, oc.TenantID, m.Entitlements.Feature) {
 		return ErrNotEntitled
 	}
-	active, err := s.q.ListActiveApps(ctx, toPg(oc.TenantID))
-	if err != nil {
-		return err
-	}
-	activeSet := map[string]bool{}
-	for _, a := range active {
-		activeSet[a] = true
-	}
-	for _, req := range m.Requires {
-		if !activeSet[req] {
-			return ErrAppDepsMissing
-		}
-	}
 	return s.withTx(ctx, func(q *db.Queries) error {
+		// Dependency closure is re-checked inside the tx so a concurrent
+		// deactivate can't slip between check and upsert.
+		active, err := q.ListActiveApps(ctx, toPg(oc.TenantID))
+		if err != nil {
+			return err
+		}
+		activeSet := map[string]bool{}
+		for _, a := range active {
+			activeSet[a] = true
+		}
+		for _, req := range m.Requires {
+			if !activeSet[req] {
+				return ErrAppDepsMissing
+			}
+		}
 		if err := q.ActivateApp(ctx, db.ActivateAppParams{TenantID: toPg(oc.TenantID), AppID: appID}); err != nil {
 			return err
 		}
@@ -115,8 +121,11 @@ func (s *Service) ActivateApp(ctx context.Context, oc *OrgCtx, ent *entitlements
 // Deactivation disables functionality — records stay (Rule 26).
 func (s *Service) DeactivateApp(ctx context.Context, oc *OrgCtx, appID string) error {
 	row, err := s.q.GetApp(ctx, appID)
-	if err != nil {
+	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrAppNotFound
+	}
+	if err != nil {
+		return err
 	}
 	if row.MvpRequired {
 		return ErrAppRequired
@@ -125,8 +134,10 @@ func (s *Service) DeactivateApp(ctx context.Context, oc *OrgCtx, appID string) e
 	if err != nil {
 		return err
 	}
+	inSet := false
 	for _, other := range active {
 		if other == appID {
+			inSet = true
 			continue
 		}
 		otherRow, err := s.q.GetApp(ctx, other)
@@ -138,6 +149,9 @@ func (s *Service) DeactivateApp(ctx context.Context, oc *OrgCtx, appID string) e
 				return ErrAppHasDependents
 			}
 		}
+	}
+	if !inSet {
+		return nil // never installed or already deactivated — idempotent no-op, no event
 	}
 	return s.withTx(ctx, func(q *db.Queries) error {
 		if err := q.DeactivateApp(ctx, db.DeactivateAppParams{TenantID: toPg(oc.TenantID), AppID: appID}); err != nil {

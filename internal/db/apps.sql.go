@@ -61,6 +61,26 @@ func (q *Queries) GetApp(ctx context.Context, appID string) (GetAppRow, error) {
 	return i, err
 }
 
+const isAppActive = `-- name: IsAppActive :one
+SELECT EXISTS(
+  SELECT 1 FROM app_installations
+  WHERE tenant_id = $1::uuid AND app_id = $2
+    AND status = 'active'
+) AS active
+`
+
+type IsAppActiveParams struct {
+	TenantID pgtype.UUID `json:"tenant_id"`
+	AppID    string      `json:"app_id"`
+}
+
+func (q *Queries) IsAppActive(ctx context.Context, arg IsAppActiveParams) (bool, error) {
+	row := q.db.QueryRow(ctx, isAppActive, arg.TenantID, arg.AppID)
+	var active bool
+	err := row.Scan(&active)
+	return active, err
+}
+
 const listActiveApps = `-- name: ListActiveApps :many
 SELECT app_id FROM app_installations
 WHERE tenant_id = $1::uuid AND status = 'active'

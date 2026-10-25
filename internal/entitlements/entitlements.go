@@ -117,6 +117,12 @@ func (s *Service) resolve(ctx context.Context, tenantID uuid.UUID) (*Set, error)
 	planSlug := "starter" // floor for pre-Phase-07 tenants
 	if sub, err := s.q.GetSubscription(ctx, toPg(tenantID)); err == nil {
 		planSlug = sub.PlanSlug
+		switch sub.State {
+		case "restricted", "cancelled":
+			// Rule 28: lapsed/cancelled tenants drop to the free core —
+			// records stay reachable, paid capabilities stop resolving.
+			planSlug = "starter"
+		}
 	} else if err != pgx.ErrNoRows {
 		return nil, err
 	}

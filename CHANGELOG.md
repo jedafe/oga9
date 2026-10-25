@@ -5,6 +5,39 @@ entries reference engineering phases in `.oos/roadmaps/ROADMAP-BACKEND.md`.
 
 ## [Unreleased]
 
+### Fixed — Phase 07 deep review
+- Self-serve billing restricted to free/downgrade plan moves:
+  `POST /billing/subscription` + `change-plan` return `402 payment_required`
+  for paid plans/upgrades — upgrades land via provider checkout webhook or
+  §15 platform override, never a bare `plan_slug` write
+- Entitlement resolution honors subscription state (Rule 28):
+  `restricted`/`cancelled` tenants resolve the starter floor — records stay
+  reachable, paid capabilities stop resolving
+- `billing:subscription_state_sweep` now lapses `active` subscriptions whose
+  `current_period_end` passed without a provider event (→ `past_due`) — a
+  silent provider no longer means free-forever
+- `ProcessWebhook` marks `processed_at` inside the transition tx — a crash
+  can't re-apply `activate()` and double-extend the period
+- Webhook durability floor: the sweep re-drives `billing_webhook_events`
+  rows recorded >5min ago but never processed (enqueue-failure case)
+- Licenses are ed25519-signed (was symmetric HMAC) — self-hosted
+  deployments verify offline with only the public key; signatures cover the
+  canonical JSON so jsonb key-ordering can't break verification. Re-issuing
+  a `deployment_id` renews in place (upsert). Issue validates tenant +
+  future expiry → `404 tenant_not_found` / `400 invalid_expiry`
+- `subscriptions_one_open` partial unique index (000059) — one open
+  (non-cancelled) subscription per tenant; concurrent creates 409
+- Billing tenant resolution is node-based (`org.admin.billing`, Rule 20) —
+  delegated billing admins resolve without holding the org_admin role;
+  multi-tenant callers must pass `?tenant_id` (`400 tenant_required`)
+- `DeactivateApp` is idempotent — never-installed/inactive apps return
+  success without emitting phantom `AppDeactivated` events; `GetApp` errors
+  no longer masquerade as `app_not_found`
+- `middleware.RequireAppActive(svc, appID)` — the §06 "deactivation
+  disables" enforcement seam for module routes (lands with Phase 08+)
+- Migration fixes: 000058 grant restricted to the NULL-tenant role; 000051
+  manifest publishes `AnnouncementPublished` (catalogued name)
+
 ### Added — Phase 07 (App Framework & Entitlements, §06/§07)
 - Group-7 migrations (000050–000057): `app_registry` + 6 MVP app seeds with
   manifests (requires/permissions/events/entitlements), `app_installations`,
@@ -26,7 +59,7 @@ entries reference engineering phases in `.oos/roadmaps/ROADMAP-BACKEND.md`.
   time-based transitions; every transition emits `SubscriptionChanged`
   same-tx
 - Licenses (Rule 29): `POST /platform/licenses` issues signed license files
-  (HMAC-SHA256, `OGA9_LICENSE_SIGNING_KEY`); `POST /license/validate` is the
+  (ed25519, `OGA9_LICENSE_SIGNING_KEY`); `POST /license/validate` is the
   unauthenticated deployment callback verifying the signature
 - Billing webhook (Rule 9): `POST /webhooks/billing/{provider}` verifies
   HMAC-SHA256 (`X-Webhook-Signature`), durably records

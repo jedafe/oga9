@@ -112,6 +112,30 @@ func (q *Queries) GetLicenseByDeployment(ctx context.Context, deploymentID strin
 	return i, err
 }
 
+const getPlan = `-- name: GetPlan :one
+SELECT slug, price_monthly_minor, price_annual_minor, is_public
+FROM plans WHERE slug = $1
+`
+
+type GetPlanRow struct {
+	Slug              string      `json:"slug"`
+	PriceMonthlyMinor pgtype.Int8 `json:"price_monthly_minor"`
+	PriceAnnualMinor  pgtype.Int8 `json:"price_annual_minor"`
+	IsPublic          bool        `json:"is_public"`
+}
+
+func (q *Queries) GetPlan(ctx context.Context, slug string) (GetPlanRow, error) {
+	row := q.db.QueryRow(ctx, getPlan, slug)
+	var i GetPlanRow
+	err := row.Scan(
+		&i.Slug,
+		&i.PriceMonthlyMinor,
+		&i.PriceAnnualMinor,
+		&i.IsPublic,
+	)
+	return i, err
+}
+
 const getPlanCapabilities = `-- name: GetPlanCapabilities :many
 SELECT capability FROM plan_capabilities WHERE plan_slug = $1
 `
@@ -266,6 +290,10 @@ const insertLicense = `-- name: InsertLicense :one
 INSERT INTO licenses (tenant_id, deployment_id, edition, entitlements, expires_at, signature)
 VALUES ($1::uuid, $2, $3,
         $4::jsonb, $5, $6)
+ON CONFLICT (deployment_id) DO UPDATE SET
+  tenant_id = EXCLUDED.tenant_id, edition = EXCLUDED.edition,
+  entitlements = EXCLUDED.entitlements, expires_at = EXCLUDED.expires_at,
+  signature = EXCLUDED.signature, issued_at = now()
 RETURNING id
 `
 
@@ -278,6 +306,8 @@ type InsertLicenseParams struct {
 	Signature    []byte             `json:"signature"`
 }
 
+// Re-issue on the same deployment_id is a renewal: rotate the signed
+// material in place (UNIQUE deployment_id is one-license-per-deployment).
 func (q *Queries) InsertLicense(ctx context.Context, arg InsertLicenseParams) (pgtype.UUID, error) {
 	row := q.db.QueryRow(ctx, insertLicense,
 		arg.TenantID,
@@ -324,6 +354,7 @@ const listDueSubscriptions = `-- name: ListDueSubscriptions :many
 SELECT id, tenant_id, plan_slug, state FROM subscriptions
 WHERE (state = 'trial' AND trial_ends_at IS NOT NULL AND trial_ends_at < now())
    OR (state IN ('past_due','grace') AND grace_ends_at IS NOT NULL AND grace_ends_at < now())
+   OR (state = 'active' AND current_period_end IS NOT NULL AND current_period_end < now())
 `
 
 type ListDueSubscriptionsRow struct {
@@ -333,8 +364,10 @@ type ListDueSubscriptionsRow struct {
 	State    string      `json:"state"`
 }
 
-// Sweep set: trials past expiry, and past_due/grace rows past their grace
-// deadline — the state machine moves each one step per pass.
+// Sweep set: trials past expiry, past_due/grace rows past their grace
+// deadline, and active rows whose period lapsed without a provider event
+// (silent provider → lapse to past_due, never free-forever). The state
+// machine moves each one step per pass.
 func (q *Queries) ListDueSubscriptions(ctx context.Context) ([]ListDueSubscriptionsRow, error) {
 	rows, err := q.db.Query(ctx, listDueSubscriptions)
 	if err != nil {
@@ -396,6 +429,70 @@ func (q *Queries) ListPlans(ctx context.Context) ([]ListPlansRow, error) {
 			return nil, err
 		}
 		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listStaleWebhookEvents = `-- name: ListStaleWebhookEvents :many
+SELECT id FROM billing_webhook_events
+WHERE processed_at IS NULL AND created_at < now() - interval '5 minutes'
+ORDER BY created_at LIMIT 200
+`
+
+// Rule 9 durability floor: rows recorded but never processed because the
+// enqueue failed. The sweep re-drives them into billing:process_webhook.
+func (q *Queries) ListStaleWebhookEvents(ctx context.Context) ([]pgtype.UUID, error) {
+	rows, err := q.db.Query(ctx, listStaleWebhookEvents)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []pgtype.UUID
+	for rows.Next() {
+		var id pgtype.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listTenantsWithNode = `-- name: ListTenantsWithNode :many
+SELECT DISTINCT r.tenant_id FROM user_role_assignments ura
+JOIN user_roles r ON r.id = ura.role_id
+JOIN role_permissions rp ON rp.role_id = r.id
+WHERE ura.user_id = $1::uuid
+  AND r.tenant_id IS NOT NULL AND rp.permission = $2
+`
+
+type ListTenantsWithNodeParams struct {
+	UserID pgtype.UUID `json:"user_id"`
+	Node   string      `json:"node"`
+}
+
+// Billing-tenant resolution (Rule 24): tenants where the caller holds a
+// tenant-scoped role granting the permission node — the api-routes-catalog
+// gate for /billing/* is org.admin.billing, not a role name (Rule 20).
+func (q *Queries) ListTenantsWithNode(ctx context.Context, arg ListTenantsWithNodeParams) ([]pgtype.UUID, error) {
+	rows, err := q.db.Query(ctx, listTenantsWithNode, arg.UserID, arg.Node)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []pgtype.UUID
+	for rows.Next() {
+		var tenant_id pgtype.UUID
+		if err := rows.Scan(&tenant_id); err != nil {
+			return nil, err
+		}
+		items = append(items, tenant_id)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err

@@ -148,6 +148,30 @@ func (s *Service) AdminTenants(ctx context.Context, userID uuid.UUID) ([]uuid.UU
 	return out, nil
 }
 
+// TenantsWithNode returns the tenants where the caller holds a role granting
+// the permission node — the api-routes-catalog gate for /billing/* is the
+// org.admin.billing node, not a role name (Rule 20).
+func (s *Service) TenantsWithNode(ctx context.Context, userID uuid.UUID, node string) ([]uuid.UUID, error) {
+	rows, err := s.q.ListTenantsWithNode(ctx, db.ListTenantsWithNodeParams{
+		UserID: toPg(userID), Node: node,
+	})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]uuid.UUID, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, uuid.UUID(r.Bytes))
+	}
+	return out, nil
+}
+
+// IsAppActive reports whether appID is installed+active for the tenant —
+// the §06 "deactivation disables functionality" check consumed by
+// middleware.RequireAppActive on module routes.
+func (s *Service) IsAppActive(ctx context.Context, tenantID uuid.UUID, appID string) (bool, error) {
+	return s.q.IsAppActive(ctx, db.IsAppActiveParams{TenantID: toPg(tenantID), AppID: appID})
+}
+
 func (s *Service) HasTenantRole(ctx context.Context, userID, tenantID uuid.UUID, slug string) bool {
 	ok, err := s.q.HasRoleInTenant(ctx, db.HasRoleInTenantParams{
 		UserID: toPg(userID), TenantID: toPg(tenantID), Slug: slug,

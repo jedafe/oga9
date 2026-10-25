@@ -14,6 +14,13 @@ WHERE tenant_id = sqlc.arg(tenant_id)::uuid;
 SELECT app_id FROM app_installations
 WHERE tenant_id = sqlc.arg(tenant_id)::uuid AND status = 'active';
 
+-- name: IsAppActive :one
+SELECT EXISTS(
+  SELECT 1 FROM app_installations
+  WHERE tenant_id = sqlc.arg(tenant_id)::uuid AND app_id = sqlc.arg(app_id)
+    AND status = 'active'
+) AS active;
+
 -- name: ActivateApp :exec
 -- Re-activation is an upsert: clears the deactivated marker (idempotent —
 -- activating an active app is a no-op state-wise).

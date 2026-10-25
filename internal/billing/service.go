@@ -6,6 +6,7 @@ package billing
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
@@ -17,9 +18,9 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
-	valkey "github.com/valkey-io/valkey-go"
 
 	"github.com/jedafe/oga9/internal/db"
 	"github.com/jedafe/oga9/internal/events"
@@ -27,6 +28,7 @@ import (
 
 var (
 	ErrNoSubscription      = errors.New("subscription_not_found")
+	ErrSubscriptionExists  = errors.New("subscription_exists")
 	ErrPlanNotFound        = errors.New("plan_not_found")
 	ErrBadBillingTerm      = errors.New("invalid_billing_term")
 	ErrBadTransition       = errors.New("invalid_state_transition")
@@ -34,7 +36,13 @@ var (
 	ErrBadSignature        = errors.New("invalid_signature")
 	ErrLicenseNotFound     = errors.New("license_not_found")
 	ErrLicenseExpired      = errors.New("license_expired")
+	ErrBadExpiry           = errors.New("invalid_expiry")
+	ErrTenantNotFound      = errors.New("tenant_not_found")
 	ErrWebhookUnconfigured = errors.New("webhook_provider_not_configured")
+	// ErrPaymentRequired: self-serve billing covers the free plan and
+	// downgrades only — upgrades flow through the provider webhook or a
+	// platform override (§15), never a bare plan_slug write.
+	ErrPaymentRequired = errors.New("payment_required")
 )
 
 var billingTerms = map[string]bool{"monthly": true, "annual": true, "enterprise_contract": true}
@@ -42,12 +50,19 @@ var billingTerms = map[string]bool{"monthly": true, "annual": true, "enterprise_
 type Service struct {
 	pool          *pgxpool.Pool
 	q             *db.Queries
-	signKey       []byte // OGA9_LICENSE_SIGNING_KEY
-	webhookSecret []byte // OGA9_BILLING_WEBHOOK_SECRET
+	signKey       ed25519.PrivateKey // from OGA9_LICENSE_SIGNING_KEY seed
+	webhookSecret []byte             // OGA9_BILLING_WEBHOOK_SECRET
 }
 
-func NewService(pool *pgxpool.Pool, vk valkey.Client, signKey, webhookSecret []byte) *Service {
-	return &Service{pool: pool, q: db.New(pool), signKey: signKey, webhookSecret: webhookSecret}
+// NewService: signSeed is a 32-byte ed25519 seed (config.LicenseSignKey).
+// Self-hosted deployments hold only the public half — signed files verify
+// offline without embedding private material (Rule 29).
+func NewService(pool *pgxpool.Pool, signSeed, webhookSecret []byte) *Service {
+	var priv ed25519.PrivateKey
+	if len(signSeed) == ed25519.SeedSize {
+		priv = ed25519.NewKeyFromSeed(signSeed)
+	}
+	return &Service{pool: pool, q: db.New(pool), signKey: priv, webhookSecret: webhookSecret}
 }
 
 func toPg(u uuid.UUID) pgtype.UUID { return pgtype.UUID{Bytes: u, Valid: u != uuid.Nil} }
@@ -83,6 +98,11 @@ func (s *Service) settingInt(ctx context.Context, key string, fallback int64) in
 	return i
 }
 
+func isUniqueViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505"
+}
+
 // ---------- subscriptions ----------
 
 // ListPlans returns public plans for the plan-picker / platform views.
@@ -101,25 +121,54 @@ func (s *Service) GetSubscription(ctx context.Context, tenantID uuid.UUID) (*db.
 	return &sub, nil
 }
 
+// selfServePrice reports the plan's price for the billing term. ok=false
+// means the plan/term isn't self-serve priced (unlisted plan, NULL price,
+// or enterprise_contract) — those need a provider checkout or a platform
+// override, never a bare slug write.
+func selfServePrice(p db.GetPlanRow, term string) (int64, bool) {
+	if !p.IsPublic || term == "enterprise_contract" {
+		return 0, false
+	}
+	v := p.PriceMonthlyMinor
+	if term == "annual" {
+		v = p.PriceAnnualMinor
+	}
+	if !v.Valid {
+		return 0, false
+	}
+	return v.Int64, true
+}
+
 // CreateSubscription starts a plan on trial (billing.trial_days, Rule 3) —
 // used both at tenant provision and for POST /billing/subscription on a
-// tenant with no current subscription.
+// tenant with no current subscription. Self-serve is the free plan only;
+// paid plans need a provider checkout (payment_required).
 func (s *Service) CreateSubscription(ctx context.Context, tenantID uuid.UUID, plan, term, actorID string) (uuid.UUID, error) {
-	if ok, _ := s.q.PlanExists(ctx, plan); !ok {
+	p, err := s.q.GetPlan(ctx, plan)
+	if err == pgx.ErrNoRows {
 		return uuid.Nil, ErrPlanNotFound
+	}
+	if err != nil {
+		return uuid.Nil, err
 	}
 	if !billingTerms[term] {
 		return uuid.Nil, ErrBadBillingTerm
 	}
+	if price, ok := selfServePrice(p, term); !ok || price > 0 {
+		return uuid.Nil, ErrPaymentRequired
+	}
 	trialDays := s.settingInt(ctx, "billing.trial_days", 14)
 	trialEnd := time.Now().Add(time.Duration(trialDays) * 24 * time.Hour)
 	var id uuid.UUID
-	err := s.withTx(ctx, func(q *db.Queries) error {
+	err = s.withTx(ctx, func(q *db.Queries) error {
 		sid, err := q.CreateSubscription(ctx, db.CreateSubscriptionParams{
 			TenantID: toPg(tenantID), PlanSlug: plan, State: "trial",
 			BillingTerm: term, TrialEndsAt: pgTime(trialEnd),
 		})
 		if err != nil {
+			if isUniqueViolation(err) {
+				return ErrSubscriptionExists // subscriptions_one_open (000059)
+			}
 			return err
 		}
 		id = uuid.UUID(sid.Bytes)
@@ -166,21 +215,36 @@ func (s *Service) transition(ctx context.Context, q *db.Queries, sub *db.Subscri
 		map[string]any{"tenant_id": uuid.UUID(sub.TenantID.Bytes), "from": from, "to": to, "plan_slug": sub.PlanSlug})
 }
 
-// ChangePlan swaps the plan slug (proration is a §15 concern); emits
-// SubscriptionChanged with the plan change recorded.
+// ChangePlan swaps the plan slug. Self-serve is restricted to free or
+// strictly-cheaper plans (downgrade/sidegrade) — upgrades return
+// ErrPaymentRequired and land via provider webhook or §15 platform
+// override. Proration is a §15 concern.
 func (s *Service) ChangePlan(ctx context.Context, tenantID uuid.UUID, plan string, actor uuid.UUID) error {
 	sub, err := s.GetSubscription(ctx, tenantID)
 	if err != nil {
 		return err
 	}
-	if ok, _ := s.q.PlanExists(ctx, plan); !ok {
+	target, err := s.q.GetPlan(ctx, plan)
+	if err == pgx.ErrNoRows {
 		return ErrPlanNotFound
+	}
+	if err != nil {
+		return err
 	}
 	if sub.PlanSlug == plan {
 		return nil
 	}
 	if sub.State == "cancelled" {
 		return ErrBadTransition // cancelled subs can't change plan — resubscribe
+	}
+	cur, err := s.q.GetPlan(ctx, sub.PlanSlug)
+	if err != nil {
+		return err
+	}
+	targetPrice, targetOK := selfServePrice(target, sub.BillingTerm)
+	curPrice, curOK := selfServePrice(cur, sub.BillingTerm)
+	if !targetOK || (curOK && targetPrice > curPrice) {
+		return ErrPaymentRequired
 	}
 	return s.withTx(ctx, func(q *db.Queries) error {
 		if err := q.SetSubscriptionPlan(ctx, db.SetSubscriptionPlanParams{ID: sub.ID, PlanSlug: plan}); err != nil {
@@ -211,7 +275,7 @@ func (s *Service) Cancel(ctx context.Context, tenantID uuid.UUID, actor uuid.UUI
 // extends the period end.
 func (s *Service) activate(ctx context.Context, q *db.Queries, sub *db.Subscriptions) error {
 	period := 30 * 24 * time.Hour
-	if sub.BillingTerm == "annual" {
+	if sub.BillingTerm == "annual" || sub.BillingTerm == "enterprise_contract" {
 		period = 365 * 24 * time.Hour
 	}
 	if err := q.SetSubscriptionState(ctx, db.SetSubscriptionStateParams{
@@ -227,6 +291,7 @@ func (s *Service) activate(ctx context.Context, q *db.Queries, sub *db.Subscript
 // SweepStates drives the time-based lifecycle transitions (§07):
 //
 //	trial expired      → grace (fresh grace window from billing.grace_period_days)
+//	active period end  → past_due (silent provider must lapse, not free-ride)
 //	grace/past_due exp → restricted
 //
 // cancelled is manual-only (webhook or route). Emits SubscriptionChanged per
@@ -246,6 +311,8 @@ func (s *Service) SweepStates(ctx context.Context) error {
 		switch r.State {
 		case "trial":
 			to, graceEnd = "grace", time.Now().Add(time.Duration(graceDays)*24*time.Hour)
+		case "active":
+			to, graceEnd = "past_due", time.Now().Add(time.Duration(graceDays)*24*time.Hour)
 		case "past_due", "grace":
 			to = "restricted"
 		default:
@@ -263,22 +330,51 @@ func (s *Service) SweepStates(ctx context.Context) error {
 
 // ---------- licenses (self-hosted, Rule 29) ----------
 
-func (s *Service) licensePayload(deploymentID string, expiresAt time.Time, entitlements []byte) []byte {
-	return []byte(fmt.Sprintf("%s|%s|%s", deploymentID, expiresAt.UTC().Format(time.RFC3339), string(entitlements)))
+// canonicalJSON normalizes a JSON blob for signing — jsonb storage reorders
+// keys and rewrites whitespace, so signatures must cover the semantic form
+// (decode → re-encode with sorted keys), not the wire bytes.
+func canonicalJSON(b []byte) []byte {
+	var v any
+	if json.Unmarshal(b, &v) != nil {
+		return b
+	}
+	out, err := json.Marshal(v)
+	if err != nil {
+		return b
+	}
+	return out
 }
 
+func (s *Service) licensePayload(deploymentID string, expiresAt time.Time, entitlements []byte) []byte {
+	return []byte(fmt.Sprintf("%s|%s|%s", deploymentID, expiresAt.UTC().Format(time.RFC3339), string(canonicalJSON(entitlements))))
+}
+
+// sign produces an ed25519 signature — asymmetric so deployments verify
+// offline against the public key without holding private material.
 func (s *Service) sign(payload []byte) []byte {
-	m := hmac.New(sha256.New, s.signKey)
-	m.Write(payload)
-	return m.Sum(nil)
+	if s.signKey == nil {
+		return nil
+	}
+	return ed25519.Sign(s.signKey, payload)
 }
 
 // IssueLicense signs + stores a self-hosted license (control-plane action,
-// platform.licenses.issue). Offline operation: deployments validate the
-// signed file locally (Rule 29).
+// platform.licenses.issue). Re-issuing a deployment_id renews in place.
+// Offline operation: deployments validate the signed file locally (Rule 29).
 func (s *Service) IssueLicense(ctx context.Context, tenantID uuid.UUID, deploymentID, edition string, entitlements json.RawMessage, expiresAt time.Time, actor uuid.UUID) (uuid.UUID, error) {
 	if !json.Valid(entitlements) {
 		return uuid.Nil, errors.New("invalid_entitlements")
+	}
+	if !expiresAt.After(time.Now()) {
+		return uuid.Nil, ErrBadExpiry
+	}
+	if s.signKey == nil {
+		return uuid.Nil, errors.New("license_signing_unconfigured")
+	}
+	if _, err := s.q.GetTenant(ctx, toPg(tenantID)); err == pgx.ErrNoRows {
+		return uuid.Nil, ErrTenantNotFound
+	} else if err != nil {
+		return uuid.Nil, err
 	}
 	sig := s.sign(s.licensePayload(deploymentID, expiresAt, entitlements))
 	var id uuid.UUID
@@ -312,9 +408,9 @@ func (s *Service) ValidateLicense(ctx context.Context, deploymentID string, sign
 	if time.Now().After(row.ExpiresAt.Time) {
 		return nil, ErrLicenseExpired
 	}
-	want := s.sign(s.licensePayload(deploymentID, row.ExpiresAt.Time, row.Entitlements))
 	got, err := hex.DecodeString(signatureHex)
-	if err != nil || !hmac.Equal(got, want) {
+	if err != nil || s.signKey == nil ||
+		!ed25519.Verify(s.signKey.Public().(ed25519.PublicKey), s.licensePayload(deploymentID, row.ExpiresAt.Time, row.Entitlements), got) {
 		return nil, ErrBadSignature
 	}
 	return row.Entitlements, nil
@@ -357,7 +453,9 @@ func (s *Service) RecordWebhook(ctx context.Context, provider string, body, sign
 }
 
 // ProcessWebhook is the billing:process_webhook worker — idempotent:
-// already-processed events skip; unknown types are acknowledged.
+// already-processed events skip; unknown types are acknowledged. The
+// transition and processed_at mark commit atomically so a crash can't
+// re-apply a transition (e.g. double-extending current_period_end).
 func (s *Service) ProcessWebhook(ctx context.Context, rawEventID uuid.UUID) error {
 	ev, err := s.q.GetWebhookEvent(ctx, toPg(rawEventID))
 	if err != nil {
@@ -378,7 +476,7 @@ func (s *Service) ProcessWebhook(ctx context.Context, rawEventID uuid.UUID) erro
 	if err != nil {
 		return s.markProcessed(ctx, rawEventID)
 	}
-	err = s.withTx(ctx, func(q *db.Queries) error {
+	return s.withTx(ctx, func(q *db.Queries) error {
 		switch ev.EventType {
 		case "invoice.paid", "payment.succeeded", "checkout.completed":
 			if err := s.activate(ctx, q, sub); err != nil {
@@ -394,12 +492,23 @@ func (s *Service) ProcessWebhook(ctx context.Context, rawEventID uuid.UUID) erro
 				return err
 			}
 		}
-		return nil
-	})
-	if err != nil {
+		_, err := q.MarkWebhookProcessed(ctx, toPg(rawEventID))
 		return err
+	})
+}
+
+// StaleWebhookEvents lists durable rows that recorded but never processed —
+// the enqueue died after insert. The sweep re-drives them (Rule 9).
+func (s *Service) StaleWebhookEvents(ctx context.Context) ([]uuid.UUID, error) {
+	rows, err := s.q.ListStaleWebhookEvents(ctx)
+	if err != nil {
+		return nil, err
 	}
-	return s.markProcessed(ctx, rawEventID)
+	out := make([]uuid.UUID, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, uuid.UUID(r.Bytes))
+	}
+	return out, nil
 }
 
 func (s *Service) markProcessed(ctx context.Context, rawEventID uuid.UUID) error {
