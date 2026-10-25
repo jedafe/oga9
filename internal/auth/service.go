@@ -25,6 +25,7 @@ import (
 	valkey "github.com/valkey-io/valkey-go"
 
 	"github.com/jedafe/oga9/internal/db"
+	"github.com/jedafe/oga9/internal/events"
 )
 
 var (
@@ -107,28 +108,6 @@ func ValidatePassword(pw string) error {
 	return nil
 }
 
-// emit appends to the domain-event outbox via the tx-scoped query handle
-// (§05). Rule 12 + error-handling-go: the event lands in the SAME transaction
-// as the state mutation and an append failure aborts the mutation — callers
-// must propagate the returned error, never swallow it. Identity events are
-// platform-scoped: tenant_id/organization_id stay NULL. `sourced` marks
-// ADR-004 replayable events per the domain-events catalog.
-func emit(ctx context.Context, q *db.Queries, name, aggType string, aggID, actorID uuid.UUID, sourced bool, payload map[string]any) error {
-	if payload == nil {
-		payload = map[string]any{}
-	}
-	payload["actor_id"] = actorID
-	payload["aggregate_id"] = aggID
-	b, err := json.Marshal(payload)
-	if err != nil {
-		return err
-	}
-	return q.EmitDomainEvent(ctx, db.EmitDomainEventParams{
-		EventType: name, AggregateType: aggType, AggregateID: toPg(aggID),
-		ActorID: toPg(actorID), Payload: b, Sourced: sourced,
-	})
-}
-
 func (s *Service) withTx(ctx context.Context, fn func(*db.Queries) error) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -176,7 +155,7 @@ func (s *Service) Register(ctx context.Context, email, password, displayName str
 			return e
 		}
 		row = r
-		return emit(ctx, q, "UserRegistered", "user", fromPg(r.ID), fromPg(r.ID), false,
+		return events.Emit(ctx, q, uuid.Nil, uuid.Nil, "UserRegistered", "user", fromPg(r.ID), fromPg(r.ID), false,
 			map[string]any{"user_id": fromPg(r.ID), "email": r.Email})
 	})
 	if err != nil {
@@ -269,7 +248,7 @@ func (s *Service) createSession(ctx context.Context, userID uuid.UUID, deviceLab
 			return e
 		}
 		sessID = id
-		return emit(ctx, q, "UserLoggedIn", "user", userID, userID, false,
+		return events.Emit(ctx, q, uuid.Nil, uuid.Nil, "UserLoggedIn", "user", userID, userID, false,
 			map[string]any{"user_id": userID, "provider": provider})
 	})
 	if err != nil {
@@ -296,7 +275,7 @@ func (s *Service) Logout(ctx context.Context, jti uuid.UUID) error {
 			}
 			return err
 		}
-		return emit(ctx, q, "SessionRevoked", "session", fromPg(row.ID), fromPg(row.UserID), false,
+		return events.Emit(ctx, q, uuid.Nil, uuid.Nil, "SessionRevoked", "session", fromPg(row.ID), fromPg(row.UserID), false,
 			map[string]any{"session_id": fromPg(row.ID), "reason": "logout"})
 	})
 	if err == nil {
@@ -306,11 +285,12 @@ func (s *Service) Logout(ctx context.Context, jti uuid.UUID) error {
 }
 
 // denySession marks a jti on the revoked-session denylist
-// (oga9:auth:deny:{jti}, 24h — covers the default session TTL). The DB row
-// stays the source of truth; this is the §02 denylist fast path so revoked
-// tokens skip the join entirely.
+// (oga9:auth:deny:{jti}; TTL tracks OGA9_SESSION_TTL so the marker always
+// outlives the token it suppresses). The DB row stays the source of truth;
+// this is the §02 denylist fast path so revoked tokens skip the join.
 func (s *Service) denySession(ctx context.Context, jti uuid.UUID) {
-	_ = s.vk.Do(ctx, s.vk.B().Set().Key("oga9:auth:deny:"+jti.String()).Value("1").ExSeconds(86400).Build()).Error()
+	ttl := max(int64(s.tokenTTL.Seconds()), 60)
+	_ = s.vk.Do(ctx, s.vk.B().Set().Key("oga9:auth:deny:"+jti.String()).Value("1").ExSeconds(ttl).Build()).Error()
 }
 
 // ResolveSession maps a JWT jti → userID, enforcing revocation + expiry +
@@ -367,7 +347,7 @@ func (s *Service) VerifyEmail(ctx context.Context, token string) error {
 		if err := q.SetUserVerified(ctx, toPg(uid)); err != nil {
 			return err
 		}
-		return emit(ctx, q, "IdentityVerified", "user", uid, uid, true,
+		return events.Emit(ctx, q, uuid.Nil, uuid.Nil, "IdentityVerified", "user", uid, uid, true,
 			map[string]any{"user_id": uid, "method": "email_link"})
 	})
 	if err != nil {
@@ -421,7 +401,7 @@ func (s *Service) ResetPassword(ctx context.Context, token, newPassword string) 
 			return err
 		}
 		revokedJTIs = jtis
-		return emit(ctx, q, "PasswordChanged", "user", uid, uid, false,
+		return events.Emit(ctx, q, uuid.Nil, uuid.Nil, "PasswordChanged", "user", uid, uid, false,
 			map[string]any{"user_id": uid, "via": "reset_link"})
 	})
 	if err != nil {
@@ -575,7 +555,7 @@ func (s *Service) SetupMFA(ctx context.Context, userID uuid.UUID, secret string)
 		if e := q.SetRecoveryCodes(ctx, db.SetRecoveryCodesParams{MfaRecoveryCodes: b, ID: toPg(userID)}); e != nil {
 			return e
 		}
-		return emit(ctx, q, "MFAEnabled", "user", userID, userID, false, map[string]any{"user_id": userID})
+		return events.Emit(ctx, q, uuid.Nil, uuid.Nil, "MFAEnabled", "user", userID, userID, false, map[string]any{"user_id": userID})
 	})
 	return codes, err
 }
@@ -629,7 +609,7 @@ func (s *Service) DisableMFA(ctx context.Context, userID uuid.UUID, password, co
 		if err := q.SetRecoveryCodes(ctx, db.SetRecoveryCodesParams{MfaRecoveryCodes: []byte("[]"), ID: toPg(userID)}); err != nil {
 			return err
 		}
-		return emit(ctx, q, "MFADisabled", "user", userID, userID, false, map[string]any{"user_id": userID})
+		return events.Emit(ctx, q, uuid.Nil, uuid.Nil, "MFADisabled", "user", userID, userID, false, map[string]any{"user_id": userID})
 	})
 }
 
@@ -685,7 +665,7 @@ func (s *Service) RevokeSession(ctx context.Context, userID, sessionID uuid.UUID
 		}
 		jti = j
 		revoked = true
-		return emit(ctx, q, "SessionRevoked", "session", sessionID, userID, false,
+		return events.Emit(ctx, q, uuid.Nil, uuid.Nil, "SessionRevoked", "session", sessionID, userID, false,
 			map[string]any{"session_id": sessionID, "reason": "revoked_by_user"})
 	})
 	if revoked {

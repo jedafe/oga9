@@ -27,6 +27,7 @@ type Querier interface {
 	// Atomic single-use burn: removes the hash and returns the row in one
 	// statement — concurrent logins can't both consume the same code.
 	ConsumeRecoveryCode(ctx context.Context, arg ConsumeRecoveryCodeParams) (pgtype.UUID, error)
+	ConsumerLogged(ctx context.Context, arg ConsumerLoggedParams) (bool, error)
 	// Active seat occupancy for a position within a term (seats cap, §03).
 	CountPositionSeats(ctx context.Context, arg CountPositionSeatsParams) (int64, error)
 	CountTenantOrgs(ctx context.Context, tenantID pgtype.UUID) (int64, error)
@@ -48,6 +49,9 @@ type Querier interface {
 	// Ref: oga9-engineering/sections/02-identity-authentication-sessions.md
 	// sqlc queries for users, sessions, oauth links (Phase 02).
 	CreateUser(ctx context.Context, arg CreateUserParams) (CreateUserRow, error)
+	// Attempt cap reached: pull the event out of the pending set and record the
+	// terminal error. `events:retry_dead` (Phase 06) can reset dispatched_at.
+	DeadLetterEvent(ctx context.Context, arg DeadLetterEventParams) error
 	// Ref: oga9-engineering/sections/05-domain-events-infrastructure.md
 	// Outbox + audit queries (Phase 02 emission, Phase 05 dispatch).
 	EmitDomainEvent(ctx context.Context, arg EmitDomainEventParams) error
@@ -55,6 +59,8 @@ type Querier interface {
 	// Ends every open appointment of the term; RETURNING rows feed
 	// AppointmentEnded events + permission-cache invalidation.
 	EndTermAppointments(ctx context.Context, termID pgtype.UUID) ([]EndTermAppointmentsRow, error)
+	// Outbox claim set: undelivered events under the attempt cap, oldest first.
+	FetchPendingEvents(ctx context.Context, arg FetchPendingEventsParams) ([]FetchPendingEventsRow, error)
 	GetBranding(ctx context.Context, organizationID pgtype.UUID) (GetBrandingRow, error)
 	GetInvitationByToken(ctx context.Context, token pgtype.UUID) (GetInvitationByTokenRow, error)
 	GetMFASecret(ctx context.Context, id pgtype.UUID) ([]byte, error)
@@ -81,6 +87,7 @@ type Querier interface {
 	HasPermission(ctx context.Context, arg HasPermissionParams) (bool, error)
 	HasRoleInTenant(ctx context.Context, arg HasRoleInTenantParams) (bool, error)
 	InsertAuditEvent(ctx context.Context, arg InsertAuditEventParams) error
+	LinkEntities(ctx context.Context, arg LinkEntitiesParams) error
 	LinkOAuthProvider(ctx context.Context, arg LinkOAuthProviderParams) error
 	// Tenants where the caller holds the org_admin role — the server-side
 	// "my tenant" resolution for POST /orgs (Rule 24).
@@ -92,6 +99,14 @@ type Querier interface {
 	ListUnits(ctx context.Context, organizationID pgtype.UUID) ([]ListUnitsRow, error)
 	ListUserOrgs(ctx context.Context, userID pgtype.UUID) ([]ListUserOrgsRow, error)
 	ListUserSessions(ctx context.Context, userID pgtype.UUID) ([]ListUserSessionsRow, error)
+	// Inserted in the SAME tx as the consumer's own writes (§05 contract).
+	LogConsumerProcessed(ctx context.Context, arg LogConsumerProcessedParams) error
+	MarkEventDispatched(ctx context.Context, id pgtype.UUID) error
+	// Failed consumer pass — stays pending, retried on the next dispatch tick.
+	RecordEventAttempt(ctx context.Context, arg RecordEventAttemptParams) error
+	// ADR-015 "related" helper: bidirectional traversal of entity_links from a
+	// (type,id) seed, depth-capped to keep the walk bounded.
+	RelatedEntities(ctx context.Context, arg RelatedEntitiesParams) ([]RelatedEntitiesRow, error)
 	RemoveCommitteeMember(ctx context.Context, arg RemoveCommitteeMemberParams) (pgtype.UUID, error)
 	// Ref: oga9-engineering/sections/03-rbac-positions.md (Phase 04)
 	// RBAC + positions: permission resolution (group+direct+position+scope union),
@@ -114,6 +129,9 @@ type Querier interface {
 	SetTenantOwnerOrg(ctx context.Context, arg SetTenantOwnerOrgParams) error
 	SetUserVerified(ctx context.Context, id pgtype.UUID) error
 	UnitHasActiveChildren(ctx context.Context, parentUnitID pgtype.UUID) (bool, error)
+	// §10 archive guard: a unit still holding committee members or open
+	// officer appointments scoped to it counts as having dependents.
+	UnitHasActiveMembers(ctx context.Context, orgUnitID pgtype.UUID) (bool, error)
 	UpdateOrgProfile(ctx context.Context, arg UpdateOrgProfileParams) (pgtype.UUID, error)
 	UpdateUnit(ctx context.Context, arg UpdateUnitParams) (pgtype.UUID, error)
 	UpdateUserPassword(ctx context.Context, arg UpdateUserPasswordParams) error

@@ -920,6 +920,25 @@ func (q *Queries) UnitHasActiveChildren(ctx context.Context, parentUnitID pgtype
 	return has_children, err
 }
 
+const unitHasActiveMembers = `-- name: UnitHasActiveMembers :one
+SELECT EXISTS (
+  SELECT 1 FROM committee_memberships WHERE org_unit_id = $1
+  UNION ALL
+  SELECT 1 FROM officer_appointments
+  WHERE (branch_id = $1 OR committee_id = $1)
+    AND (ends_at IS NULL OR ends_at >= CURRENT_DATE)
+) AS has_members
+`
+
+// §10 archive guard: a unit still holding committee members or open
+// officer appointments scoped to it counts as having dependents.
+func (q *Queries) UnitHasActiveMembers(ctx context.Context, orgUnitID pgtype.UUID) (bool, error) {
+	row := q.db.QueryRow(ctx, unitHasActiveMembers, orgUnitID)
+	var has_members bool
+	err := row.Scan(&has_members)
+	return has_members, err
+}
+
 const updateOrgProfile = `-- name: UpdateOrgProfile :one
 UPDATE organizations SET name = $1, country_code = $2,
        city = $3, is_public_listed = $4

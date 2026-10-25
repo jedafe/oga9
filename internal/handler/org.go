@@ -49,7 +49,13 @@ func orgErr(w http.ResponseWriter, err error) {
 	case errors.Is(err, tenant.ErrUnknownSetting):
 		httpx.WriteErr(w, 400, "unknown_setting_key", "key not in the settings catalog")
 	case errors.Is(err, tenant.ErrBadValue):
-		httpx.WriteErr(w, 400, "validation_failed", "value must be valid json")
+		httpx.WriteErr(w, 400, "validation_failed", "invalid request value")
+	case errors.Is(err, tenant.ErrBadBillingEmail):
+		httpx.WriteErr(w, 400, "invalid_billing_email", "billing_email must be a valid address")
+	case errors.Is(err, tenant.ErrBadScopeUnit):
+		httpx.WriteErr(w, 400, "invalid_scope_unit", "committee_id must reference a committee unit; branch_id a structural unit")
+	case errors.Is(err, tenant.ErrDuplicateMember):
+		httpx.WriteErr(w, 409, "member_already_seated", "member is already in this committee")
 	case errors.Is(err, tenant.ErrInviteNoContact):
 		httpx.WriteErr(w, 400, "validation_failed", "email or phone required")
 	case errors.Is(err, tenant.ErrInviteNotFound):
@@ -118,8 +124,10 @@ func (h *OrgHandler) Get(w http.ResponseWriter, r *http.Request) {
 
 func (h *OrgHandler) Patch(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Name, Country, City string
-		IsPublicListed      bool `json:"is_public_listed"`
+		Name           string `json:"name"`
+		Country        string `json:"country"`
+		City           string `json:"city"`
+		IsPublicListed bool   `json:"is_public_listed"`
 	}
 	if err := httpx.Decode(w, r, &req); err != nil || req.Name == "" {
 		httpx.WriteErr(w, 400, "validation_failed", "name required")
@@ -349,14 +357,18 @@ func parseDate(s string) (time.Time, bool) {
 
 func (h *OrgHandler) CreateTerm(w http.ResponseWriter, r *http.Request) {
 	var req termReq
-	sa, ok1 := parseDate(req.StartsAt)
-	ea, ok2 := parseDate(req.EndsAt)
 	if err := httpx.Decode(w, r, &req); err != nil || req.Label == "" {
 		httpx.WriteErr(w, 400, "validation_failed", "label required")
 		return
 	}
+	sa, ok1 := parseDate(req.StartsAt)
+	ea, ok2 := parseDate(req.EndsAt)
 	if !ok1 || !ok2 {
 		httpx.WriteErr(w, 400, "validation_failed", "starts_at/ends_at must be YYYY-MM-DD")
+		return
+	}
+	if !ea.After(sa) {
+		httpx.WriteErr(w, 400, "validation_failed", "ends_at must be after starts_at")
 		return
 	}
 	id, err := h.svc.CreateTerm(r.Context(), middleware.OrgCtx(r.Context()), req.Label, sa, ea, req.Current)
@@ -368,7 +380,11 @@ func (h *OrgHandler) CreateTerm(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *OrgHandler) CloseTerm(w http.ResponseWriter, r *http.Request) {
-	termID, _ := uuid.Parse(chi.URLParam(r, "term_id"))
+	termID, err := uuid.Parse(chi.URLParam(r, "term_id"))
+	if err != nil {
+		httpx.WriteErr(w, 400, "validation_failed", "bad term id")
+		return
+	}
 	if err := h.svc.CloseTerm(r.Context(), middleware.OrgCtx(r.Context()), termID); err != nil {
 		orgErr(w, err)
 		return
@@ -387,13 +403,17 @@ type appointReq struct {
 
 func (h *OrgHandler) Appoint(w http.ResponseWriter, r *http.Request) {
 	var req appointReq
-	sa, _ := parseDate(req.StartsAt)
 	if err := httpx.Decode(w, r, &req); err != nil || req.TermID == uuid.Nil || req.PositionID == uuid.Nil || req.MemberID == uuid.Nil {
 		httpx.WriteErr(w, 400, "validation_failed", "term_id, position_id and member_id required")
 		return
 	}
-	if sa.IsZero() {
-		sa = time.Now()
+	sa := time.Now()
+	if req.StartsAt != "" {
+		var ok bool
+		if sa, ok = parseDate(req.StartsAt); !ok {
+			httpx.WriteErr(w, 400, "validation_failed", "starts_at must be YYYY-MM-DD")
+			return
+		}
 	}
 	id, err := h.svc.AppointOfficer(r.Context(), middleware.OrgCtx(r.Context()),
 		req.TermID, req.PositionID, req.MemberID, req.BranchID, req.CommitteeID, sa)
@@ -405,7 +425,11 @@ func (h *OrgHandler) Appoint(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *OrgHandler) EndAppointment(w http.ResponseWriter, r *http.Request) {
-	apptID, _ := uuid.Parse(chi.URLParam(r, "appointment_id"))
+	apptID, err := uuid.Parse(chi.URLParam(r, "appointment_id"))
+	if err != nil {
+		httpx.WriteErr(w, 400, "validation_failed", "bad appointment id")
+		return
+	}
 	if err := h.svc.EndAppointment(r.Context(), middleware.OrgCtx(r.Context()), apptID); err != nil {
 		orgErr(w, err)
 		return
@@ -420,7 +444,11 @@ type committeeMemberReq struct {
 
 func (h *OrgHandler) AddCommitteeMember(w http.ResponseWriter, r *http.Request) {
 	var req committeeMemberReq
-	unitID, _ := uuid.Parse(chi.URLParam(r, "unit_id"))
+	unitID, err := uuid.Parse(chi.URLParam(r, "unit_id"))
+	if err != nil {
+		httpx.WriteErr(w, 400, "validation_failed", "bad unit id")
+		return
+	}
 	if err := httpx.Decode(w, r, &req); err != nil || req.MemberID == uuid.Nil {
 		httpx.WriteErr(w, 400, "validation_failed", "member_id required")
 		return
@@ -436,7 +464,11 @@ func (h *OrgHandler) AddCommitteeMember(w http.ResponseWriter, r *http.Request) 
 }
 
 func (h *OrgHandler) RemoveCommitteeMember(w http.ResponseWriter, r *http.Request) {
-	cmID, _ := uuid.Parse(chi.URLParam(r, "cm_id"))
+	cmID, err := uuid.Parse(chi.URLParam(r, "cm_id"))
+	if err != nil {
+		httpx.WriteErr(w, 400, "validation_failed", "bad committee member id")
+		return
+	}
 	if err := h.svc.RemoveCommitteeMember(r.Context(), middleware.OrgCtx(r.Context()), cmID); err != nil {
 		orgErr(w, err)
 		return

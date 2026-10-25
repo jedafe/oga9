@@ -5,6 +5,24 @@ entries reference engineering phases in `.oos/roadmaps/ROADMAP-BACKEND.md`.
 
 ## [Unreleased]
 
+### Added — Phase 05 (Domain Events Infrastructure)
+- Group-6 migrations: `event_consumer_log` (consumer,event PK — Rule 27
+  idempotency ledger) + `entity_links` (ADR-015 graph edges)
+- `internal/events`: consolidated `Emit` (single outbox writer — replaces
+  the duplicated emit helpers in auth+tenant; uuid.Nil scope → NULL for
+  platform events), `Event`/`Consumer` types, `Dispatcher`
+- `events:dispatch_outbox` critical-tier task on the Asynq scheduler
+  (`OGA9_OUTBOX_DISPATCH_INTERVAL`, default 10s): `oga9:outbox:lock` SET NX
+  EX 60s lease → batch-claims pending events (50, `attempts < 8`) → fans out
+  to registered consumers; consumer writes + `event_consumer_log` insert in
+  one tx → `dispatched_at`; per-event failures record `attempts`/`last_error`
+  and dead-letter at the cap (`events:retry_dead` resets, Phase 06)
+- `entity_links` consumer: derives organization→tenant `belongs_to`,
+  unit→org `child_of`, appointment→position `holds` + →term `during` edges
+- `RelatedEntities` recursive-CTE helper — bidirectional depth-capped walk
+- End-to-end smoke test: in-tx emit → leased claim → edge written →
+  dispatched → replay dedupes (consumer_log)
+
 ### Added — Phase 04 (RBAC & Positions)
 - Group-5 migrations: org_positions, position_permissions, terms
   (+`one_current_term` partial index), officer_appointments,
@@ -157,3 +175,36 @@ entries reference engineering phases in `.oos/roadmaps/ROADMAP-BACKEND.md`.
   optional `tenant_id` verified against admin rights (`no_administered_tenant`
   403), ambiguous multi-tenant callers get `tenant_required` 400;
   `limit.organizations` intentionally unenforced until Phase 07 entitlements
+- `org.governance.terms.manage` missing from permission seed → terms routes
+  permanently 403; node added to 000018 (org_admin roles pick it up via the
+  `org.%` grant), catch-up applied to migrated DBs (spec §16/catalog)
+- `CreateTerm`/`Appoint` parsed `starts_at`/`ends_at` BEFORE body decode →
+  terms always 400ed, appointment `starts_at` silently ignored; decode now
+  precedes parsing; `ends_at > starts_at` validated
+- `CloseTerm` (explicit close) emitted no `TermClosed` event — only the
+  auto-close path in `CreateTerm` did; both now emit
+- `TenantProvisioned` never emitted when `POST /orgs` provisions a tenant —
+  catalogued (sourced) event now fires in the provision tx (plan_slug null
+  until Phase 07)
+- Permission resolver missed the §03 group-roles union term —
+  `organization_memberships.user_group_id → user_roles → role_permissions`
+  now resolves into `oga9:perm` sets
+- `ArchiveUnit` only blocked on child units — §10 requires blocking on
+  active members too; `committee_memberships` + open scoped appointments
+  now count as dependents (`unit_has_dependents`)
+- `officer_appointments` scope columns accepted any same-org unit —
+  `committee_id` must now be a `committee` unit, `branch_id` a structural
+  unit (`invalid_scope_unit` 400)
+- `committee_memberships` had no uniqueness → duplicate seats possible;
+  `UNIQUE(organization_id, org_unit_id, member_id)` added (spec §03 + live DB)
+- `CreateOrg` bad `billing_email`/slug mapped to "value must be valid json"
+  → dedicated `invalid_billing_email` 400; `ErrBadValue` message generalized
+- `uuid.Parse` failures on term/appointment/committee route params silently
+  became 404s → now honest 400s
+- Session denylist TTL hardcoded 24h → tracks `OGA9_SESSION_TTL`
+- Action tokens embedded `|` in URL path (mail-link fragile) → `~` separator
+- Event payloads lacked `aggregate_type`/`occurred_at` required by the
+  domain-events catalog → injected by both emit helpers; nil-able
+  tenant/org scope now maps uuid.Nil → NULL (platform events)
+- Sentry/GlitchTip initialized but never captured → `sentryhttp` middleware
+  wired (Repanic defers to chi Recoverer for the 500 envelope)

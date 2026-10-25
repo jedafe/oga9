@@ -24,6 +24,7 @@ INSERT INTO permissions (node, label) VALUES
 ('org.voice.start','Start voice room'),('org.voice.join','Join voice room'),
 ('org.fields.manage','Manage custom fields'),('org.listing.manage','Manage directory listing'),
 ('org.governance.view','View governance'),('org.governance.positions.manage','Manage positions'),('org.governance.positions.assign','Assign positions'),
+('org.governance.terms.manage','Manage terms'),
 ('org.governance.appointments.manage','Manage appointments'),('org.governance.committees.manage','Manage committees'),
 ('org.governance.resolutions.record','Record resolutions'),('org.governance.constitution.manage','Manage constitution'),
 ('org.welfare.request_own','Request welfare'),('org.welfare.view_any','View welfare'),

@@ -129,6 +129,17 @@ RETURNING id;
 -- name: UnitHasActiveChildren :one
 SELECT EXISTS (SELECT 1 FROM org_units WHERE parent_unit_id = $1 AND archived_at IS NULL) AS has_children;
 
+-- name: UnitHasActiveMembers :one
+-- §10 archive guard: a unit still holding committee members or open
+-- officer appointments scoped to it counts as having dependents.
+SELECT EXISTS (
+  SELECT 1 FROM committee_memberships WHERE org_unit_id = $1
+  UNION ALL
+  SELECT 1 FROM officer_appointments
+  WHERE (branch_id = $1 OR committee_id = $1)
+    AND (ends_at IS NULL OR ends_at >= CURRENT_DATE)
+) AS has_members;
+
 -- name: ArchiveUnit :one
 UPDATE org_units SET archived_at = now() WHERE id = $1 AND archived_at IS NULL
 RETURNING id;

@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/mail"
 	"strings"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jedafe/oga9/internal/db"
+	"github.com/jedafe/oga9/internal/events"
 )
 
 var ErrBadValue = errors.New("invalid json value")
@@ -109,8 +111,8 @@ func (s *Service) CreateUnit(ctx context.Context, oc *OrgCtx, parentID uuid.UUID
 			return err
 		}
 		id = r
-		return emit(ctx, q, oc.TenantID, oc.OrgID, "OrgUnitCreated", "org_unit", fromPg(r), oc.UserID, true,
-			map[string]any{"unit_id": fromPg(r), "org_id": oc.OrgID, "type": typ})
+		return events.Emit(ctx, q, oc.TenantID, oc.OrgID, "OrgUnitCreated", "org_unit", fromPg(r), oc.UserID, true,
+			map[string]any{"unit_id": fromPg(r), "org_id": oc.OrgID, "organization_id": oc.OrgID, "type": typ})
 	})
 	return fromPg(id), err
 }
@@ -162,12 +164,14 @@ func (s *Service) UpdateUnit(ctx context.Context, oc *OrgCtx, unitID, parentID u
 		}); err != nil {
 			return err
 		}
-		return emit(ctx, q, oc.TenantID, oc.OrgID, "OrgUnitUpdated", "org_unit", unitID, oc.UserID, true,
-			map[string]any{"unit_id": unitID, "org_id": oc.OrgID})
+		return events.Emit(ctx, q, oc.TenantID, oc.OrgID, "OrgUnitUpdated", "org_unit", unitID, oc.UserID, true,
+			map[string]any{"unit_id": unitID, "org_id": oc.OrgID, "organization_id": oc.OrgID})
 	})
 }
 
-// ArchiveUnit soft-archives (§10: blocked while children exist).
+// ArchiveUnit soft-archives (§10: blocked while child units OR member
+// references exist — committee memberships and open appointments scoped
+// to the unit count as dependents).
 func (s *Service) ArchiveUnit(ctx context.Context, oc *OrgCtx, unitID uuid.UUID) error {
 	u, err := s.q.GetUnit(ctx, toPg(unitID))
 	if err != nil {
@@ -179,15 +183,22 @@ func (s *Service) ArchiveUnit(ctx context.Context, oc *OrgCtx, unitID uuid.UUID)
 	if fromPg(u.OrganizationID) != oc.OrgID {
 		return ErrUnitNotFound
 	}
-	if has, _ := s.q.UnitHasActiveChildren(ctx, toPg(unitID)); has {
+	if has, err := s.q.UnitHasActiveChildren(ctx, toPg(unitID)); err != nil {
+		return err
+	} else if has {
+		return ErrUnitDependents
+	}
+	if has, err := s.q.UnitHasActiveMembers(ctx, toPg(unitID)); err != nil {
+		return err
+	} else if has {
 		return ErrUnitDependents
 	}
 	return s.withTx(ctx, func(q *db.Queries) error {
 		if _, err := q.ArchiveUnit(ctx, toPg(unitID)); err != nil {
 			return err
 		}
-		return emit(ctx, q, oc.TenantID, oc.OrgID, "OrgUnitArchived", "org_unit", unitID, oc.UserID, true,
-			map[string]any{"unit_id": unitID, "org_id": oc.OrgID})
+		return events.Emit(ctx, q, oc.TenantID, oc.OrgID, "OrgUnitArchived", "org_unit", unitID, oc.UserID, true,
+			map[string]any{"unit_id": unitID, "org_id": oc.OrgID, "organization_id": oc.OrgID})
 	})
 }
 
@@ -203,7 +214,7 @@ func (s *Service) UpdateOrgProfile(ctx context.Context, oc *OrgCtx, name, countr
 		}); err != nil {
 			return err
 		}
-		return emit(ctx, q, oc.TenantID, oc.OrgID, "OrganizationSettingChanged", "organization", oc.OrgID, oc.UserID, false,
+		return events.Emit(ctx, q, oc.TenantID, oc.OrgID, "OrganizationSettingChanged", "organization", oc.OrgID, oc.UserID, false,
 			map[string]any{"org_id": oc.OrgID, "organization_id": oc.OrgID, "profile": true})
 	})
 }
@@ -227,7 +238,7 @@ func (s *Service) SetSetting(ctx context.Context, oc *OrgCtx, key string, value 
 		}); err != nil {
 			return err
 		}
-		return emit(ctx, q, oc.TenantID, oc.OrgID, "OrganizationSettingChanged", "organization", oc.OrgID, oc.UserID, false,
+		return events.Emit(ctx, q, oc.TenantID, oc.OrgID, "OrganizationSettingChanged", "organization", oc.OrgID, oc.UserID, false,
 			map[string]any{"org_id": oc.OrgID, "organization_id": oc.OrgID, "key": key})
 	})
 }
@@ -246,6 +257,16 @@ func (s *Service) CreateInvitation(ctx context.Context, oc *OrgCtx, email, phone
 	if email == "" && phone == "" {
 		return nil, ErrInviteNoContact
 	}
+	if email != "" {
+		// normalize "Name <a@b>" → "a@b" so the accept-time email binding
+		// (EqualFold against the user's stored address) can actually match;
+		// an unparseable address would make the invite un-acceptable.
+		addr, err := mail.ParseAddress(email)
+		if err != nil || addr.Address == "" {
+			return nil, ErrBadValue
+		}
+		email = addr.Address
+	}
 	var out Invitation
 	err := s.withTx(ctx, func(q *db.Queries) error {
 		r, err := q.CreateInvitation(ctx, db.CreateInvitationParams{
@@ -260,7 +281,7 @@ func (s *Service) CreateInvitation(ctx context.Context, oc *OrgCtx, email, phone
 			Token: fromPg(r.Token), ExpiresAt: r.ExpiresAt.Time}
 		// membership_id is the inviter's (no invitee membership exists yet);
 		// invitation_id identifies the invite itself.
-		return emit(ctx, q, oc.TenantID, oc.OrgID, "MemberInvited", "invitation", fromPg(r.ID), oc.UserID, true,
+		return events.Emit(ctx, q, oc.TenantID, oc.OrgID, "MemberInvited", "invitation", fromPg(r.ID), oc.UserID, true,
 			map[string]any{"membership_id": oc.MembershipID, "invitation_id": fromPg(r.ID),
 				"org_id": oc.OrgID, "email": email})
 	})
@@ -292,7 +313,7 @@ func (s *Service) RevokeInvitation(ctx context.Context, oc *OrgCtx, inviteID uui
 			}
 			return err
 		}
-		return emit(ctx, q, oc.TenantID, oc.OrgID, "InvitationRevoked", "invitation", inviteID, oc.UserID, false,
+		return events.Emit(ctx, q, oc.TenantID, oc.OrgID, "InvitationRevoked", "invitation", inviteID, oc.UserID, false,
 			map[string]any{"invitation_id": inviteID, "org_id": oc.OrgID})
 	})
 }
@@ -316,6 +337,9 @@ func (s *Service) AcceptInvitation(ctx context.Context, userID uuid.UUID, token 
 	err = s.withTx(ctx, func(q *db.Queries) error {
 		org, err := q.GetOrg(ctx, inv.OrganizationID)
 		if err != nil {
+			if err == pgx.ErrNoRows {
+				return ErrInviteDead // org soft-deleted — invite dies with it
+			}
 			return err
 		}
 		tenantID = org.TenantID
@@ -352,7 +376,7 @@ func (s *Service) AcceptInvitation(ctx context.Context, userID uuid.UUID, token 
 				return err
 			}
 		}
-		return emit(ctx, q, fromPg(tenantID), orgID, "InvitationAccepted", "invitation", fromPg(inv.ID), userID, true,
+		return events.Emit(ctx, q, fromPg(tenantID), orgID, "InvitationAccepted", "invitation", fromPg(inv.ID), userID, true,
 			map[string]any{"invitation_id": fromPg(inv.ID), "org_id": orgID, "user_id": userID})
 	})
 	s.InvalidateOrgCtx(ctx, userID, orgID)
@@ -381,7 +405,7 @@ func (s *Service) SetBranding(ctx context.Context, oc *OrgCtx, b Branding) error
 		}); err != nil {
 			return err
 		}
-		return emit(ctx, q, oc.TenantID, oc.OrgID, "OrgBrandingUpdated", "organization", oc.OrgID, oc.UserID, false,
+		return events.Emit(ctx, q, oc.TenantID, oc.OrgID, "OrgBrandingUpdated", "organization", oc.OrgID, oc.UserID, false,
 			map[string]any{"org_id": oc.OrgID})
 	})
 }

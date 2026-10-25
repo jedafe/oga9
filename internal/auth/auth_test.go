@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/jedafe/oga9/internal/db"
+	"github.com/jedafe/oga9/internal/events"
 	"github.com/pquerna/otp/totp"
 	valkey "github.com/valkey-io/valkey-go"
 )
@@ -350,7 +351,7 @@ func TestEmitAbortsTxOnFailure(t *testing.T) {
 		if e := q.SetUserVerified(ctx, toPg(uuid.New())); e != nil {
 			return e
 		}
-		return emit(ctx, q, "UserRegistered", "user", uuid.New(), uuid.New(), false,
+		return events.Emit(ctx, q, uuid.Nil, uuid.Nil, "UserRegistered", "user", uuid.New(), uuid.New(), false,
 			map[string]any{"bad": func() {}})
 	})
 	if err == nil {

@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jedafe/oga9/internal/db"
+	"github.com/jedafe/oga9/internal/events"
 )
 
 type permSet struct {
@@ -117,7 +118,7 @@ func (s *Service) CreatePosition(ctx context.Context, oc *OrgCtx, name, slug str
 				return err
 			}
 		}
-		return emit(ctx, q, oc.TenantID, oc.OrgID, "PositionCreated", "org_position", id, oc.UserID, true,
+		return events.Emit(ctx, q, oc.TenantID, oc.OrgID, "PositionCreated", "org_position", id, oc.UserID, true,
 			map[string]any{"position_id": id, "org_id": oc.OrgID, "name": name})
 	})
 	return id, err
@@ -144,12 +145,12 @@ func (s *Service) CreateTerm(ctx context.Context, oc *OrgCtx, label string, star
 						return err
 					}
 					outgoing = append(outgoing, fromPg(m.UserID))
-					if err := emit(ctx, q, oc.TenantID, oc.OrgID, "AppointmentEnded", "officer_appointment", fromPg(ap.ID), oc.UserID, true,
+					if err := events.Emit(ctx, q, oc.TenantID, oc.OrgID, "AppointmentEnded", "officer_appointment", fromPg(ap.ID), oc.UserID, true,
 						map[string]any{"appointment_id": fromPg(ap.ID), "term_id": fromPg(prev), "org_id": oc.OrgID}); err != nil {
 						return err
 					}
 				}
-				if err := emit(ctx, q, oc.TenantID, oc.OrgID, "TermClosed", "term", fromPg(prev), oc.UserID, true,
+				if err := events.Emit(ctx, q, oc.TenantID, oc.OrgID, "TermClosed", "term", fromPg(prev), oc.UserID, true,
 					map[string]any{"term_id": fromPg(prev), "org_id": oc.OrgID, "reason": "superseded"}); err != nil {
 					return err
 				}
@@ -169,7 +170,7 @@ func (s *Service) CreateTerm(ctx context.Context, oc *OrgCtx, label string, star
 			return err
 		}
 		id = fromPg(tid)
-		return emit(ctx, q, oc.TenantID, oc.OrgID, "TermStarted", "term", id, oc.UserID, true,
+		return events.Emit(ctx, q, oc.TenantID, oc.OrgID, "TermStarted", "term", id, oc.UserID, true,
 			map[string]any{"term_id": id, "org_id": oc.OrgID})
 	})
 	for _, u := range outgoing {
@@ -223,6 +224,14 @@ func (s *Service) AppointOfficer(ctx context.Context, oc *OrgCtx, termID, positi
 			if err != nil || fromPg(ur.OrganizationID) != oc.OrgID {
 				return ErrNotFound
 			}
+			// scope columns are typed: committee_id targets committee units,
+			// branch_id targets structural units (hq|branch|chapter|wing).
+			if u == committeeID && ur.Type != "committee" {
+				return ErrBadScopeUnit
+			}
+			if u == branchID && ur.Type == "committee" {
+				return ErrBadScopeUnit
+			}
 		}
 		appointee = fromPg(m.UserID)
 		aid, err := q.AppointOfficer(ctx, db.AppointOfficerParams{
@@ -234,7 +243,7 @@ func (s *Service) AppointOfficer(ctx context.Context, oc *OrgCtx, termID, positi
 			return err
 		}
 		id = fromPg(aid)
-		return emit(ctx, q, oc.TenantID, oc.OrgID, "LeaderAppointed", "officer_appointment", id, oc.UserID, true,
+		return events.Emit(ctx, q, oc.TenantID, oc.OrgID, "LeaderAppointed", "officer_appointment", id, oc.UserID, true,
 			map[string]any{"appointment_id": id, "position_id": positionID, "term_id": termID, "org_id": oc.OrgID})
 	})
 	if err == nil {
@@ -259,7 +268,7 @@ func (s *Service) EndAppointment(ctx context.Context, oc *OrgCtx, appointmentID 
 			return err
 		}
 		appointee = fromPg(m.UserID)
-		return emit(ctx, q, oc.TenantID, oc.OrgID, "AppointmentEnded", "officer_appointment", appointmentID, oc.UserID, true,
+		return events.Emit(ctx, q, oc.TenantID, oc.OrgID, "AppointmentEnded", "officer_appointment", appointmentID, oc.UserID, true,
 			map[string]any{"appointment_id": appointmentID, "org_id": oc.OrgID})
 	})
 	if err == nil && appointee != uuid.Nil {
@@ -290,12 +299,13 @@ func (s *Service) CloseTerm(ctx context.Context, oc *OrgCtx, termID uuid.UUID) e
 				return err
 			}
 			appointees = append(appointees, fromPg(m.UserID))
-			if err := emit(ctx, q, oc.TenantID, oc.OrgID, "AppointmentEnded", "officer_appointment", fromPg(ap.ID), oc.UserID, true,
+			if err := events.Emit(ctx, q, oc.TenantID, oc.OrgID, "AppointmentEnded", "officer_appointment", fromPg(ap.ID), oc.UserID, true,
 				map[string]any{"appointment_id": fromPg(ap.ID), "term_id": termID, "org_id": oc.OrgID}); err != nil {
 				return err
 			}
 		}
-		return nil
+		return events.Emit(ctx, q, oc.TenantID, oc.OrgID, "TermClosed", "term", termID, oc.UserID, true,
+			map[string]any{"term_id": termID, "org_id": oc.OrgID})
 	})
 	for _, u := range appointees {
 		s.InvalidatePermCache(ctx, u, oc.OrgID)
@@ -319,7 +329,14 @@ func (s *Service) AddCommitteeMember(ctx context.Context, oc *OrgCtx, unitID, me
 		_, err = q.AddCommitteeMember(ctx, db.AddCommitteeMemberParams{
 			OrganizationID: toPg(oc.OrgID), OrgUnitID: toPg(unitID), MemberID: toPg(memberID), Role: role,
 		})
-		return err
+		if err != nil {
+			var pgErr *pgconn.PgError
+			if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+				return ErrDuplicateMember // UNIQUE(org,unit,member) — seat exists
+			}
+			return err
+		}
+		return nil
 	})
 	if err == nil {
 		s.InvalidatePermCache(ctx, userID, oc.OrgID)

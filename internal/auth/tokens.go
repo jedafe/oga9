@@ -14,10 +14,12 @@ import (
 	"time"
 )
 
+// Action-token wire format: `jti~userID~purpose~exp.sig16` — `~` (not `|`)
+// keeps the token unreserved-URL-safe inside emailed links (RFC 3986).
 func SignActionToken(secret, userID, purpose string, ttl time.Duration) (string, string) {
 	jti := newJTI()
 	exp := time.Now().Add(ttl).Unix()
-	payload := fmt.Sprintf("%s|%s|%s|%d", jti, userID, purpose, exp)
+	payload := fmt.Sprintf("%s~%s~%s~%d", jti, userID, purpose, exp)
 	sig := hmac.New(sha256.New, []byte(secret))
 	sig.Write([]byte(payload))
 	return fmt.Sprintf("%s.%s", payload, hex.EncodeToString(sig.Sum(nil))[:32]), jti
@@ -34,7 +36,7 @@ func VerifyActionToken(secret, token, purpose string) (jti, userID string, err e
 	if !hmac.Equal(sig.Sum(nil)[:16], expected) {
 		return "", "", errors.New("bad signature")
 	}
-	f := strings.Split(parts[0], "|")
+	f := strings.Split(parts[0], "~")
 	if len(f) != 4 || f[2] != purpose {
 		return "", "", errors.New("wrong purpose")
 	}

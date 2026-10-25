@@ -5,5 +5,6 @@ CREATE TABLE committee_memberships (
   org_unit_id uuid NOT NULL REFERENCES org_units(id),
   member_id uuid NOT NULL REFERENCES organization_memberships(id),
   role text NOT NULL DEFAULT 'member',
-  created_at timestamptz NOT NULL DEFAULT now()
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE(organization_id, org_unit_id, member_id)
 );

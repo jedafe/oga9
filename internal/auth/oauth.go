@@ -18,6 +18,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jedafe/oga9/internal/db"
+	"github.com/jedafe/oga9/internal/events"
 	valkey "github.com/valkey-io/valkey-go"
 )
 
@@ -166,7 +167,7 @@ func (s *Service) findOrProvisionOAuthUser(ctx context.Context, provider string,
 				return e
 			}
 			userID = fromPg(id)
-			if e := emit(ctx, q, "UserRegistered", "user", userID, userID, false,
+			if e := events.Emit(ctx, q, uuid.Nil, uuid.Nil, "UserRegistered", "user", userID, userID, false,
 				map[string]any{"user_id": userID, "provider": provider}); e != nil {
 				return e
 			}

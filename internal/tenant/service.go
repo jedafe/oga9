@@ -19,6 +19,7 @@ import (
 	valkey "github.com/valkey-io/valkey-go"
 
 	"github.com/jedafe/oga9/internal/db"
+	"github.com/jedafe/oga9/internal/events"
 )
 
 var (
@@ -40,6 +41,9 @@ var (
 	ErrNoTenant         = errors.New("no_administered_tenant")
 	ErrNotFound         = errors.New("not_found")
 	ErrTermConflict     = errors.New("term_conflict")
+	ErrBadBillingEmail  = errors.New("invalid_billing_email")
+	ErrBadScopeUnit     = errors.New("invalid_scope_unit")
+	ErrDuplicateMember  = errors.New("member_already_seated")
 )
 
 type Service struct {
@@ -125,27 +129,6 @@ func (s *Service) HasTenantRole(ctx context.Context, userID, tenantID uuid.UUID,
 }
 
 // UpdateOrgProfile moved to ops.go
-
-// emit appends an outbox event inside the org's mutation tx (Rule 12).
-// `sourced` marks ADR-004 replayable events per the domain-events catalog;
-// documented payload keys are supplied by each call site (actor_id and
-// aggregate_id are injected automatically).
-func emit(ctx context.Context, q *db.Queries, tenantID, orgID uuid.UUID, name, aggType string, aggID, actorID uuid.UUID, sourced bool, payload map[string]any) error {
-	if payload == nil {
-		payload = map[string]any{}
-	}
-	payload["actor_id"] = actorID
-	payload["aggregate_id"] = aggID
-	b, err := json.Marshal(payload)
-	if err != nil {
-		return err
-	}
-	return q.EmitDomainEvent(ctx, db.EmitDomainEventParams{
-		EventType: name, AggregateType: aggType, AggregateID: toPg(aggID),
-		TenantID: toPg(tenantID), OrganizationID: toPg(orgID), ActorID: toPg(actorID),
-		Payload: b, Sourced: sourced,
-	})
-}
 
 func (s *Service) withTx(ctx context.Context, fn func(*db.Queries) error) error {
 	tx, err := s.pool.Begin(ctx)
@@ -262,7 +245,7 @@ func (s *Service) CreateOrg(ctx context.Context, userID uuid.UUID, name, slug, t
 	if provision {
 		addr, err := mail.ParseAddress(billingEmail)
 		if err != nil {
-			return nil, ErrBadValue
+			return nil, ErrBadBillingEmail
 		}
 		billingEmail = addr.Address // normalize "Name <a@b>" like registration
 	}
@@ -283,6 +266,12 @@ func (s *Service) CreateOrg(ctx context.Context, userID uuid.UUID, name, slug, t
 				return err
 			}
 			tenantID = fromPg(tid)
+			// platform-scoped event (no org yet); plan_slug stays null until
+			// subscriptions land in Phase 07 (§07 entitlement consumer).
+			if err := events.Emit(ctx, q, tenantID, uuid.Nil, "TenantProvisioned", "tenant", tenantID, userID, true,
+				map[string]any{"tenant_id": tenantID, "plan_slug": nil}); err != nil {
+				return err
+			}
 			// clone the system role templates into the new tenant
 			if err := q.CloneTenantRoles(ctx, tid); err != nil {
 				return err
@@ -354,14 +343,14 @@ func (s *Service) CreateOrg(ctx context.Context, userID uuid.UUID, name, slug, t
 				return err
 			}
 		}
-		if err := emit(ctx, q, tenantID, orgID, "OrganizationCreated", "organization", orgID, userID, true,
+		if err := events.Emit(ctx, q, tenantID, orgID, "OrganizationCreated", "organization", orgID, userID, true,
 			map[string]any{"org_id": orgID, "organization_id": orgID, "tenant_id": tenantID, "template_slug": templateSlug}); err != nil {
 			return err
 		}
 		// positions/committees/contribution_types instantiate with their
 		// modules — the deferred list lets Phase 04/09/12 consumers finish
 		// instantiation from this event (template_slug is also on the org).
-		if err := emit(ctx, q, tenantID, orgID, "TemplateInstantiated", "organization", orgID, userID, false,
+		if err := events.Emit(ctx, q, tenantID, orgID, "TemplateInstantiated", "organization", orgID, userID, false,
 			map[string]any{"org_id": orgID, "organization_id": orgID, "template_slug": templateSlug,
 				"deferred": []string{"positions", "committees", "contribution_types"}}); err != nil {
 			return err

@@ -11,6 +11,39 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const consumerLogged = `-- name: ConsumerLogged :one
+SELECT EXISTS(SELECT 1 FROM event_consumer_log WHERE consumer = $1 AND event_id = $2) AS processed
+`
+
+type ConsumerLoggedParams struct {
+	Consumer string      `json:"consumer"`
+	EventID  pgtype.UUID `json:"event_id"`
+}
+
+func (q *Queries) ConsumerLogged(ctx context.Context, arg ConsumerLoggedParams) (bool, error) {
+	row := q.db.QueryRow(ctx, consumerLogged, arg.Consumer, arg.EventID)
+	var processed bool
+	err := row.Scan(&processed)
+	return processed, err
+}
+
+const deadLetterEvent = `-- name: DeadLetterEvent :exec
+UPDATE domain_events SET dispatched_at = now(), attempts = attempts + 1, last_error = $2
+WHERE id = $1
+`
+
+type DeadLetterEventParams struct {
+	ID        pgtype.UUID `json:"id"`
+	LastError pgtype.Text `json:"last_error"`
+}
+
+// Attempt cap reached: pull the event out of the pending set and record the
+// terminal error. `events:retry_dead` (Phase 06) can reset dispatched_at.
+func (q *Queries) DeadLetterEvent(ctx context.Context, arg DeadLetterEventParams) error {
+	_, err := q.db.Exec(ctx, deadLetterEvent, arg.ID, arg.LastError)
+	return err
+}
+
 const emitDomainEvent = `-- name: EmitDomainEvent :exec
 
 INSERT INTO domain_events (event_type, aggregate_type, aggregate_id, tenant_id, organization_id, actor_id, payload, sourced)
@@ -46,6 +79,65 @@ func (q *Queries) EmitDomainEvent(ctx context.Context, arg EmitDomainEventParams
 	return err
 }
 
+const fetchPendingEvents = `-- name: FetchPendingEvents :many
+SELECT id, event_type, aggregate_type, aggregate_id, tenant_id, organization_id,
+       actor_id, payload, occurred_at, attempts
+FROM domain_events
+WHERE dispatched_at IS NULL AND attempts < $1::int
+ORDER BY occurred_at
+LIMIT $2::int
+`
+
+type FetchPendingEventsParams struct {
+	MaxAttempts int32 `json:"max_attempts"`
+	BatchSize   int32 `json:"batch_size"`
+}
+
+type FetchPendingEventsRow struct {
+	ID             pgtype.UUID        `json:"id"`
+	EventType      string             `json:"event_type"`
+	AggregateType  string             `json:"aggregate_type"`
+	AggregateID    pgtype.UUID        `json:"aggregate_id"`
+	TenantID       pgtype.UUID        `json:"tenant_id"`
+	OrganizationID pgtype.UUID        `json:"organization_id"`
+	ActorID        pgtype.UUID        `json:"actor_id"`
+	Payload        []byte             `json:"payload"`
+	OccurredAt     pgtype.Timestamptz `json:"occurred_at"`
+	Attempts       int32              `json:"attempts"`
+}
+
+// Outbox claim set: undelivered events under the attempt cap, oldest first.
+func (q *Queries) FetchPendingEvents(ctx context.Context, arg FetchPendingEventsParams) ([]FetchPendingEventsRow, error) {
+	rows, err := q.db.Query(ctx, fetchPendingEvents, arg.MaxAttempts, arg.BatchSize)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []FetchPendingEventsRow
+	for rows.Next() {
+		var i FetchPendingEventsRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.EventType,
+			&i.AggregateType,
+			&i.AggregateID,
+			&i.TenantID,
+			&i.OrganizationID,
+			&i.ActorID,
+			&i.Payload,
+			&i.OccurredAt,
+			&i.Attempts,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const insertAuditEvent = `-- name: InsertAuditEvent :exec
 INSERT INTO audit_events (tenant_id, organization_id, actor_id, action, target_type, target_id, context)
 VALUES ($1, $2, $3,
@@ -73,4 +165,126 @@ func (q *Queries) InsertAuditEvent(ctx context.Context, arg InsertAuditEventPara
 		arg.Context,
 	)
 	return err
+}
+
+const linkEntities = `-- name: LinkEntities :exec
+INSERT INTO entity_links (organization_id, source_type, source_id, target_type, target_id, relationship_type, created_by)
+VALUES ($1, $2, $3,
+        $4, $5, $6, $7)
+ON CONFLICT (source_type, source_id, target_type, target_id, relationship_type) DO NOTHING
+`
+
+type LinkEntitiesParams struct {
+	OrganizationID   pgtype.UUID `json:"organization_id"`
+	SourceType       string      `json:"source_type"`
+	SourceID         pgtype.UUID `json:"source_id"`
+	TargetType       string      `json:"target_type"`
+	TargetID         pgtype.UUID `json:"target_id"`
+	RelationshipType string      `json:"relationship_type"`
+	CreatedBy        pgtype.UUID `json:"created_by"`
+}
+
+func (q *Queries) LinkEntities(ctx context.Context, arg LinkEntitiesParams) error {
+	_, err := q.db.Exec(ctx, linkEntities,
+		arg.OrganizationID,
+		arg.SourceType,
+		arg.SourceID,
+		arg.TargetType,
+		arg.TargetID,
+		arg.RelationshipType,
+		arg.CreatedBy,
+	)
+	return err
+}
+
+const logConsumerProcessed = `-- name: LogConsumerProcessed :exec
+INSERT INTO event_consumer_log (consumer, event_id) VALUES ($1, $2)
+ON CONFLICT (consumer, event_id) DO NOTHING
+`
+
+type LogConsumerProcessedParams struct {
+	Consumer string      `json:"consumer"`
+	EventID  pgtype.UUID `json:"event_id"`
+}
+
+// Inserted in the SAME tx as the consumer's own writes (§05 contract).
+func (q *Queries) LogConsumerProcessed(ctx context.Context, arg LogConsumerProcessedParams) error {
+	_, err := q.db.Exec(ctx, logConsumerProcessed, arg.Consumer, arg.EventID)
+	return err
+}
+
+const markEventDispatched = `-- name: MarkEventDispatched :exec
+UPDATE domain_events SET dispatched_at = now() WHERE id = $1
+`
+
+func (q *Queries) MarkEventDispatched(ctx context.Context, id pgtype.UUID) error {
+	_, err := q.db.Exec(ctx, markEventDispatched, id)
+	return err
+}
+
+const recordEventAttempt = `-- name: RecordEventAttempt :exec
+UPDATE domain_events SET attempts = attempts + 1, last_error = $2 WHERE id = $1
+`
+
+type RecordEventAttemptParams struct {
+	ID        pgtype.UUID `json:"id"`
+	LastError pgtype.Text `json:"last_error"`
+}
+
+// Failed consumer pass — stays pending, retried on the next dispatch tick.
+func (q *Queries) RecordEventAttempt(ctx context.Context, arg RecordEventAttemptParams) error {
+	_, err := q.db.Exec(ctx, recordEventAttempt, arg.ID, arg.LastError)
+	return err
+}
+
+const relatedEntities = `-- name: RelatedEntities :many
+WITH RECURSIVE rel AS (
+  SELECT el.target_type AS node_type, el.target_id AS node_id, el.relationship_type, 1 AS depth
+  FROM entity_links el
+  WHERE el.source_type = $1 AND el.source_id = $2::uuid
+  UNION
+  SELECT CASE WHEN el.source_type = r.node_type AND el.source_id = r.node_id
+              THEN el.target_type ELSE el.source_type END,
+         CASE WHEN el.source_type = r.node_type AND el.source_id = r.node_id
+              THEN el.target_id ELSE el.source_id END,
+         el.relationship_type, r.depth + 1
+  FROM entity_links el
+  JOIN rel r ON (el.source_type = r.node_type AND el.source_id = r.node_id)
+            OR (el.target_type = r.node_type AND el.target_id = r.node_id)
+  WHERE r.depth < 5
+)
+SELECT DISTINCT node_type, node_id, relationship_type FROM rel
+`
+
+type RelatedEntitiesParams struct {
+	SourceType string      `json:"source_type"`
+	Column2    pgtype.UUID `json:"column_2"`
+}
+
+type RelatedEntitiesRow struct {
+	NodeType         string      `json:"node_type"`
+	NodeID           pgtype.UUID `json:"node_id"`
+	RelationshipType string      `json:"relationship_type"`
+}
+
+// ADR-015 "related" helper: bidirectional traversal of entity_links from a
+// (type,id) seed, depth-capped to keep the walk bounded.
+func (q *Queries) RelatedEntities(ctx context.Context, arg RelatedEntitiesParams) ([]RelatedEntitiesRow, error) {
+	rows, err := q.db.Query(ctx, relatedEntities, arg.SourceType, arg.Column2)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []RelatedEntitiesRow
+	for rows.Next() {
+		var i RelatedEntitiesRow
+		if err := rows.Scan(&i.NodeType, &i.NodeID, &i.RelationshipType); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }

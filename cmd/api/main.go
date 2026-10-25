@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/getsentry/sentry-go"
+	sentryhttp "github.com/getsentry/sentry-go/http"
 	"github.com/go-chi/chi/v5"
 	chimiddleware "github.com/go-chi/chi/v5/middleware"
 	"github.com/hibiken/asynq"
@@ -21,6 +22,7 @@ import (
 
 	"github.com/jedafe/oga9/internal/auth"
 	"github.com/jedafe/oga9/internal/config"
+	"github.com/jedafe/oga9/internal/events"
 	"github.com/jedafe/oga9/internal/handler"
 	"github.com/jedafe/oga9/internal/mailer"
 	"github.com/jedafe/oga9/internal/middleware"
@@ -80,6 +82,10 @@ func main() {
 
 	r := chi.NewRouter()
 	r.Use(chimiddleware.RequestID)
+	if cfg.GlitchTipDSN != "" {
+		// capture panics to GlitchTip; Repanic lets chi Recoverer still 500
+		r.Use(sentryhttp.New(sentryhttp.Options{Repanic: true}).Handle)
+	}
 	r.Use(chimiddleware.Recoverer)
 
 	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
@@ -114,6 +120,17 @@ func main() {
 	oauthH := handler.NewOAuthHandler(authSvc, vk, providers, cfg.BaseURL, queue, cfg.JWTSecret)
 	orgSvc := tenant.NewService(pool, vk)
 	orgH := handler.NewOrgHandler(orgSvc)
+
+	// §05 outbox dispatcher: lease-locked claim + consumer-log dedupe.
+	dispatcher := events.NewDispatcher(pool, vk)
+	dispatcher.Register("entity_links", events.EntityLinksConsumer)
+	mux.HandleFunc(events.TypeDispatchOutbox, dispatcher.ProcessTask)
+	if _, err := scheduler.Register(
+		"@every "+cfg.OutboxInterval.String(),
+		asynq.NewTask(events.TypeDispatchOutbox, nil, asynq.Queue("critical")),
+	); err != nil {
+		log.Fatalf("outbox schedule: %v", err)
+	}
 
 	r.Use(middleware.ResolveIP(cfg.TrustedProxies))
 	r.Route("/api/v1", func(r chi.Router) {

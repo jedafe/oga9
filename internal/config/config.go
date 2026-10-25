@@ -25,6 +25,7 @@ type Config struct {
 	ControlHost    string
 	APIPort        int
 	SessionTTL     time.Duration
+	OutboxInterval time.Duration // events:dispatch_outbox cadence (§05)
 	SMTPHost       string
 	SMTPPort       int
 	SMTPUser       string
@@ -59,6 +60,7 @@ func Load() (*Config, error) {
 		ControlHost:    env("OGA9_CONTROL_HOST", "control.oga9.com"),
 		APIPort:        envInt(&errs, "OGA9_API_PORT", 8080),
 		SessionTTL:     envDur(&errs, "OGA9_SESSION_TTL", 24*time.Hour),
+		OutboxInterval: envDur(&errs, "OGA9_OUTBOX_DISPATCH_INTERVAL", 10*time.Second),
 		SMTPHost:       env("OGA9_SMTP_HOST", "localhost"),
 		SMTPPort:       envInt(&errs, "OGA9_SMTP_PORT", 1025),
 		SMTPUser:       env("OGA9_SMTP_USERNAME", ""),

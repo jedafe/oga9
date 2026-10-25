@@ -319,6 +319,20 @@ SELECT DISTINCT permission FROM (
   JOIN organizations o ON o.id = $1::uuid
   WHERE ura.user_id = $2::uuid AND r.tenant_id = o.tenant_id
   UNION
+  -- §03 union term: the member's org group → roles bound to that group
+  -- (organization_memberships.user_group_id is the group link). Roles are
+  -- tenant-scoped: system templates (tenant_id NULL) or this org's tenant —
+  -- cloned roles share user_group_id, so the scope check prevents
+  -- cross-tenant grant leakage.
+  SELECT rp.permission
+  FROM organization_memberships m
+  JOIN organizations o ON o.id = m.organization_id
+  JOIN user_roles r ON r.user_group_id = m.user_group_id
+                   AND (r.tenant_id IS NULL OR r.tenant_id = o.tenant_id)
+  JOIN role_permissions rp ON rp.role_id = r.id
+  WHERE m.organization_id = $1::uuid
+    AND m.user_id = $2::uuid
+  UNION
   SELECT pp.permission
   FROM officer_appointments oa
   JOIN terms t ON t.id = oa.term_id AND t.is_current

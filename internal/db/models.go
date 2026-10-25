@@ -86,6 +86,24 @@ type DomainEvents struct {
 	Sourced        bool               `json:"sourced"`
 }
 
+type EntityLinks struct {
+	ID               pgtype.UUID        `json:"id"`
+	OrganizationID   pgtype.UUID        `json:"organization_id"`
+	SourceType       string             `json:"source_type"`
+	SourceID         pgtype.UUID        `json:"source_id"`
+	TargetType       string             `json:"target_type"`
+	TargetID         pgtype.UUID        `json:"target_id"`
+	RelationshipType string             `json:"relationship_type"`
+	CreatedBy        pgtype.UUID        `json:"created_by"`
+	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+}
+
+type EventConsumerLog struct {
+	Consumer    string             `json:"consumer"`
+	EventID     pgtype.UUID        `json:"event_id"`
+	ProcessedAt pgtype.Timestamptz `json:"processed_at"`
+}
+
 type OauthProviders struct {
 	ID              pgtype.UUID        `json:"id"`
 	UserID          pgtype.UUID        `json:"user_id"`
