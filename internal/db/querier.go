@@ -42,6 +42,9 @@ type Querier interface {
 	// statement — concurrent logins can't both consume the same code.
 	ConsumeRecoveryCode(ctx context.Context, arg ConsumeRecoveryCodeParams) (pgtype.UUID, error)
 	ConsumerLogged(ctx context.Context, arg ConsumerLoggedParams) (bool, error)
+	// Staged sponsors become membership rows on approve; ON CONFLICT keeps a
+	// staged sponsor that duplicates the primary from breaking the approve tx.
+	CopyApplicationSponsors(ctx context.Context, arg CopyApplicationSponsorsParams) error
 	// Total sponsors across the application's primary sponsor_member_id plus
 	// any application-staged rows — the sponsor_required numerator at approve.
 	CountApplicationSponsors(ctx context.Context, applicationID pgtype.UUID) (int32, error)
@@ -85,6 +88,7 @@ type Querier interface {
 	// Attempt cap reached: pull the event out of the pending set and record the
 	// terminal error. `events:retry_dead` (Phase 06) can reset dispatched_at.
 	DeadLetterEvent(ctx context.Context, arg DeadLetterEventParams) error
+	DeleteApplicationSponsors(ctx context.Context, applicationID pgtype.UUID) error
 	// Ref: oga9-engineering/sections/05-domain-events-infrastructure.md
 	// Outbox + audit queries (Phase 02 emission, Phase 05 dispatch).
 	EmitDomainEvent(ctx context.Context, arg EmitDomainEventParams) error
@@ -214,7 +218,6 @@ type Querier interface {
 	// AND the member's application aggregates (ADR-014 "complete replayable
 	// journey" — the intake trail belongs in the history too).
 	MemberHistory(ctx context.Context, arg MemberHistoryParams) ([]MemberHistoryRow, error)
-	MoveApplicationSponsors(ctx context.Context, arg MoveApplicationSponsorsParams) error
 	// Atomic per-org sequence for member_no ({SLUG}-{YYYY}-{seq5}); the lock
 	// serializes concurrent approvals so numbers are unique and never reused.
 	NextMemberNoSeq(ctx context.Context, id pgtype.UUID) (int64, error)

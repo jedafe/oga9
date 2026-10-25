@@ -128,6 +128,12 @@ func (s *Service) Apply(ctx context.Context, orgID, userID uuid.UUID, email, pho
 		} else if n > 0 {
 			return uuid.Nil, ErrAlreadyApplied
 		}
+	} else if exists, err := s.q.ExistsOpenApplicationByEmail(ctx, db.ExistsOpenApplicationByEmailParams{
+		OrgID: toPg(orgID), Email: email, Phone: phone,
+	}); err != nil {
+		return uuid.Nil, err
+	} else if exists {
+		return uuid.Nil, ErrAlreadyApplied // public intake dedupes on contact
 	}
 	var primary pgtype.UUID
 	if len(sponsorIDs) > 0 {
@@ -152,6 +158,9 @@ func (s *Service) Apply(ctx context.Context, orgID, userID uuid.UUID, email, pho
 		}
 		id = fromPg(r)
 		for _, sid := range sponsorIDs[min(len(sponsorIDs), 1):] {
+			if sid == sponsorIDs[0] {
+				continue // extra duplicating the primary — not a second sponsor
+			}
 			if err := q.AddApplicationSponsor(ctx, db.AddApplicationSponsorParams{
 				ApplicationID: r, SponsorMemberID: toPg(sid), Kind: "sponsor",
 			}); err != nil {
@@ -315,10 +324,15 @@ func (s *Service) DecideApplication(ctx context.Context, oc *OrgCtx, appID uuid.
 				return err
 			}
 		}
-		// staged extras become membership sponsor rows too.
-		return q.MoveApplicationSponsors(ctx, db.MoveApplicationSponsorsParams{
-			ApplicationID: toPg(appID), MembershipID: mid,
-		})
+		// staged extras become membership sponsor rows too (copy+delete is
+		// unique-index-safe vs an in-place UPDATE when an extra duplicates
+		// the primary).
+		if err := q.CopyApplicationSponsors(ctx, db.CopyApplicationSponsorsParams{
+			MembershipID: mid, ApplicationID: toPg(appID),
+		}); err != nil {
+			return err
+		}
+		return q.DeleteApplicationSponsors(ctx, toPg(appID))
 	})
 }
 
@@ -476,6 +490,9 @@ func (s *Service) RenewMember(ctx context.Context, oc *OrgCtx, memberID uuid.UUI
 	if m.LifecycleState != "active" && m.LifecycleState != "suspended" {
 		return uuid.Nil, ErrInvalidTransition
 	}
+	if !endsAt.After(startsAt) {
+		return uuid.Nil, ErrBadValue // renewal window must span forward
+	}
 	var id uuid.UUID
 	err = s.withTx(ctx, func(q *db.Queries) error {
 		r, err := q.CreateRenewal(ctx, db.CreateRenewalParams{
@@ -511,6 +528,11 @@ func (s *Service) IssueCard(ctx context.Context, oc *OrgCtx, memberID uuid.UUID,
 	}
 	if len(design) == 0 {
 		design = json.RawMessage("{}")
+	}
+	// one active card per member (partial unique index) — re-issue returns
+	// the live card instead of erroring or double-emitting.
+	if cur, err := s.q.GetActiveCard(ctx, toPg(memberID)); err == nil {
+		return db.IssueCardRow{ID: cur.ID, Serial: cur.Serial, IssuedAt: cur.IssuedAt}, nil
 	}
 	serial := fmt.Sprintf("CARD-%s-%s", strings.ToUpper(uuid.NewString()[:8]), strings.ToUpper(uuid.NewString()[:4]))
 	if m.MemberNo.Valid && m.MemberNo.String != "" {

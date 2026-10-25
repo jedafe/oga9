@@ -47,6 +47,25 @@ func (q *Queries) AddSponsor(ctx context.Context, arg AddSponsorParams) error {
 	return err
 }
 
+const copyApplicationSponsors = `-- name: CopyApplicationSponsors :exec
+INSERT INTO member_sponsors (membership_id, sponsor_member_id, kind)
+SELECT $1::uuid, sponsor_member_id, kind
+FROM member_sponsors WHERE application_id = $2::uuid
+ON CONFLICT DO NOTHING
+`
+
+type CopyApplicationSponsorsParams struct {
+	MembershipID  pgtype.UUID `json:"membership_id"`
+	ApplicationID pgtype.UUID `json:"application_id"`
+}
+
+// Staged sponsors become membership rows on approve; ON CONFLICT keeps a
+// staged sponsor that duplicates the primary from breaking the approve tx.
+func (q *Queries) CopyApplicationSponsors(ctx context.Context, arg CopyApplicationSponsorsParams) error {
+	_, err := q.db.Exec(ctx, copyApplicationSponsors, arg.MembershipID, arg.ApplicationID)
+	return err
+}
+
 const countApplicationSponsors = `-- name: CountApplicationSponsors :one
 SELECT (
   SELECT count(*) FROM member_sponsors
@@ -157,6 +176,15 @@ func (q *Queries) CreateRenewal(ctx context.Context, arg CreateRenewalParams) (p
 	var id pgtype.UUID
 	err := row.Scan(&id)
 	return id, err
+}
+
+const deleteApplicationSponsors = `-- name: DeleteApplicationSponsors :exec
+DELETE FROM member_sponsors WHERE application_id = $1::uuid
+`
+
+func (q *Queries) DeleteApplicationSponsors(ctx context.Context, applicationID pgtype.UUID) error {
+	_, err := q.db.Exec(ctx, deleteApplicationSponsors, applicationID)
+	return err
 }
 
 const endMemberAppointments = `-- name: EndMemberAppointments :many
@@ -730,22 +758,6 @@ func (q *Queries) MemberHistory(ctx context.Context, arg MemberHistoryParams) ([
 		return nil, err
 	}
 	return items, nil
-}
-
-const moveApplicationSponsors = `-- name: MoveApplicationSponsors :exec
-UPDATE member_sponsors SET membership_id = $1::uuid,
-                          application_id = NULL
-WHERE application_id = $2::uuid
-`
-
-type MoveApplicationSponsorsParams struct {
-	MembershipID  pgtype.UUID `json:"membership_id"`
-	ApplicationID pgtype.UUID `json:"application_id"`
-}
-
-func (q *Queries) MoveApplicationSponsors(ctx context.Context, arg MoveApplicationSponsorsParams) error {
-	_, err := q.db.Exec(ctx, moveApplicationSponsors, arg.MembershipID, arg.ApplicationID)
-	return err
 }
 
 const nextMemberNoSeq = `-- name: NextMemberNoSeq :one

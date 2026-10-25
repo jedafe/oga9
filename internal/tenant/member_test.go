@@ -141,12 +141,19 @@ func TestMemberLifecycleFlow(t *testing.T) {
 	if card.Serial == "" {
 		t.Fatal("empty card serial")
 	}
+	// one active card per member — re-issue returns the live card
+	if card2, err := svc.IssueCard(ctx, oc, mid, nil); err != nil || card2.Serial != card.Serial {
+		t.Fatalf("re-issue should return the live card, got %v err %v", card2.Serial, err)
+	}
 	rid, err := svc.RenewMember(ctx, oc, mid, "2026", time.Now(), time.Now().AddDate(1, 0, 0))
 	if err != nil || rid == uuid.Nil {
 		t.Fatalf("renew: %v", err)
 	}
 	if _, err := svc.RenewMember(ctx, oc, mid, "2026", time.Now(), time.Now().AddDate(1, 0, 0)); err != ErrDuplicateRenewal {
 		t.Fatalf("dup period renewal should 409, got %v", err)
+	}
+	if _, err := svc.RenewMember(ctx, oc, mid, "2025", time.Now(), time.Now().AddDate(-1, 0, 0)); err != ErrBadValue {
+		t.Fatalf("backwards renewal window should fail, got %v", err)
 	}
 	if !Eligible("active", "good") || Eligible("suspended", "good") || Eligible("active", "bad") {
 		t.Fatal("eligibility predicate wrong")

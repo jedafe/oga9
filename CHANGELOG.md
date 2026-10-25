@@ -5,6 +5,18 @@ entries reference engineering phases in `.oos/roadmaps/ROADMAP-BACKEND.md`.
 
 ## [Unreleased]
 
+### Fixed — Phase 08 review, round 3
+- `membership_cards` partial index is now UNIQUE (000076) — one live card
+  per member; `IssueCard` is idempotent and returns the live card instead
+  of double-emitting `CardIssued` (Rule 27).
+- Staged-sponsor migration on approve uses INSERT-SELECT + DELETE (was
+  in-place UPDATE that could violate the membership unique index when an
+  extra sponsor duplicated the primary).
+- Extras equal to the primary sponsor are deduped at apply.
+- Public pre-signup applications dedupe on email-or-phone — repeat
+  submissions no longer stack open applications.
+- `RenewMember` rejects backwards windows (`ends_at <= starts_at`).
+
 ### Fixed — Phase 08 review, round 2 (spec gaps)
 - Member home-unit scope: `organization_memberships.org_unit_id`
   (000075) — the §11 `unit` directory filter is now real

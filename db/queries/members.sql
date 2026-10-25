@@ -96,10 +96,16 @@ SELECT (
 ) + (SELECT CASE WHEN sponsor_member_id IS NOT NULL THEN 1 ELSE 0 END
      FROM membership_applications WHERE id = sqlc.arg(application_id)::uuid);
 
--- name: MoveApplicationSponsors :exec
-UPDATE member_sponsors SET membership_id = sqlc.arg(membership_id)::uuid,
-                          application_id = NULL
-WHERE application_id = sqlc.arg(application_id)::uuid;
+-- name: CopyApplicationSponsors :exec
+-- Staged sponsors become membership rows on approve; ON CONFLICT keeps a
+-- staged sponsor that duplicates the primary from breaking the approve tx.
+INSERT INTO member_sponsors (membership_id, sponsor_member_id, kind)
+SELECT sqlc.arg(membership_id)::uuid, sponsor_member_id, kind
+FROM member_sponsors WHERE application_id = sqlc.arg(application_id)::uuid
+ON CONFLICT DO NOTHING;
+
+-- name: DeleteApplicationSponsors :exec
+DELETE FROM member_sponsors WHERE application_id = sqlc.arg(application_id)::uuid;
 
 -- name: CountSponsors :one
 SELECT count(*) FROM member_sponsors WHERE membership_id = $1 AND kind = 'sponsor';
