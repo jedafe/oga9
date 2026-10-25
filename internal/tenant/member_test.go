@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/jedafe/oga9/internal/db"
 )
@@ -40,16 +41,16 @@ func TestMemberLifecycleFlow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := svc.DecideApplication(ctx, oc, lone, "screen"); err != nil {
+	if err := svc.DecideApplication(ctx, oc, lone, "screen", nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := svc.DecideApplication(ctx, oc, lone, "approve"); err != ErrSponsorRequired {
+	if err := svc.DecideApplication(ctx, oc, lone, "approve", nil); err != ErrSponsorRequired {
 		t.Fatalf("unsponsored approve under required=1 should fail, got %v", err)
 	}
 	if err := svc.SetSetting(ctx, oc, "org.membership.sponsor_required", json.RawMessage("0")); err != nil {
 		t.Fatal(err)
 	}
-	if err := svc.DecideApplication(ctx, oc, lone, "approve"); err != nil {
+	if err := svc.DecideApplication(ctx, oc, lone, "approve", nil); err != nil {
 		t.Fatalf("approve after setting drop: %v", err)
 	}
 
@@ -65,13 +66,13 @@ func TestMemberLifecycleFlow(t *testing.T) {
 
 	// decision flow: applied→approved skips screening — §11 intake is
 	// applied→screened→approved, so the jump is genuinely invalid.
-	if err := svc.DecideApplication(ctx, oc, appID, "approve"); err != ErrInvalidTransition {
+	if err := svc.DecideApplication(ctx, oc, appID, "approve", nil); err != ErrInvalidTransition {
 		t.Fatalf("applied→approved skip should be invalid, got %v", err)
 	}
-	if err := svc.DecideApplication(ctx, oc, appID, "screen"); err != nil {
+	if err := svc.DecideApplication(ctx, oc, appID, "screen", nil); err != nil {
 		t.Fatalf("screen: %v", err)
 	}
-	if err := svc.DecideApplication(ctx, oc, appID, "approve"); err != nil {
+	if err := svc.DecideApplication(ctx, oc, appID, "approve", nil); err != nil {
 		t.Fatalf("approve: %v", err)
 	}
 	mb, err := pool.Query(ctx, "SELECT id, member_no, lifecycle_state FROM organization_memberships WHERE organization_id=$1 AND user_id=$2", org.ID, applicant)
@@ -185,6 +186,34 @@ func TestMemberLifecycleFlow(t *testing.T) {
 		t.Fatalf("unfiltered directory should return all members, got %d err %v", len(rows), err)
 	}
 
+	// self-resign: a member resigns their own membership without the
+	// manage node (service-level; handler gates mid==oc.MembershipID).
+	resigner := mkUser(t, pool, "rs"+uuid.NewString()[:8]+"@test.oga9")
+	rapp, err := svc.Apply(ctx, org.ID, resigner, "rs@t.co", "", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.DecideApplication(ctx, oc, rapp, "screen", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.DecideApplication(ctx, oc, rapp, "approve", nil); err != nil {
+		t.Fatal(err)
+	}
+	var rmid pgtype.UUID
+	pool.QueryRow(ctx, "SELECT id FROM organization_memberships WHERE organization_id=$1 AND user_id=$2", org.ID, resigner).Scan(&rmid)
+	rctx := &OrgCtx{OrgID: org.ID, UserID: resigner, MembershipID: fromPg(rmid), TenantID: org.TenantID}
+	if _, err := pool.Exec(ctx, "UPDATE organization_memberships SET lifecycle_state='active' WHERE id=$1", rmid); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.TransitionMember(ctx, rctx, fromPg(rmid), "resign"); err != nil {
+		t.Fatalf("self-resign: %v", err)
+	}
+	var rst string
+	pool.QueryRow(ctx, "SELECT lifecycle_state FROM organization_memberships WHERE id=$1", rmid).Scan(&rst)
+	if rst != "resigned" {
+		t.Fatalf("expected resigned, got %s", rst)
+	}
+
 	// deceased: terminal teardown — card revoked, member history kept
 	if err := svc.TransitionMember(ctx, oc, mid, "deceased"); err != nil {
 		t.Fatalf("deceased: %v", err)
@@ -292,13 +321,13 @@ func TestSponsorWorkflow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := svc.DecideApplication(ctx, oc, one, "screen"); err != nil {
+	if err := svc.DecideApplication(ctx, oc, one, "screen", nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := svc.DecideApplication(ctx, oc, one, "approve"); err != ErrSponsorRequired {
+	if err := svc.DecideApplication(ctx, oc, one, "approve", nil); err != ErrSponsorRequired {
 		t.Fatalf("1 of 2 sponsors should fail approve, got %v", err)
 	}
-	if err := svc.DecideApplication(ctx, oc, one, "withdraw"); err != nil {
+	if err := svc.DecideApplication(ctx, oc, one, "withdraw", nil); err != nil {
 		t.Fatalf("withdraw the rejected app: %v", err)
 	}
 
@@ -308,10 +337,10 @@ func TestSponsorWorkflow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := svc.DecideApplication(ctx, oc, two, "screen"); err != nil {
+	if err := svc.DecideApplication(ctx, oc, two, "screen", nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := svc.DecideApplication(ctx, oc, two, "approve"); err != nil {
+	if err := svc.DecideApplication(ctx, oc, two, "approve", nil); err != nil {
 		t.Fatalf("2-sponsor approve: %v", err)
 	}
 	var n int64
@@ -322,16 +351,42 @@ func TestSponsorWorkflow(t *testing.T) {
 		t.Fatalf("expected 2 membership sponsors after approve, got %d", n)
 	}
 
+	// decide-time sponsors: a public-style application (no sponsors at
+	// intake) in a sponsor-required org gets them attached by the screener
+	// at approve — otherwise the queue deadlocks for public applicants.
+	publicApp, err := svc.Apply(ctx, org.ID, wd, "pub@t.co", "", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.DecideApplication(ctx, oc, publicApp, "screen", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.DecideApplication(ctx, oc, publicApp, "approve", nil); err != ErrSponsorRequired {
+		t.Fatalf("no-sponsor approve under required=2 should fail, got %v", err)
+	}
+	if err := svc.DecideApplication(ctx, oc, publicApp, "approve",
+		[]uuid.UUID{oc.MembershipID, fromPg(sp2.ID)}); err != nil {
+		t.Fatalf("decide-time sponsors should satisfy the count, got %v", err)
+	}
+	var pn int64
+	pool.QueryRow(ctx,
+		"SELECT count(*) FROM member_sponsors ms JOIN membership_applications a ON a.id=$1 WHERE ms.application_id=$1",
+		publicApp).Scan(&pn)
+	if pn != 0 {
+		t.Fatalf("staged sponsors should have moved to the membership, %d still staged", pn)
+	}
+
 	// self-withdraw: the applicant can withdraw their own open application;
 	// a stranger can't, and an approved one can't anymore.
-	wa, err := svc.Apply(ctx, org.ID, wd, "wd@t.co", "", nil, nil)
+	wd2 := mkUser(t, pool, "w2"+uuid.NewString()[:8]+"@test.oga9")
+	wa, err := svc.Apply(ctx, org.ID, wd2, "w2@t.co", "", nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := svc.WithdrawApplication(ctx, cand, org.ID, wa); err != ErrApplicationNotFound {
 		t.Fatalf("foreign withdraw should be not_found, got %v", err)
 	}
-	if err := svc.WithdrawApplication(ctx, wd, org.ID, wa); err != nil {
+	if err := svc.WithdrawApplication(ctx, wd2, org.ID, wa); err != nil {
 		t.Fatalf("own withdraw: %v", err)
 	}
 	var st string

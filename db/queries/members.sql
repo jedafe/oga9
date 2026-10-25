@@ -22,7 +22,8 @@ ORDER BY created_at;
 -- Decision flow only moves forward within the intake machine
 -- (applied→screened→approved|rejected|withdrawn); callers pass expected
 -- source states so a concurrent decision can't double-apply.
-UPDATE membership_applications SET status = $3, screened_by = $4, decided_at = now()
+UPDATE membership_applications SET status = $3, screened_by = $4,
+  decided_at = CASE WHEN $3 IN ('approved','rejected','withdrawn') THEN now() ELSE decided_at END
 WHERE id = $1 AND status = ANY($2::text[])
 RETURNING id, organization_id, sponsor_member_id;
 
@@ -41,7 +42,7 @@ UPDATE organization_memberships SET member_no = $2 WHERE id = $1;
 
 -- name: GetMembershipFull :one
 SELECT m.id, m.organization_id, m.user_id, m.member_no, m.category, m.lifecycle_state,
-       m.dues_standing, m.last_renewed_at, m.joined_at, m.created_at,
+       m.dues_standing, m.last_renewed_at, m.joined_at, m.created_at, m.org_unit_id,
        u.display_name, u.email
 FROM organization_memberships m
 JOIN users u ON u.id = m.user_id

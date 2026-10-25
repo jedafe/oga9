@@ -230,7 +230,10 @@ func (s *Service) Applications(ctx context.Context, oc *OrgCtx, status string) (
 // records the sponsor link, and emits MemberApproved + SponsorshipRecorded.
 // Pre-signup applications (user_id NULL) approve without a membership —
 // the membership materializes when they register and accept (Phase-02 hook).
-func (s *Service) DecideApplication(ctx context.Context, oc *OrgCtx, appID uuid.UUID, action string) error {
+// extraSponsors lets a screener attach missing sponsors at decision time —
+// public/pre-signup applicants can't supply sponsor ids at intake, so a
+// sponsor-required org's queue would otherwise deadlock at approve.
+func (s *Service) DecideApplication(ctx context.Context, oc *OrgCtx, appID uuid.UUID, action string, extraSponsors []uuid.UUID) error {
 	to := memberActions[action]
 	if to == "" || to == "registered" {
 		return ErrInvalidTransition
@@ -254,6 +257,17 @@ func (s *Service) DecideApplication(ctx context.Context, oc *OrgCtx, appID uuid.
 		}
 	}
 	return s.withTx(ctx, func(q *db.Queries) error {
+		for _, sid := range extraSponsors {
+			sp, err := q.GetMembershipByID(ctx, toPg(sid))
+			if err != nil || fromPg(sp.OrganizationID) != oc.OrgID || sp.LifecycleState != "active" {
+				return ErrNotMember
+			}
+			if err := q.AddApplicationSponsor(ctx, db.AddApplicationSponsorParams{
+				ApplicationID: toPg(appID), SponsorMemberID: toPg(sid), Kind: "sponsor",
+			}); err != nil {
+				return err
+			}
+		}
 		if to == "approved" {
 			// §11 test: approve enforces org.membership.sponsor_required —
 			// total sponsors (primary + staged) must reach the org's count.

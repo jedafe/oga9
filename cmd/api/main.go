@@ -266,7 +266,7 @@ func main() {
 					r.With(middleware.RequireOrgPermission(orgSvc, "org.members.view_any")).Get("/orgs/{org_id}/members", memberH.Members)
 					r.Get("/orgs/{org_id}/members/{member_id}", memberH.Member) // view_any or self — checked inside
 					r.With(middleware.RequireOrgPermission(orgSvc, "org.members.manage")).Patch("/orgs/{org_id}/members/{member_id}", memberH.PatchMember)
-					r.With(middleware.RequireOrgPermission(orgSvc, "org.members.manage")).Post("/orgs/{org_id}/members/{member_id}/transition", memberH.Transition)
+					r.Post("/orgs/{org_id}/members/{member_id}/transition", memberH.Transition) // manage — or member self-resigns
 					r.Post("/orgs/{org_id}/members/{member_id}/renew", memberH.Renew) // manage or self
 					r.With(middleware.RequireOrgPermission(orgSvc, "org.members.card.issue")).Post("/orgs/{org_id}/members/{member_id}/card", memberH.Card)
 					r.With(middleware.RequireOrgPermission(orgSvc, "org.members.view_any")).Get("/orgs/{org_id}/members/{member_id}/history", memberH.History)

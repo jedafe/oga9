@@ -117,7 +117,13 @@ func (h *MemberHandler) Transition(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteErr(w, 400, "validation_failed", "to required")
 		return
 	}
-	if err := h.svc.TransitionMember(r.Context(), middleware.OrgCtx(r.Context()), mid, req.To); err != nil {
+	oc := middleware.OrgCtx(r.Context())
+	selfResign := mid == oc.MembershipID && req.To == "resign"
+	if !selfResign && !h.svc.HasPermission(r.Context(), oc.UserID, oc.OrgID, "org.members.manage") {
+		httpx.WriteErr(w, 403, "forbidden", "insufficient permission")
+		return
+	}
+	if err := h.svc.TransitionMember(r.Context(), oc, mid, req.To); err != nil {
 		memberErr(w, err)
 		return
 	}
@@ -218,13 +224,14 @@ func (h *MemberHandler) Applications(w http.ResponseWriter, r *http.Request) {
 func (h *MemberHandler) Decide(w http.ResponseWriter, r *http.Request) {
 	aid, _ := uuid.Parse(chi.URLParam(r, "application_id"))
 	var req struct {
-		Action string `json:"action"`
+		Action   string      `json:"action"`
+		Sponsors []uuid.UUID `json:"sponsor_member_ids"` // screener-attached at decision time
 	}
 	if err := httpx.Decode(w, r, &req); err != nil || req.Action == "" {
 		httpx.WriteErr(w, 400, "validation_failed", "action required")
 		return
 	}
-	if err := h.svc.DecideApplication(r.Context(), middleware.OrgCtx(r.Context()), aid, req.Action); err != nil {
+	if err := h.svc.DecideApplication(r.Context(), middleware.OrgCtx(r.Context()), aid, req.Action, req.Sponsors); err != nil {
 		memberErr(w, err)
 		return
 	}

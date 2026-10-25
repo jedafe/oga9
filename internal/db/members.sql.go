@@ -372,7 +372,7 @@ func (q *Queries) GetImport(ctx context.Context, id pgtype.UUID) (GetImportRow, 
 
 const getMembershipFull = `-- name: GetMembershipFull :one
 SELECT m.id, m.organization_id, m.user_id, m.member_no, m.category, m.lifecycle_state,
-       m.dues_standing, m.last_renewed_at, m.joined_at, m.created_at,
+       m.dues_standing, m.last_renewed_at, m.joined_at, m.created_at, m.org_unit_id,
        u.display_name, u.email
 FROM organization_memberships m
 JOIN users u ON u.id = m.user_id
@@ -390,6 +390,7 @@ type GetMembershipFullRow struct {
 	LastRenewedAt  pgtype.Timestamptz `json:"last_renewed_at"`
 	JoinedAt       pgtype.Timestamptz `json:"joined_at"`
 	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+	OrgUnitID      pgtype.UUID        `json:"org_unit_id"`
 	DisplayName    string             `json:"display_name"`
 	Email          string             `json:"email"`
 }
@@ -408,6 +409,7 @@ func (q *Queries) GetMembershipFull(ctx context.Context, id pgtype.UUID) (GetMem
 		&i.LastRenewedAt,
 		&i.JoinedAt,
 		&i.CreatedAt,
+		&i.OrgUnitID,
 		&i.DisplayName,
 		&i.Email,
 	)
@@ -848,7 +850,8 @@ func (q *Queries) RevokeCards(ctx context.Context, membershipID pgtype.UUID) err
 }
 
 const setApplicationStatus = `-- name: SetApplicationStatus :one
-UPDATE membership_applications SET status = $3, screened_by = $4, decided_at = now()
+UPDATE membership_applications SET status = $3, screened_by = $4,
+  decided_at = CASE WHEN $3 IN ('approved','rejected','withdrawn') THEN now() ELSE decided_at END
 WHERE id = $1 AND status = ANY($2::text[])
 RETURNING id, organization_id, sponsor_member_id
 `
