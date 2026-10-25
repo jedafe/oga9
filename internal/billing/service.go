@@ -39,6 +39,7 @@ var (
 	ErrBadExpiry           = errors.New("invalid_expiry")
 	ErrTenantNotFound      = errors.New("tenant_not_found")
 	ErrWebhookUnconfigured = errors.New("webhook_provider_not_configured")
+	ErrBadPayload          = errors.New("invalid_webhook_payload")
 	// ErrPaymentRequired: self-serve billing covers the free plan and
 	// downgrades only — upgrades flow through the provider webhook or a
 	// platform override (§15), never a bare plan_slug write.
@@ -438,7 +439,7 @@ func (s *Service) RecordWebhook(ctx context.Context, provider string, body, sign
 	}
 	var env webhookEnvelope
 	if err := json.Unmarshal(body, &env); err != nil || env.ID == "" || env.Type == "" {
-		return uuid.Nil, errors.New("invalid_webhook_payload")
+		return uuid.Nil, ErrBadPayload
 	}
 	id, err := s.q.InsertWebhookEvent(ctx, db.InsertWebhookEventParams{
 		Provider: provider, EventID: env.ID, EventType: env.Type, Payload: body,
@@ -474,7 +475,10 @@ func (s *Service) ProcessWebhook(ctx context.Context, rawEventID uuid.UUID) erro
 	}
 	sub, err := s.GetSubscription(ctx, tenantID)
 	if err != nil {
-		return s.markProcessed(ctx, rawEventID)
+		if errors.Is(err, ErrNoSubscription) {
+			return s.markProcessed(ctx, rawEventID) // tenant-less event — ack, don't retry forever
+		}
+		return err // transient lookup failure → retry, don't drop
 	}
 	return s.withTx(ctx, func(q *db.Queries) error {
 		switch ev.EventType {

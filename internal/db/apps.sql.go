@@ -11,11 +11,12 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-const activateApp = `-- name: ActivateApp :exec
+const activateApp = `-- name: ActivateApp :one
 INSERT INTO app_installations (tenant_id, app_id, status)
 VALUES ($1::uuid, $2, 'active')
 ON CONFLICT (tenant_id, app_id) DO UPDATE
 SET status = 'active', deactivated_at = NULL, activated_at = now()
+RETURNING id
 `
 
 type ActivateAppParams struct {
@@ -25,14 +26,18 @@ type ActivateAppParams struct {
 
 // Re-activation is an upsert: clears the deactivated marker (idempotent —
 // activating an active app is a no-op state-wise).
-func (q *Queries) ActivateApp(ctx context.Context, arg ActivateAppParams) error {
-	_, err := q.db.Exec(ctx, activateApp, arg.TenantID, arg.AppID)
-	return err
+func (q *Queries) ActivateApp(ctx context.Context, arg ActivateAppParams) (pgtype.UUID, error) {
+	row := q.db.QueryRow(ctx, activateApp, arg.TenantID, arg.AppID)
+	var id pgtype.UUID
+	err := row.Scan(&id)
+	return id, err
 }
 
-const deactivateApp = `-- name: DeactivateApp :exec
+const deactivateApp = `-- name: DeactivateApp :one
 UPDATE app_installations SET status = 'deactivated', deactivated_at = now()
 WHERE tenant_id = $1::uuid AND app_id = $2
+  AND status = 'active'
+RETURNING id
 `
 
 type DeactivateAppParams struct {
@@ -40,9 +45,13 @@ type DeactivateAppParams struct {
 	AppID    string      `json:"app_id"`
 }
 
-func (q *Queries) DeactivateApp(ctx context.Context, arg DeactivateAppParams) error {
-	_, err := q.db.Exec(ctx, deactivateApp, arg.TenantID, arg.AppID)
-	return err
+// Only an active installation transitions — callers check the active set
+// first, and this guard keeps already-deactivated rows untouched.
+func (q *Queries) DeactivateApp(ctx context.Context, arg DeactivateAppParams) (pgtype.UUID, error) {
+	row := q.db.QueryRow(ctx, deactivateApp, arg.TenantID, arg.AppID)
+	var id pgtype.UUID
+	err := row.Scan(&id)
+	return id, err
 }
 
 const getApp = `-- name: GetApp :one

@@ -209,7 +209,7 @@ func main() {
 			r.With(middleware.RequirePlatformNode(pool, "platform.plans.view")).Get("/platform/plans", billH.Plans)
 			r.With(middleware.RequirePlatformNode(pool, "platform.licenses.issue")).Post("/platform/licenses", billH.IssueLicense)
 			// §07 billing — tenant resolves server-side from the caller's
-			// org_admin tenants (tenantFor in the handler, Rule 24).
+			// org.admin.billing node grants (tenantFor in the handler, Rule 24).
 			r.Get("/me/entitlements", billH.Entitlements)
 			r.Get("/billing/subscription", billH.Subscription)
 			r.Post("/billing/subscription", billH.CreateSubscription)

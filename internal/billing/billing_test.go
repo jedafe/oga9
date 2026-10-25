@@ -91,6 +91,13 @@ func TestCreateSubscriptionGates(t *testing.T) {
 	if _, err := svc.CreateSubscription(ctx, tenant, "starter", "monthly", ""); err != ErrSubscriptionExists {
 		t.Fatalf("second open sub should conflict, got %v", err)
 	}
+	// resubscribe path: a cancelled history doesn't block a fresh free sub
+	if err := svc.Cancel(ctx, tenant, uuid.Nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.CreateSubscription(ctx, tenant, "starter", "monthly", ""); err != nil {
+		t.Fatalf("resubscribe after cancel should work, got %v", err)
+	}
 }
 
 func TestChangePlanGates(t *testing.T) {
@@ -138,7 +145,7 @@ func TestWebhookLifecycle(t *testing.T) {
 		t.Fatalf("bad sig should fail, got %v", err)
 	}
 
-	body, sig := webhookBody(t, "invoice.paid", tenant, "evt-1")
+	body, sig := webhookBody(t, "invoice.paid", tenant, "evt-"+uuid.NewString()[:12])
 	rawID, err := svc.RecordWebhook(ctx, "testprov", body, sig)
 	if err != nil {
 		t.Fatalf("record: %v", err)
@@ -217,38 +224,39 @@ func TestLicenseIssueValidateRenew(t *testing.T) {
 	svc, _ := testSvc(t)
 	ctx := context.Background()
 	tenant := mkTenant(t, svc.pool)
+	depID := "dep-" + uuid.NewString()[:12]
 	ents := json.RawMessage(`{"capabilities":["app.finance_lite"],"limits":{"limit.branches":5}}`)
 
-	if _, err := svc.IssueLicense(ctx, uuid.New(), "dep-x", "self_hosted", ents, time.Now().Add(time.Hour), uuid.Nil); err != ErrTenantNotFound {
+	if _, err := svc.IssueLicense(ctx, uuid.New(), depID, "self_hosted", ents, time.Now().Add(time.Hour), uuid.Nil); err != ErrTenantNotFound {
 		t.Fatalf("bad tenant should 404, got %v", err)
 	}
-	if _, err := svc.IssueLicense(ctx, tenant, "dep-x", "self_hosted", ents, time.Now().Add(-time.Hour), uuid.Nil); err != ErrBadExpiry {
+	if _, err := svc.IssueLicense(ctx, tenant, depID, "self_hosted", ents, time.Now().Add(-time.Hour), uuid.Nil); err != ErrBadExpiry {
 		t.Fatalf("past expiry should fail, got %v", err)
 	}
 	exp := time.Now().Add(24 * time.Hour).Truncate(time.Second)
-	if _, err := svc.IssueLicense(ctx, tenant, "dep-x", "self_hosted", ents, exp, uuid.Nil); err != nil {
+	if _, err := svc.IssueLicense(ctx, tenant, depID, "self_hosted", ents, exp, uuid.Nil); err != nil {
 		t.Fatalf("issue: %v", err)
 	}
 
-	row, err := svc.q.GetLicenseByDeployment(ctx, "dep-x")
+	row, err := svc.q.GetLicenseByDeployment(ctx, depID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := svc.ValidateLicense(ctx, "dep-x", hex.EncodeToString(row.Signature)); err != nil {
+	if _, err := svc.ValidateLicense(ctx, depID, hex.EncodeToString(row.Signature)); err != nil {
 		t.Fatalf("valid license should verify, got %v", err)
 	}
-	if _, err := svc.ValidateLicense(ctx, "dep-x", hex.EncodeToString(make([]byte, 64))); err != ErrBadSignature {
+	if _, err := svc.ValidateLicense(ctx, depID, hex.EncodeToString(make([]byte, 64))); err != ErrBadSignature {
 		t.Fatalf("forged sig should fail, got %v", err)
 	}
-	if _, err := svc.ValidateLicense(ctx, "dep-missing", "00"); err != ErrLicenseNotFound {
+	if _, err := svc.ValidateLicense(ctx, "dep-missing-"+uuid.NewString()[:8], "00"); err != ErrLicenseNotFound {
 		t.Fatalf("unknown deployment, got %v", err)
 	}
 	// renewal on the same deployment_id rotates in place, not a conflict
 	exp2 := time.Now().Add(48 * time.Hour).Truncate(time.Second)
-	if _, err := svc.IssueLicense(ctx, tenant, "dep-x", "self_hosted", ents, exp2, uuid.Nil); err != nil {
+	if _, err := svc.IssueLicense(ctx, tenant, depID, "self_hosted", ents, exp2, uuid.Nil); err != nil {
 		t.Fatalf("renewal should upsert, got %v", err)
 	}
-	if _, err := svc.ValidateLicense(ctx, "dep-x", hex.EncodeToString(row.Signature)); err != ErrBadSignature {
+	if _, err := svc.ValidateLicense(ctx, depID, hex.EncodeToString(row.Signature)); err != ErrBadSignature {
 		t.Fatalf("pre-renewal signature must not verify after rotation, got %v", err)
 	}
 }
@@ -260,7 +268,7 @@ func TestStaleWebhookRedrive(t *testing.T) {
 	if _, err := svc.CreateSubscription(ctx, tenant, "starter", "monthly", ""); err != nil {
 		t.Fatal(err)
 	}
-	body, sig := webhookBody(t, "subscription.cancelled", tenant, "evt-stale")
+	body, sig := webhookBody(t, "subscription.cancelled", tenant, "evt-"+uuid.NewString()[:12])
 	rawID, err := svc.RecordWebhook(ctx, "testprov", body, sig)
 	if err != nil {
 		t.Fatal(err)

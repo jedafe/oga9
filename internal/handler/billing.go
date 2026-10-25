@@ -113,7 +113,7 @@ func (h *BillingHandler) CreateSubscription(w http.ResponseWriter, r *http.Reque
 	if req.BillingTerm == "" {
 		req.BillingTerm = "monthly"
 	}
-	if _, err := h.svc.GetSubscription(r.Context(), tenantID); err == nil {
+	if sub, err := h.svc.GetSubscription(r.Context(), tenantID); err == nil && sub.State != "cancelled" {
 		httpx.WriteErr(w, 409, "subscription_exists", "use change-plan to switch plans")
 		return
 	}
@@ -196,9 +196,12 @@ func (h *BillingHandler) Entitlements(w http.ResponseWriter, r *http.Request) {
 	}
 	out := map[string]any{}
 	for _, t := range admins {
-		if set, err := h.ent.Set(r.Context(), t); err == nil {
-			out[t.String()] = set
+		set, err := h.ent.Set(r.Context(), t)
+		if err != nil {
+			log.Printf("entitlements: resolve failed for tenant %s: %v", t, err)
+			continue
 		}
+		out[t.String()] = set
 	}
 	httpx.WriteData(w, 200, out)
 }
@@ -297,6 +300,9 @@ func (h *BillingHandler) Webhook(w http.ResponseWriter, r *http.Request) {
 		return
 	case errors.Is(err, billing.ErrBadSignature):
 		httpx.WriteErr(w, 401, "invalid_signature", "signature verification failed")
+		return
+	case errors.Is(err, billing.ErrBadPayload):
+		httpx.WriteErr(w, 400, "invalid_webhook_payload", "signed body missing id/type")
 		return
 	case err != nil:
 		httpx.WriteErr(w, 500, "internal_error", "webhook record failed")

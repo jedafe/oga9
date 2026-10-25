@@ -5,6 +5,21 @@ entries reference engineering phases in `.oos/roadmaps/ROADMAP-BACKEND.md`.
 
 ## [Unreleased]
 
+### Fixed — Phase 07 review, round 2
+- `ProcessWebhook` no longer drops events on transient `GetSubscription`
+  failures — only `subscription_not_found` acks; other errors retry
+- Signed-but-malformed webhook bodies return `400 invalid_webhook_payload`
+  (was 500); stale-webhook redrive is bounded to a 2-day window so a
+  poisoned row can't re-enqueue hourly forever
+- App events now carry the `app_installations.id` as `aggregate_id` (was
+  the tenant uuid); re-activating an already-active app is a no-op with no
+  phantom `AppActivated`; `DeactivateApp` only transitions `active` rows
+- Resubscribe path: a cancelled-only tenant can create a fresh (free-plan)
+  subscription again — the 409 check only blocks on open subscriptions
+- `/me/entitlements` logs per-tenant resolve failures instead of silently
+  omitting them; unused `PlanExists` query removed; tests are
+  repeat-safe on a shared database
+
 ### Fixed — Phase 07 deep review
 - Self-serve billing restricted to free/downgrade plan moves:
   `POST /billing/subscription` + `change-plan` return `402 payment_required`

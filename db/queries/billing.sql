@@ -4,9 +4,6 @@
 SELECT slug, label, price_monthly_minor, price_annual_minor, currency, sort
 FROM plans WHERE is_public ORDER BY sort;
 
--- name: PlanExists :one
-SELECT EXISTS(SELECT 1 FROM plans WHERE slug = $1) AS exists;
-
 -- name: GetPlan :one
 SELECT slug, price_monthly_minor, price_annual_minor, is_public
 FROM plans WHERE slug = $1;
@@ -96,8 +93,12 @@ WHERE id = sqlc.arg(id)::uuid AND processed_at IS NULL;
 -- name: ListStaleWebhookEvents :many
 -- Rule 9 durability floor: rows recorded but never processed because the
 -- enqueue failed. The sweep re-drives them into billing:process_webhook.
+-- Bounded to 2 days — a permanently-poisoned row must stop re-enqueueing
+-- (manual inspection), not loop forever.
 SELECT id FROM billing_webhook_events
-WHERE processed_at IS NULL AND created_at < now() - interval '5 minutes'
+WHERE processed_at IS NULL
+  AND created_at < now() - interval '5 minutes'
+  AND created_at > now() - interval '2 days'
 ORDER BY created_at LIMIT 200;
 
 -- name: GetUsage :one

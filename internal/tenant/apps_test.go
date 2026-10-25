@@ -2,6 +2,7 @@ package tenant
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 
 	"github.com/google/uuid"
@@ -61,38 +62,41 @@ func TestAppLifecycle(t *testing.T) {
 	}
 
 	// synthetic non-required pair exercises the dependents path
+	base := "pb" + uuid.NewString()[:8]
+	ext := "pe" + uuid.NewString()[:8]
+	baseM, _ := json.Marshal(map[string]any{"id": base, "version": "1.0.0", "requires": []string{}, "entitlements": map[string]any{}})
+	extM, _ := json.Marshal(map[string]any{"id": ext, "version": "1.0.0", "requires": []string{base}, "entitlements": map[string]any{}})
 	if _, err := pool.Exec(ctx, `INSERT INTO app_registry (app_id, version, label, manifest) VALUES
-		('plug_base','1.0.0','Base','{"id":"plug_base","version":"1.0.0","requires":[],"entitlements":{}}'),
-		('plug_ext','1.0.0','Ext','{"id":"plug_ext","version":"1.0.0","requires":["plug_base"],"entitlements":{}}')`); err != nil {
+		($1,'1.0.0','Base',$3::jsonb), ($2,'1.0.0','Ext',$4::jsonb)`, base, ext, baseM, extM); err != nil {
 		t.Fatal(err)
 	}
-	if err := svc.ActivateApp(ctx, oc, ent, "plug_base"); err != nil {
+	if err := svc.ActivateApp(ctx, oc, ent, base); err != nil {
 		t.Fatalf("no requires, no feature gate → activate, got %v", err)
 	}
-	if err := svc.ActivateApp(ctx, oc, ent, "plug_ext"); err != nil {
+	if err := svc.ActivateApp(ctx, oc, ent, ext); err != nil {
 		t.Fatalf("dep active → activate, got %v", err)
 	}
-	if err := svc.DeactivateApp(ctx, oc, "plug_base"); err != ErrAppHasDependents {
-		t.Fatalf("plug_ext depends on plug_base, got %v", err)
+	if err := svc.DeactivateApp(ctx, oc, base); err != ErrAppHasDependents {
+		t.Fatalf("ext depends on base, got %v", err)
 	}
-	if err := svc.DeactivateApp(ctx, oc, "plug_ext"); err != nil {
+	if err := svc.DeactivateApp(ctx, oc, ext); err != nil {
 		t.Fatalf("deactivate leaf first: %v", err)
 	}
-	if err := svc.DeactivateApp(ctx, oc, "plug_base"); err != nil {
+	if err := svc.DeactivateApp(ctx, oc, base); err != nil {
 		t.Fatalf("deactivate: %v", err)
 	}
-	if ok, _ := svc.IsAppActive(ctx, oc.TenantID, "plug_base"); ok {
-		t.Fatal("plug_base should be inactive")
+	if ok, _ := svc.IsAppActive(ctx, oc.TenantID, base); ok {
+		t.Fatal("base should be inactive")
 	}
-	if n := countEvent(t, svc, oc.TenantID, "AppDeactivated", "plug_base"); n != 1 {
+	if n := countEvent(t, svc, oc.TenantID, "AppDeactivated", base); n != 1 {
 		t.Fatalf("expected 1 AppDeactivated, got %d", n)
 	}
 
 	// repeat deactivation is a no-op — no phantom event
-	if err := svc.DeactivateApp(ctx, oc, "plug_base"); err != nil {
+	if err := svc.DeactivateApp(ctx, oc, base); err != nil {
 		t.Fatal(err)
 	}
-	if n := countEvent(t, svc, oc.TenantID, "AppDeactivated", "plug_base"); n != 1 {
+	if n := countEvent(t, svc, oc.TenantID, "AppDeactivated", base); n != 1 {
 		t.Fatalf("no-op deactivate emitted phantom events: %d", n)
 	}
 	// never-installed app: also a silent no-op
@@ -107,18 +111,25 @@ func TestAppLifecycle(t *testing.T) {
 	if err := svc.ActivateApp(ctx, oc, ent, "finance_lite"); err != ErrNotEntitled {
 		t.Fatalf("starter lacks app.finance_lite, got %v", err)
 	}
-	// dependency gate: plug_ext requires plug_base (currently inactive)
-	if err := svc.ActivateApp(ctx, oc, ent, "plug_ext"); err != ErrAppDepsMissing {
-		t.Fatalf("plug_ext needs plug_base active, got %v", err)
+	// dependency gate: ext requires base (currently inactive)
+	if err := svc.ActivateApp(ctx, oc, ent, ext); err != ErrAppDepsMissing {
+		t.Fatalf("ext needs base active, got %v", err)
 	}
-	if err := svc.ActivateApp(ctx, oc, ent, "plug_base"); err != nil {
+	if err := svc.ActivateApp(ctx, oc, ent, base); err != nil {
 		t.Fatalf("reactivate base: %v", err)
 	}
-	if err := svc.ActivateApp(ctx, oc, ent, "plug_ext"); err != nil {
+	if err := svc.ActivateApp(ctx, oc, ent, ext); err != nil {
 		t.Fatalf("deps satisfied → activate, got %v", err)
 	}
 	if err := svc.ActivateApp(ctx, oc, ent, "no_such_app"); err != ErrAppNotFound {
 		t.Fatalf("unknown app, got %v", err)
+	}
+	// re-activating an already-active app is a no-op — no phantom event
+	if err := svc.ActivateApp(ctx, oc, ent, "members"); err != nil {
+		t.Fatal(err)
+	}
+	if n := countEvent(t, svc, oc.TenantID, "AppActivated", "members"); n != 0 {
+		t.Fatalf("re-activation emitted %d phantom events", n)
 	}
 }
 

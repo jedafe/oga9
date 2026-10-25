@@ -21,14 +21,19 @@ SELECT EXISTS(
     AND status = 'active'
 ) AS active;
 
--- name: ActivateApp :exec
+-- name: ActivateApp :one
 -- Re-activation is an upsert: clears the deactivated marker (idempotent —
 -- activating an active app is a no-op state-wise).
 INSERT INTO app_installations (tenant_id, app_id, status)
 VALUES (sqlc.arg(tenant_id)::uuid, sqlc.arg(app_id), 'active')
 ON CONFLICT (tenant_id, app_id) DO UPDATE
-SET status = 'active', deactivated_at = NULL, activated_at = now();
+SET status = 'active', deactivated_at = NULL, activated_at = now()
+RETURNING id;
 
--- name: DeactivateApp :exec
+-- name: DeactivateApp :one
+-- Only an active installation transitions — callers check the active set
+-- first, and this guard keeps already-deactivated rows untouched.
 UPDATE app_installations SET status = 'deactivated', deactivated_at = now()
-WHERE tenant_id = sqlc.arg(tenant_id)::uuid AND app_id = sqlc.arg(app_id);
+WHERE tenant_id = sqlc.arg(tenant_id)::uuid AND app_id = sqlc.arg(app_id)
+  AND status = 'active'
+RETURNING id;

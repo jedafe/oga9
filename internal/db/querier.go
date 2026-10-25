@@ -13,7 +13,7 @@ import (
 type Querier interface {
 	// Re-activation is an upsert: clears the deactivated marker (idempotent —
 	// activating an active app is a no-op state-wise).
-	ActivateApp(ctx context.Context, arg ActivateAppParams) error
+	ActivateApp(ctx context.Context, arg ActivateAppParams) (pgtype.UUID, error)
 	AddCommitteeMember(ctx context.Context, arg AddCommitteeMemberParams) (pgtype.UUID, error)
 	AddUsage(ctx context.Context, arg AddUsageParams) (int64, error)
 	AppointOfficer(ctx context.Context, arg AppointOfficerParams) (pgtype.UUID, error)
@@ -56,7 +56,9 @@ type Querier interface {
 	// Ref: oga9-engineering/sections/02-identity-authentication-sessions.md
 	// sqlc queries for users, sessions, oauth links (Phase 02).
 	CreateUser(ctx context.Context, arg CreateUserParams) (CreateUserRow, error)
-	DeactivateApp(ctx context.Context, arg DeactivateAppParams) error
+	// Only an active installation transitions — callers check the active set
+	// first, and this guard keeps already-deactivated rows untouched.
+	DeactivateApp(ctx context.Context, arg DeactivateAppParams) (pgtype.UUID, error)
 	// Attempt cap reached: pull the event out of the pending set and record the
 	// terminal error. `events:retry_dead` (Phase 06) can reset dispatched_at.
 	DeadLetterEvent(ctx context.Context, arg DeadLetterEventParams) error
@@ -141,6 +143,8 @@ type Querier interface {
 	ListPublicOrgs(ctx context.Context) ([]ListPublicOrgsRow, error)
 	// Rule 9 durability floor: rows recorded but never processed because the
 	// enqueue failed. The sweep re-drives them into billing:process_webhook.
+	// Bounded to 2 days — a permanently-poisoned row must stop re-enqueueing
+	// (manual inspection), not loop forever.
 	ListStaleWebhookEvents(ctx context.Context) ([]pgtype.UUID, error)
 	ListTemplates(ctx context.Context) ([]ListTemplatesRow, error)
 	// Billing-tenant resolution (Rule 24): tenants where the caller holds a
@@ -156,7 +160,6 @@ type Querier interface {
 	MarkEventDispatched(ctx context.Context, id pgtype.UUID) error
 	// Idempotent worker completion — a redrive sees processed_at set and skips.
 	MarkWebhookProcessed(ctx context.Context, id pgtype.UUID) (int64, error)
-	PlanExists(ctx context.Context, slug string) (bool, error)
 	// Failed consumer pass — stays pending, retried after exponential backoff
 	// (10s * 2^attempts, capped at 1h — §05 "retry w/ backoff").
 	RecordEventAttempt(ctx context.Context, arg RecordEventAttemptParams) error

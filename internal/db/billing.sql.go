@@ -438,12 +438,16 @@ func (q *Queries) ListPlans(ctx context.Context) ([]ListPlansRow, error) {
 
 const listStaleWebhookEvents = `-- name: ListStaleWebhookEvents :many
 SELECT id FROM billing_webhook_events
-WHERE processed_at IS NULL AND created_at < now() - interval '5 minutes'
+WHERE processed_at IS NULL
+  AND created_at < now() - interval '5 minutes'
+  AND created_at > now() - interval '2 days'
 ORDER BY created_at LIMIT 200
 `
 
 // Rule 9 durability floor: rows recorded but never processed because the
 // enqueue failed. The sweep re-drives them into billing:process_webhook.
+// Bounded to 2 days — a permanently-poisoned row must stop re-enqueueing
+// (manual inspection), not loop forever.
 func (q *Queries) ListStaleWebhookEvents(ctx context.Context) ([]pgtype.UUID, error) {
 	rows, err := q.db.Query(ctx, listStaleWebhookEvents)
 	if err != nil {
@@ -512,17 +516,6 @@ func (q *Queries) MarkWebhookProcessed(ctx context.Context, id pgtype.UUID) (int
 		return 0, err
 	}
 	return result.RowsAffected(), nil
-}
-
-const planExists = `-- name: PlanExists :one
-SELECT EXISTS(SELECT 1 FROM plans WHERE slug = $1) AS exists
-`
-
-func (q *Queries) PlanExists(ctx context.Context, slug string) (bool, error) {
-	row := q.db.QueryRow(ctx, planExists, slug)
-	var exists bool
-	err := row.Scan(&exists)
-	return exists, err
 }
 
 const setSubscriptionPlan = `-- name: SetSubscriptionPlan :exec

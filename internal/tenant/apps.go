@@ -109,10 +109,14 @@ func (s *Service) ActivateApp(ctx context.Context, oc *OrgCtx, ent *entitlements
 				return ErrAppDepsMissing
 			}
 		}
-		if err := q.ActivateApp(ctx, db.ActivateAppParams{TenantID: toPg(oc.TenantID), AppID: appID}); err != nil {
+		if activeSet[appID] {
+			return nil // already active — idempotent no-op, no event
+		}
+		iid, err := q.ActivateApp(ctx, db.ActivateAppParams{TenantID: toPg(oc.TenantID), AppID: appID})
+		if err != nil {
 			return err
 		}
-		return events.Emit(ctx, q, oc.TenantID, oc.OrgID, "AppActivated", "app_installation", oc.TenantID, oc.UserID, true,
+		return events.Emit(ctx, q, oc.TenantID, oc.OrgID, "AppActivated", "app_installation", uuid.UUID(iid.Bytes), oc.UserID, true,
 			map[string]any{"tenant_id": oc.TenantID, "app_id": appID, "org_id": oc.OrgID})
 	})
 }
@@ -154,10 +158,11 @@ func (s *Service) DeactivateApp(ctx context.Context, oc *OrgCtx, appID string) e
 		return nil // never installed or already deactivated — idempotent no-op, no event
 	}
 	return s.withTx(ctx, func(q *db.Queries) error {
-		if err := q.DeactivateApp(ctx, db.DeactivateAppParams{TenantID: toPg(oc.TenantID), AppID: appID}); err != nil {
+		iid, err := q.DeactivateApp(ctx, db.DeactivateAppParams{TenantID: toPg(oc.TenantID), AppID: appID})
+		if err != nil {
 			return err
 		}
-		return events.Emit(ctx, q, oc.TenantID, oc.OrgID, "AppDeactivated", "app_installation", oc.TenantID, oc.UserID, true,
+		return events.Emit(ctx, q, oc.TenantID, oc.OrgID, "AppDeactivated", "app_installation", uuid.UUID(iid.Bytes), oc.UserID, true,
 			map[string]any{"tenant_id": oc.TenantID, "app_id": appID, "org_id": oc.OrgID})
 	})
 }
@@ -173,7 +178,7 @@ func provisionMVPApps(ctx context.Context, q *db.Queries, tenantID uuid.UUID) er
 		if !a.MvpRequired {
 			continue
 		}
-		if err := q.ActivateApp(ctx, db.ActivateAppParams{TenantID: toPg(tenantID), AppID: a.AppID}); err != nil {
+		if _, err := q.ActivateApp(ctx, db.ActivateAppParams{TenantID: toPg(tenantID), AppID: a.AppID}); err != nil {
 			return err
 		}
 	}
