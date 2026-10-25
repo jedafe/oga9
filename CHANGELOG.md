@@ -5,6 +5,22 @@ entries reference engineering phases in `.oos/roadmaps/ROADMAP-BACKEND.md`.
 
 ## [Unreleased]
 
+### Added — Phase 06 (Job Queue Conventions, §08)
+- `internal/tasks` becomes the code-side task registry: all nine §08
+  foundation seeds registered (Rule 7) — `identity:send_verification`,
+  `identity:send_password_reset`, `events:retry_dead`, `scheduler:tick`
+  implemented; `billing:retry_payment`, `billing:subscription_state_sweep`,
+  `license:renewal_reminder`, `tenant:provision` wired as explicit no-op
+  stubs pinned to their owning phases
+- `events:retry_dead` (default tier per §08) — `RetryDeadEvents` resets
+  dead-lettered `domain_events` (`dispatched_at`/`attempts`/`last_error`/
+  `next_attempt_at` cleared) in bounded batches; scheduled via
+  `OGA9_EVENTS_RETRY_DEAD_INTERVAL` (default 1m)
+- `scheduler:tick` cron driver via `OGA9_SCHEDULER_TICK_INTERVAL`
+  (default 5m): runs `tasks.OnTick`-registered sweeps and reports the
+  queue-depth metric — per-queue pending/retry/archived via asynq
+  Inspector + `CountDeadEvents` DLQ depth (ADR-020 reliability signal)
+
 ### Added — Phase 05 (Domain Events Infrastructure)
 - Group-6 migrations: `event_consumer_log` (consumer,event PK — Rule 27
   idempotency ledger) + `entity_links` (ADR-015 graph edges)

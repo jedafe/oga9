@@ -104,7 +104,9 @@ func main() {
 	mail := mailer.New(cfg.SMTPHost, cfg.SMTPPort, cfg.MailFrom, cfg.SMTPUser, cfg.SMTPPass)
 	queue := asynq.NewClient(asynq.RedisClientOpt{Addr: cfg.ValkeyAddr})
 	defer queue.Close()
-	for taskType, h := range tasks.Handlers(mail) {
+	for taskType, h := range tasks.Handlers(tasks.Deps{
+		Mail: mail, Pool: pool, RedisAddr: cfg.ValkeyAddr,
+	}) {
 		mux.HandleFunc(taskType, h)
 	}
 	authSvc := auth.NewService(pool, vk, cfg.JWTSecret, cfg.SessionTTL, cfg.DataKey)
@@ -130,6 +132,19 @@ func main() {
 		asynq.NewTask(events.TypeDispatchOutbox, nil, asynq.Queue("critical")),
 	); err != nil {
 		log.Fatalf("outbox schedule: %v", err)
+	}
+	// §08 recurring jobs: DLQ re-drive (default tier per §08 seeded table) +
+	// the scheduler:tick cron driver (sweeps + queue-depth metric).
+	for typ, iv := range map[string]time.Duration{
+		tasks.TypeRetryDead:     cfg.RetryDeadInterval,
+		tasks.TypeSchedulerTick: cfg.SchedulerTickInterval,
+	} {
+		if _, err := scheduler.Register(
+			"@every "+iv.String(),
+			asynq.NewTask(typ, nil, asynq.Queue("default")),
+		); err != nil {
+			log.Fatalf("schedule %s: %v", typ, err)
+		}
 	}
 
 	r.Use(middleware.ResolveIP(cfg.TrustedProxies))

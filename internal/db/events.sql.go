@@ -27,6 +27,19 @@ func (q *Queries) ConsumerLogged(ctx context.Context, arg ConsumerLoggedParams) 
 	return processed, err
 }
 
+const countDeadEvents = `-- name: CountDeadEvents :one
+SELECT count(*) FROM domain_events
+WHERE dispatched_at IS NOT NULL AND attempts >= $1::int
+`
+
+// DLQ depth for the queue-depth metric (ADR-020 reliability signal).
+func (q *Queries) CountDeadEvents(ctx context.Context, maxAttempts int32) (int64, error) {
+	row := q.db.QueryRow(ctx, countDeadEvents, maxAttempts)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const deadLetterEvent = `-- name: DeadLetterEvent :exec
 UPDATE domain_events SET dispatched_at = now(), attempts = attempts + 1, last_error = $2
 WHERE id = $1
@@ -292,4 +305,31 @@ func (q *Queries) RelatedEntities(ctx context.Context, arg RelatedEntitiesParams
 		return nil, err
 	}
 	return items, nil
+}
+
+const retryDeadEvents = `-- name: RetryDeadEvents :execrows
+UPDATE domain_events SET dispatched_at = NULL, attempts = 0,
+       last_error = NULL, next_attempt_at = NULL
+WHERE id IN (
+  SELECT id FROM domain_events
+  WHERE dispatched_at IS NOT NULL AND attempts >= $1::int
+  ORDER BY occurred_at
+  LIMIT $2::int
+)
+`
+
+type RetryDeadEventsParams struct {
+	MaxAttempts int32 `json:"max_attempts"`
+	BatchSize   int32 `json:"batch_size"`
+}
+
+// §08 DLQ re-drive: dead letters are rows parked by the dispatcher —
+// dispatched_at set AND attempts at cap. Reset makes them claimable again;
+// next_attempt_at cleared so they retry on the next tick. Idempotent.
+func (q *Queries) RetryDeadEvents(ctx context.Context, arg RetryDeadEventsParams) (int64, error) {
+	result, err := q.db.Exec(ctx, retryDeadEvents, arg.MaxAttempts, arg.BatchSize)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }

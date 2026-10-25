@@ -28,6 +28,8 @@ type Querier interface {
 	// statement — concurrent logins can't both consume the same code.
 	ConsumeRecoveryCode(ctx context.Context, arg ConsumeRecoveryCodeParams) (pgtype.UUID, error)
 	ConsumerLogged(ctx context.Context, arg ConsumerLoggedParams) (bool, error)
+	// DLQ depth for the queue-depth metric (ADR-020 reliability signal).
+	CountDeadEvents(ctx context.Context, maxAttempts int32) (int64, error)
 	// Active seat occupancy for a position within a term (seats cap, §03).
 	CountPositionSeats(ctx context.Context, arg CountPositionSeatsParams) (int64, error)
 	CountTenantOrgs(ctx context.Context, tenantID pgtype.UUID) (int64, error)
@@ -116,6 +118,10 @@ type Querier interface {
 	// appointments in the org's current term. _branch/_committee nodes are
 	// suffixed base nodes — resolved in Go against scoped grants.
 	ResolveOrgPermissions(ctx context.Context, arg ResolveOrgPermissionsParams) ([]string, error)
+	// §08 DLQ re-drive: dead letters are rows parked by the dispatcher —
+	// dispatched_at set AND attempts at cap. Reset makes them claimable again;
+	// next_attempt_at cleared so they retry on the next tick. Idempotent.
+	RetryDeadEvents(ctx context.Context, arg RetryDeadEventsParams) (int64, error)
 	RevokeAllUserSessions(ctx context.Context, userID pgtype.UUID) ([]pgtype.UUID, error)
 	RevokeSessionByID(ctx context.Context, arg RevokeSessionByIDParams) (pgtype.UUID, error)
 	RevokeSessionByJTI(ctx context.Context, jti pgtype.UUID) (pgtype.UUID, error)

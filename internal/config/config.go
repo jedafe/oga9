@@ -26,22 +26,25 @@ type Config struct {
 	APIPort        int
 	SessionTTL     time.Duration
 	OutboxInterval time.Duration // events:dispatch_outbox cadence (§05)
-	SMTPHost       string
-	SMTPPort       int
-	SMTPUser       string
-	SMTPPass       string
-	GlitchTipDSN   string
-	MeilisearchURL string
-	MeilisearchKey string
-	S3Endpoint     string
-	S3Bucket       string
-	S3AccessKey    string
-	S3SecretKey    string
-	ImgproxyURL    string
-	BaseURL        string
-	AppURL         string // user-facing app origin for emailed links (app.oga9.com)
-	MailFrom       string
-	TrustedProxies []*net.IPNet
+	// §08 job queue cadences
+	SchedulerTickInterval time.Duration // scheduler:tick cron driver
+	RetryDeadInterval     time.Duration // events:retry_dead DLQ re-drive
+	SMTPHost              string
+	SMTPPort              int
+	SMTPUser              string
+	SMTPPass              string
+	GlitchTipDSN          string
+	MeilisearchURL        string
+	MeilisearchKey        string
+	S3Endpoint            string
+	S3Bucket              string
+	S3AccessKey           string
+	S3SecretKey           string
+	ImgproxyURL           string
+	BaseURL               string
+	AppURL                string // user-facing app origin for emailed links (app.oga9.com)
+	MailFrom              string
+	TrustedProxies        []*net.IPNet
 }
 
 // OAuthProviderEnv is a raw provider env bundle; cmd/api maps it onto
@@ -53,29 +56,31 @@ type OAuthProviderEnv struct {
 func Load() (*Config, error) {
 	var errs []error
 	cfg := &Config{
-		Env:            env("OGA9_ENV", "development"),
-		DatabaseURL:    reqEnv(&errs, "OGA9_DATABASE_URL"),
-		ValkeyAddr:     reqEnv(&errs, "OGA9_VALKEY_ADDR"),
-		JWTSecret:      reqEnv(&errs, "OGA9_JWT_SECRET"),
-		BaseDomain:     env("OGA9_BASE_DOMAIN", "oga9.com"),
-		ControlHost:    env("OGA9_CONTROL_HOST", "control.oga9.com"),
-		APIPort:        envInt(&errs, "OGA9_API_PORT", 8080),
-		SessionTTL:     envDur(&errs, "OGA9_SESSION_TTL", 24*time.Hour),
-		OutboxInterval: envDur(&errs, "OGA9_OUTBOX_DISPATCH_INTERVAL", 10*time.Second),
-		SMTPHost:       env("OGA9_SMTP_HOST", "localhost"),
-		SMTPPort:       envInt(&errs, "OGA9_SMTP_PORT", 1025),
-		SMTPUser:       env("OGA9_SMTP_USERNAME", ""),
-		SMTPPass:       env("OGA9_SMTP_PASSWORD", ""),
-		GlitchTipDSN:   env("OGA9_GLITCHTIP_DSN", ""),
-		MeilisearchURL: env("OGA9_MEILISEARCH_URL", ""),
-		MeilisearchKey: env("OGA9_MEILISEARCH_KEY", ""),
-		S3Endpoint:     env("OGA9_S3_ENDPOINT", ""),
-		S3Bucket:       env("OGA9_S3_BUCKET", ""),
-		S3AccessKey:    env("OGA9_S3_ACCESS_KEY", ""),
-		S3SecretKey:    env("OGA9_S3_SECRET_KEY", ""),
-		ImgproxyURL:    env("OGA9_IMGPROXY_URL", ""),
-		MailFrom:       env("OGA9_MAIL_FROM", "noreply@oga9.com"),
-		BaseURL:        env("OGA9_BASE_URL", "http://localhost:8080"),
+		Env:                   env("OGA9_ENV", "development"),
+		DatabaseURL:           reqEnv(&errs, "OGA9_DATABASE_URL"),
+		ValkeyAddr:            reqEnv(&errs, "OGA9_VALKEY_ADDR"),
+		JWTSecret:             reqEnv(&errs, "OGA9_JWT_SECRET"),
+		BaseDomain:            env("OGA9_BASE_DOMAIN", "oga9.com"),
+		ControlHost:           env("OGA9_CONTROL_HOST", "control.oga9.com"),
+		APIPort:               envInt(&errs, "OGA9_API_PORT", 8080),
+		SessionTTL:            envDur(&errs, "OGA9_SESSION_TTL", 24*time.Hour),
+		OutboxInterval:        envDur(&errs, "OGA9_OUTBOX_DISPATCH_INTERVAL", 10*time.Second),
+		SchedulerTickInterval: envDur(&errs, "OGA9_SCHEDULER_TICK_INTERVAL", 5*time.Minute),
+		RetryDeadInterval:     envDur(&errs, "OGA9_EVENTS_RETRY_DEAD_INTERVAL", time.Minute),
+		SMTPHost:              env("OGA9_SMTP_HOST", "localhost"),
+		SMTPPort:              envInt(&errs, "OGA9_SMTP_PORT", 1025),
+		SMTPUser:              env("OGA9_SMTP_USERNAME", ""),
+		SMTPPass:              env("OGA9_SMTP_PASSWORD", ""),
+		GlitchTipDSN:          env("OGA9_GLITCHTIP_DSN", ""),
+		MeilisearchURL:        env("OGA9_MEILISEARCH_URL", ""),
+		MeilisearchKey:        env("OGA9_MEILISEARCH_KEY", ""),
+		S3Endpoint:            env("OGA9_S3_ENDPOINT", ""),
+		S3Bucket:              env("OGA9_S3_BUCKET", ""),
+		S3AccessKey:           env("OGA9_S3_ACCESS_KEY", ""),
+		S3SecretKey:           env("OGA9_S3_SECRET_KEY", ""),
+		ImgproxyURL:           env("OGA9_IMGPROXY_URL", ""),
+		MailFrom:              env("OGA9_MAIL_FROM", "noreply@oga9.com"),
+		BaseURL:               env("OGA9_BASE_URL", "http://localhost:8080"),
 	}
 	cfg.AppURL = env("OGA9_APP_URL", cfg.BaseURL)
 	for _, c := range strings.Split(env("OGA9_TRUSTED_PROXIES", ""), ",") {

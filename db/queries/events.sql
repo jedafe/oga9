@@ -39,6 +39,24 @@ WHERE id = $1;
 UPDATE domain_events SET dispatched_at = now(), attempts = attempts + 1, last_error = $2
 WHERE id = $1;
 
+-- name: RetryDeadEvents :execrows
+-- §08 DLQ re-drive: dead letters are rows parked by the dispatcher —
+-- dispatched_at set AND attempts at cap. Reset makes them claimable again;
+-- next_attempt_at cleared so they retry on the next tick. Idempotent.
+UPDATE domain_events SET dispatched_at = NULL, attempts = 0,
+       last_error = NULL, next_attempt_at = NULL
+WHERE id IN (
+  SELECT id FROM domain_events
+  WHERE dispatched_at IS NOT NULL AND attempts >= sqlc.arg(max_attempts)::int
+  ORDER BY occurred_at
+  LIMIT sqlc.arg(batch_size)::int
+);
+
+-- name: CountDeadEvents :one
+-- DLQ depth for the queue-depth metric (ADR-020 reliability signal).
+SELECT count(*) FROM domain_events
+WHERE dispatched_at IS NOT NULL AND attempts >= sqlc.arg(max_attempts)::int;
+
 -- name: ConsumerLogged :one
 SELECT EXISTS(SELECT 1 FROM event_consumer_log WHERE consumer = $1 AND event_id = $2) AS processed;
 
