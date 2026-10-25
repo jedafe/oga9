@@ -18,6 +18,7 @@ func TestMemberLifecycleFlow(t *testing.T) {
 	ctx := context.Background()
 	owner := mkUser(t, pool, "ow"+uuid.NewString()[:8]+"@test.oga9")
 	applicant := mkUser(t, pool, "ap"+uuid.NewString()[:8]+"@test.oga9")
+	late := mkUser(t, pool, "lt"+uuid.NewString()[:8]+"@test.oga9")
 
 	org, err := svc.CreateOrg(ctx, owner, "Member Union", "mu"+uuid.NewString()[:6], "union", "union", "NG", "Lagos", "o@t.co", uuid.Nil, nil)
 	if err != nil {
@@ -28,17 +29,29 @@ func TestMemberLifecycleFlow(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// sponsor_required=1: application without sponsor is rejected
+	// sponsor_required=1 is enforced at APPROVE, not apply — intake stays
+	// open; the unsponsored application screens fine then fails the guard.
 	if err := svc.SetSetting(ctx, oc, "org.membership.sponsor_required", json.RawMessage("1")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := svc.Apply(ctx, org.ID, applicant, "applicant@t.co", "", nil, uuid.Nil); err != ErrSponsorRequired {
-		t.Fatalf("expected sponsor_required, got %v", err)
+	lone, err := svc.Apply(ctx, org.ID, late, "late@t.co", "", nil, uuid.Nil)
+	if err != nil {
+		t.Fatal(err)
 	}
-	// owner's membership is the sponsor (creator lands 'active')
+	if err := svc.DecideApplication(ctx, oc, lone, "screen"); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.DecideApplication(ctx, oc, lone, "approve"); err != ErrSponsorRequired {
+		t.Fatalf("unsponsored approve under required=1 should fail, got %v", err)
+	}
 	if err := svc.SetSetting(ctx, oc, "org.membership.sponsor_required", json.RawMessage("0")); err != nil {
 		t.Fatal(err)
 	}
+	if err := svc.DecideApplication(ctx, oc, lone, "approve"); err != nil {
+		t.Fatalf("approve after setting drop: %v", err)
+	}
+
+	// owner's membership is the sponsor (creator lands 'active')
 	appID, err := svc.Apply(ctx, org.ID, applicant, "applicant@t.co", "", json.RawMessage(`{"village":"Ota"}`), oc.MembershipID)
 	if err != nil {
 		t.Fatalf("apply: %v", err)

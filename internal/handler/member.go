@@ -7,7 +7,9 @@ import (
 	"encoding/csv"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -240,21 +242,30 @@ func (h *MemberHandler) PublicApply(w http.ResponseWriter, r *http.Request) {
 	httpx.WriteData(w, 201, map[string]any{"id": id, "status": "applied"})
 }
 
-// Import — POST /orgs/{id}/members/import {filename, rows:[...]}: durable
-// import row + membership:import fan-out (§11: rows become applications).
+// Import — POST /orgs/{id}/members/import {filename, csv | rows}:
+// durable import row + membership:import fan-out (§11: rows become
+// applications). csv is raw text with a header row (email,phone,…);
+// rows is a pre-parsed JSON array for API clients.
 func (h *MemberHandler) Import(w http.ResponseWriter, r *http.Request) {
 	oc := middleware.OrgCtx(r.Context())
 	var req struct {
 		Filename string            `json:"filename"`
+		CSV      string            `json:"csv"`
 		Rows     []json.RawMessage `json:"rows"`
 	}
-	if err := httpx.Decode(w, r, &req); err != nil || req.Filename == "" || len(req.Rows) == 0 {
-		httpx.WriteErr(w, 400, "validation_failed", "filename and rows required")
+	if err := httpx.Decode(w, r, &req); err != nil || req.Filename == "" || (req.CSV == "" && len(req.Rows) == 0) {
+		httpx.WriteErr(w, 400, "validation_failed", "filename and csv or rows required")
 		return
 	}
-	raw, err := json.Marshal(req.Rows)
+	var raw json.RawMessage
+	var err error
+	if req.CSV != "" {
+		raw, err = csvRows(req.CSV)
+	} else {
+		raw, err = json.Marshal(req.Rows)
+	}
 	if err != nil {
-		httpx.WriteErr(w, 400, "validation_failed", "rows must be objects")
+		httpx.WriteErr(w, 400, "validation_failed", "unparseable import payload: "+err.Error())
 		return
 	}
 	id, err := h.svc.CreateImport(r.Context(), oc, req.Filename, raw)
@@ -304,4 +315,41 @@ func (h *MemberHandler) MyMemberships(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httpx.WriteData(w, 200, rows)
+}
+
+// ApplyForm — GET /directory/orgs/{slug}/apply (public): the org's
+// configurable application fields + sponsor requirement so the form can
+// render before submission.
+func (h *MemberHandler) ApplyForm(w http.ResponseWriter, r *http.Request) {
+	out, err := h.svc.PublicApplyForm(r.Context(), chi.URLParam(r, "slug"))
+	if err != nil {
+		memberErr(w, err)
+		return
+	}
+	httpx.WriteData(w, 200, out)
+}
+
+// csvRows parses a header-row CSV into the row-object shape the worker
+// stores in member_imports.data.
+func csvRows(text string) (json.RawMessage, error) {
+	r := csv.NewReader(strings.NewReader(text))
+	recs, err := r.ReadAll()
+	if err != nil || len(recs) < 2 {
+		return nil, fmt.Errorf("need a header row and at least one data row")
+	}
+	head := recs[0]
+	for i := range head {
+		head[i] = strings.ToLower(strings.TrimSpace(head[i]))
+	}
+	rows := make([]map[string]any, 0, len(recs)-1)
+	for _, rec := range recs[1:] {
+		row := map[string]any{}
+		for i, cell := range rec {
+			if i < len(head) && head[i] != "" {
+				row[head[i]] = strings.TrimSpace(cell)
+			}
+		}
+		rows = append(rows, row)
+	}
+	return json.Marshal(rows)
 }

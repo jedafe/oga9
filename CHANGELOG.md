@@ -5,6 +5,30 @@ entries reference engineering phases in `.oos/roadmaps/ROADMAP-BACKEND.md`.
 
 ## [Unreleased]
 
+### Fixed — Phase 08 review, round 1
+- `DecideApplication` no longer emits an empty `event_type` on withdraw
+  (no `MemberWithdrawn` event exists in the catalog — Rule 12) and no
+  longer double-emits `MemberApproved` on the application + membership
+  aggregates; pre-signup approvals still emit the app-level event.
+- `sponsor_required` enforced at approve, not apply (§11 test scenario) —
+  intake stays open so a screener can attach sponsors; public apply to
+  sponsor-required orgs is no longer dead-on-arrival.
+- Terminal transitions emit `CommitteeMemberRemoved` per vacated seat
+  (catalogued, sourced, feeds rbac invalidation consumers) — seats were
+  being deleted silently.
+- `membership:import` is idempotent (Rule 27): retried workers skip rows
+  that already produced an open application (org+email dedupe) instead of
+  minting duplicates.
+- `MemberImported` now emits once at finish with the catalogued
+  `{import_id,ok,err}` payload and `sourced=no` (was per-row, sourced).
+- Import accepts real CSV (`{filename, csv}` header-row text) as well as
+  pre-parsed `rows`; `answers`/card `design` default to `{}` instead of
+  violating NOT NULL.
+- `MemberHistory` includes the member's application-level events — the
+  intake trail belongs to the replayable journey.
+- `GET /directory/orgs/{slug}/apply` (public) serves the org's
+  `app_fields` + `sponsor_required` so the form renders before submit.
+
 ### Added — Phase 08: Members (§11)
 - g9 migrations 000070–000074: `membership_applications`, `member_sponsors`,
   `membership_cards`, `member_imports` (+`data` payload column for the

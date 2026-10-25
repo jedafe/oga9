@@ -137,22 +137,37 @@ WHERE member_id = $1 AND ends_at IS NULL
 RETURNING id, term_id;
 
 -- name: RemoveMemberCommitteeSeats :many
+-- RETURNING ids feed CommitteeMemberRemoved events — the seats can't be
+-- deleted silently (Rule 12: state change + event in the same tx).
 DELETE FROM committee_memberships
 WHERE member_id = $1
-RETURNING org_unit_id;
+RETURNING id, org_unit_id;
 
 -- name: MemberHistory :many
--- Lifecycle journey: sourced domain events against the membership/user
--- aggregates (ADR-014 "complete replayable journey").
+-- Lifecycle journey: sourced domain events against the membership, user
+-- AND the member's application aggregates (ADR-014 "complete replayable
+-- journey" — the intake trail belongs in the history too).
 SELECT event_type, payload, occurred_at FROM domain_events
 WHERE organization_id = sqlc.arg(org_id)::uuid
   AND (aggregate_id = sqlc.arg(membership_id)::uuid
-       OR (aggregate_type = 'user' AND aggregate_id = sqlc.arg(user_id)::uuid))
+       OR (aggregate_type = 'user' AND aggregate_id = sqlc.arg(user_id)::uuid)
+       OR aggregate_id IN (
+         SELECT id FROM membership_applications
+         WHERE organization_id = sqlc.arg(org_id)::uuid AND user_id = sqlc.arg(user_id)::uuid))
 ORDER BY occurred_at;
 
 -- name: GetApplicationCountForUser :one
 SELECT count(*) FROM membership_applications
 WHERE organization_id = $1 AND user_id = $2 AND status IN ('applied','screened','approved');
+
+-- name: ExistsOpenApplicationByEmail :one
+-- Import idempotency: a retried member_import worker must not mint a
+-- second open application for the same org+email (Rule 27).
+SELECT EXISTS(
+  SELECT 1 FROM membership_applications
+  WHERE organization_id = $1 AND lower(email::text) = lower($2)
+    AND status IN ('applied','screened','approved')
+);
 
 -- name: ListUserMemberships :many
 SELECT m.id, m.organization_id, o.name AS org_name, o.slug AS org_slug,

@@ -183,6 +183,7 @@ func main() {
 		r.With(middleware.RateLimit(vk, "mfa", 10, time.Minute)).Post("/auth/mfa/complete", mfaH.Complete)
 		r.With(middleware.RateLimit(vk, "directory", 30, time.Minute)).Get("/directory/organizations", orgH.Directory)
 		r.With(middleware.RateLimit(vk, "directory_apply", 10, time.Minute)).Post("/directory/orgs/{slug}/apply", memberH.PublicApply)
+		r.With(middleware.RateLimit(vk, "directory_apply", 30, time.Minute)).Get("/directory/orgs/{slug}/apply", memberH.ApplyForm)
 
 		// §07 self-hosted callback + provider webhook — no session auth;
 		// the signed material / HMAC signature is the credential (Rules 9/29).

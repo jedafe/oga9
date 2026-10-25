@@ -90,6 +90,9 @@ type Querier interface {
 	// AppointmentEnded events + permission-cache invalidation. GREATEST keeps
 	// ends_at >= starts_at for future-dated appointments (never end<start).
 	EndTermAppointments(ctx context.Context, termID pgtype.UUID) ([]EndTermAppointmentsRow, error)
+	// Import idempotency: a retried member_import worker must not mint a
+	// second open application for the same org+email (Rule 27).
+	ExistsOpenApplicationByEmail(ctx context.Context, arg ExistsOpenApplicationByEmailParams) (bool, error)
 	// Outbox claim set: undelivered events under the attempt cap whose backoff
 	// has elapsed (next_attempt_at), oldest first.
 	FetchPendingEvents(ctx context.Context, arg FetchPendingEventsParams) ([]FetchPendingEventsRow, error)
@@ -200,8 +203,9 @@ type Querier interface {
 	MarkEventDispatched(ctx context.Context, id pgtype.UUID) error
 	// Idempotent worker completion — a redrive sees processed_at set and skips.
 	MarkWebhookProcessed(ctx context.Context, id pgtype.UUID) (int64, error)
-	// Lifecycle journey: sourced domain events against the membership/user
-	// aggregates (ADR-014 "complete replayable journey").
+	// Lifecycle journey: sourced domain events against the membership, user
+	// AND the member's application aggregates (ADR-014 "complete replayable
+	// journey" — the intake trail belongs in the history too).
 	MemberHistory(ctx context.Context, arg MemberHistoryParams) ([]MemberHistoryRow, error)
 	// Atomic per-org sequence for member_no ({SLUG}-{YYYY}-{seq5}); the lock
 	// serializes concurrent approvals so numbers are unique and never reused.
@@ -215,7 +219,9 @@ type Querier interface {
 	// (type,id) seed, depth-capped to keep the walk bounded.
 	RelatedEntities(ctx context.Context, arg RelatedEntitiesParams) ([]RelatedEntitiesRow, error)
 	RemoveCommitteeMember(ctx context.Context, arg RemoveCommitteeMemberParams) (RemoveCommitteeMemberRow, error)
-	RemoveMemberCommitteeSeats(ctx context.Context, memberID pgtype.UUID) ([]pgtype.UUID, error)
+	// RETURNING ids feed CommitteeMemberRemoved events — the seats can't be
+	// deleted silently (Rule 12: state change + event in the same tx).
+	RemoveMemberCommitteeSeats(ctx context.Context, memberID pgtype.UUID) ([]RemoveMemberCommitteeSeatsRow, error)
 	// Ref: oga9-engineering/sections/03-rbac-positions.md (Phase 04)
 	// RBAC + positions: permission resolution (group+direct+position+scope union),
 	// positions, terms, officer appointments, committee memberships.

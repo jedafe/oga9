@@ -156,6 +156,28 @@ func (q *Queries) EndMemberAppointments(ctx context.Context, memberID pgtype.UUI
 	return items, nil
 }
 
+const existsOpenApplicationByEmail = `-- name: ExistsOpenApplicationByEmail :one
+SELECT EXISTS(
+  SELECT 1 FROM membership_applications
+  WHERE organization_id = $1 AND lower(email::text) = lower($2)
+    AND status IN ('applied','screened','approved')
+)
+`
+
+type ExistsOpenApplicationByEmailParams struct {
+	OrganizationID pgtype.UUID `json:"organization_id"`
+	Lower          string      `json:"lower"`
+}
+
+// Import idempotency: a retried member_import worker must not mint a
+// second open application for the same org+email (Rule 27).
+func (q *Queries) ExistsOpenApplicationByEmail(ctx context.Context, arg ExistsOpenApplicationByEmailParams) (bool, error) {
+	row := q.db.QueryRow(ctx, existsOpenApplicationByEmail, arg.OrganizationID, arg.Lower)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
+}
+
 const finishImport = `-- name: FinishImport :exec
 UPDATE member_imports SET status = $2, row_count = $3, ok_count = $4, err_count = $5, errors = $6
 WHERE id = $1
@@ -620,7 +642,10 @@ const memberHistory = `-- name: MemberHistory :many
 SELECT event_type, payload, occurred_at FROM domain_events
 WHERE organization_id = $1::uuid
   AND (aggregate_id = $2::uuid
-       OR (aggregate_type = 'user' AND aggregate_id = $3::uuid))
+       OR (aggregate_type = 'user' AND aggregate_id = $3::uuid)
+       OR aggregate_id IN (
+         SELECT id FROM membership_applications
+         WHERE organization_id = $1::uuid AND user_id = $3::uuid))
 ORDER BY occurred_at
 `
 
@@ -636,8 +661,9 @@ type MemberHistoryRow struct {
 	OccurredAt pgtype.Timestamptz `json:"occurred_at"`
 }
 
-// Lifecycle journey: sourced domain events against the membership/user
-// aggregates (ADR-014 "complete replayable journey").
+// Lifecycle journey: sourced domain events against the membership, user
+// AND the member's application aggregates (ADR-014 "complete replayable
+// journey" — the intake trail belongs in the history too).
 func (q *Queries) MemberHistory(ctx context.Context, arg MemberHistoryParams) ([]MemberHistoryRow, error) {
 	rows, err := q.db.Query(ctx, memberHistory, arg.OrgID, arg.MembershipID, arg.UserID)
 	if err != nil {
@@ -696,22 +722,29 @@ func (q *Queries) PatchMembership(ctx context.Context, arg PatchMembershipParams
 const removeMemberCommitteeSeats = `-- name: RemoveMemberCommitteeSeats :many
 DELETE FROM committee_memberships
 WHERE member_id = $1
-RETURNING org_unit_id
+RETURNING id, org_unit_id
 `
 
-func (q *Queries) RemoveMemberCommitteeSeats(ctx context.Context, memberID pgtype.UUID) ([]pgtype.UUID, error) {
+type RemoveMemberCommitteeSeatsRow struct {
+	ID        pgtype.UUID `json:"id"`
+	OrgUnitID pgtype.UUID `json:"org_unit_id"`
+}
+
+// RETURNING ids feed CommitteeMemberRemoved events — the seats can't be
+// deleted silently (Rule 12: state change + event in the same tx).
+func (q *Queries) RemoveMemberCommitteeSeats(ctx context.Context, memberID pgtype.UUID) ([]RemoveMemberCommitteeSeatsRow, error) {
 	rows, err := q.db.Query(ctx, removeMemberCommitteeSeats, memberID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var items []pgtype.UUID
+	var items []RemoveMemberCommitteeSeatsRow
 	for rows.Next() {
-		var org_unit_id pgtype.UUID
-		if err := rows.Scan(&org_unit_id); err != nil {
+		var i RemoveMemberCommitteeSeatsRow
+		if err := rows.Scan(&i.ID, &i.OrgUnitID); err != nil {
 			return nil, err
 		}
-		items = append(items, org_unit_id)
+		items = append(items, i)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err

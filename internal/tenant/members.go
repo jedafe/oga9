@@ -108,23 +108,14 @@ func (s *Service) memberNo(ctx context.Context, q *db.Queries, orgID uuid.UUID) 
 
 // Apply files a membership application. Public pre-signup applications
 // pass userID=uuid.Nil (email carries identity until they register).
-// sponsor_required comes from the org setting (0|1|2) — a sponsor must be
-// an active member of the same org.
+// org.membership.sponsor_required is enforced at APPROVE (§11 test
+// scenario) — intake stays open so a screener can attach sponsors later.
 func (s *Service) Apply(ctx context.Context, orgID, userID uuid.UUID, email, phone string, answers json.RawMessage, sponsorID uuid.UUID) (uuid.UUID, error) {
 	if email == "" && phone == "" {
 		return uuid.Nil, ErrInviteNoContact
 	}
-	required := 0
-	if raw, err := s.q.GetOrgSetting(ctx, db.GetOrgSettingParams{
-		OrganizationID: toPg(orgID), Key: "org.membership.sponsor_required",
-	}); err == nil && len(raw) > 0 {
-		var v float64
-		if json.Unmarshal(raw, &v) == nil {
-			required = int(v)
-		}
-	}
-	if required > 0 && sponsorID == uuid.Nil {
-		return uuid.Nil, ErrSponsorRequired
+	if len(answers) == 0 {
+		answers = json.RawMessage("{}")
 	}
 	if userID != uuid.Nil {
 		if n, err := s.q.GetApplicationCountForUser(ctx, db.GetApplicationCountForUserParams{OrganizationID: toPg(orgID), UserID: toPg(userID)}); err != nil {
@@ -170,6 +161,37 @@ func (s *Service) PublicApply(ctx context.Context, slug, email, phone string, an
 	return s.Apply(ctx, fromPg(org.ID), uuid.Nil, email, phone, answers, uuid.Nil)
 }
 
+// PublicApplyForm feeds GET /directory/orgs/{slug}/apply — the org's
+// name + configurable app_fields schema + sponsor requirement so the
+// public form renders before anyone submits.
+func (s *Service) PublicApplyForm(ctx context.Context, slug string) (map[string]any, error) {
+	org, err := s.q.GetPublicOrgBySlug(ctx, slug)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrOrgNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	fields := json.RawMessage("[]")
+	if raw, err := s.q.GetOrgSetting(ctx, db.GetOrgSettingParams{
+		OrganizationID: org.ID, Key: "org.membership.app_fields",
+	}); err == nil && len(raw) > 0 {
+		fields = raw
+	}
+	sponsorRequired := 0
+	if raw, err := s.q.GetOrgSetting(ctx, db.GetOrgSettingParams{
+		OrganizationID: org.ID, Key: "org.membership.sponsor_required",
+	}); err == nil && len(raw) > 0 {
+		var v float64
+		if json.Unmarshal(raw, &v) == nil {
+			sponsorRequired = int(v)
+		}
+	}
+	return map[string]any{
+		"org_name": org.Name, "app_fields": fields, "sponsor_required": sponsorRequired,
+	}, nil
+}
+
 // Applications lists the screening queue (applied|screened|approved|rejected|withdrawn).
 func (s *Service) Applications(ctx context.Context, oc *OrgCtx, status string) ([]db.ListApplicationsRow, error) {
 	if status == "" {
@@ -207,6 +229,18 @@ func (s *Service) DecideApplication(ctx context.Context, oc *OrgCtx, appID uuid.
 		}
 	}
 	return s.withTx(ctx, func(q *db.Queries) error {
+		if to == "approved" {
+			// §11 test: approve enforces org.membership.sponsor_required —
+			// a sponsor must be an active member of this org.
+			if raw, err := q.GetOrgSetting(ctx, db.GetOrgSettingParams{
+				OrganizationID: toPg(oc.OrgID), Key: "org.membership.sponsor_required",
+			}); err == nil && len(raw) > 0 {
+				var required float64
+				if json.Unmarshal(raw, &required) == nil && required > 0 && !app.SponsorMemberID.Valid {
+					return ErrSponsorRequired
+				}
+			}
+		}
 		row, err := q.SetApplicationStatus(ctx, db.SetApplicationStatusParams{
 			ID: toPg(appID), Column2: from, Status: to, ScreenedBy: pgUUIDPtr(oc.MembershipID),
 		})
@@ -216,11 +250,22 @@ func (s *Service) DecideApplication(ctx context.Context, oc *OrgCtx, appID uuid.
 		if err != nil {
 			return err
 		}
-		if err := events.Emit(ctx, q, uuid.Nil, oc.OrgID, transitionEvent(app.Status, to), "membership_application", appID, oc.UserID, true,
-			map[string]any{"application_id": appID, "org_id": oc.OrgID, "to": to}); err != nil {
-			return err
+		// App-level decision event — skipped when the name isn't catalogued
+		// (withdrawn has no domain event) or when approve emits the
+		// canonical membership-level MemberApproved below.
+		if name := transitionEvent(app.Status, to); name != "" && to != "approved" {
+			if err := events.Emit(ctx, q, uuid.Nil, oc.OrgID, name, "membership_application", appID, oc.UserID, true,
+				map[string]any{"application_id": appID, "org_id": oc.OrgID, "to": to}); err != nil {
+				return err
+			}
 		}
 		if to != "approved" || !app.UserID.Valid {
+			// Pre-signup approval still records the decision event —
+			// the membership materializes when they register (Phase-02 hook).
+			if to == "approved" && !app.UserID.Valid {
+				return events.Emit(ctx, q, uuid.Nil, oc.OrgID, "MemberApproved", "membership_application", appID, oc.UserID, true,
+					map[string]any{"application_id": appID, "org_id": oc.OrgID, "to": to})
+			}
 			return nil
 		}
 		// approved: materialize the membership pipeline row + member_no.
@@ -310,8 +355,17 @@ func (s *Service) TransitionMember(ctx context.Context, oc *OrgCtx, memberID uui
 					return err
 				}
 			}
-			if _, err := q.RemoveMemberCommitteeSeats(ctx, toPg(memberID)); err != nil {
+			units, err := q.RemoveMemberCommitteeSeats(ctx, toPg(memberID))
+			if err != nil {
 				return err
+			}
+			// Rule 12: seat removal emits its event per unit — rbac consumers
+			// dedupe on event id and invalidate scope caches.
+			for _, u := range units {
+				if err := events.Emit(ctx, q, oc.TenantID, oc.OrgID, "CommitteeMemberRemoved", "committee_membership", fromPg(u.ID), oc.UserID, true,
+					map[string]any{"committee_membership_id": fromPg(u.ID), "org_unit_id": fromPg(u.OrgUnitID), "member_id": memberID, "org_id": oc.OrgID}); err != nil {
+					return err
+				}
 			}
 			if err := q.RevokeCards(ctx, toPg(memberID)); err != nil {
 				return err
@@ -487,16 +541,21 @@ func (s *Service) ProcessImport(ctx context.Context, importID uuid.UUID) error {
 			errs = append(errs, map[string]any{"row": i, "error": "email_or_phone_required"})
 			continue
 		}
-		err := s.withTx(ctx, func(q *db.Queries) error {
-			r, err := q.CreateApplication(ctx, db.CreateApplicationParams{
-				OrganizationID: imp.OrganizationID, Email: pgText(email), Phone: pgText(phone),
-				Answers: answers,
-			})
-			if err != nil {
+		// Rule 27 idempotency: a retried worker skips rows that already
+		// produced an open application for this org+email.
+		if email != "" {
+			if exists, err := s.q.ExistsOpenApplicationByEmail(ctx, db.ExistsOpenApplicationByEmailParams{
+				OrganizationID: imp.OrganizationID, Lower: email,
+			}); err != nil {
 				return err
+			} else if exists {
+				ok++ // already created — counts as success on replay
+				continue
 			}
-			return events.Emit(ctx, q, uuid.Nil, orgID, "MemberImported", "membership_application", fromPg(r), uuid.Nil, true,
-				map[string]any{"application_id": fromPg(r), "org_id": orgID, "import_id": importID, "row": i})
+		}
+		_, err := s.q.CreateApplication(ctx, db.CreateApplicationParams{
+			OrganizationID: imp.OrganizationID, Email: pgText(email), Phone: pgText(phone),
+			Answers: answers,
 		})
 		if err != nil {
 			errs = append(errs, map[string]any{"row": i, "error": err.Error()})
@@ -504,10 +563,18 @@ func (s *Service) ProcessImport(ctx context.Context, importID uuid.UUID) error {
 		}
 		ok++
 	}
-	return s.q.FinishImport(ctx, db.FinishImportParams{
+	if err := s.q.FinishImport(ctx, db.FinishImportParams{
 		ID: toPg(importID), Status: "done",
 		RowCount: pgtype.Int4{Int32: int32(len(rows)), Valid: true}, OkCount: pgtype.Int4{Int32: int32(ok), Valid: true}, ErrCount: pgtype.Int4{Int32: int32(len(errs)), Valid: true},
 		Errors: mustJSON(errs),
+	}); err != nil {
+		return err
+	}
+	// Catalogued payload {import_id,ok,err}, sourced=no — per-application
+	// MemberApplied isn't emitted for imports (intake, not membership yet).
+	return s.withTx(ctx, func(q *db.Queries) error {
+		return events.Emit(ctx, q, uuid.Nil, orgID, "MemberImported", "member_import", importID, uuid.Nil, false,
+			map[string]any{"import_id": importID, "ok": ok, "err": len(errs)})
 	})
 }
 
