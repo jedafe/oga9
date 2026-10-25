@@ -11,6 +11,29 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const activateSubscription = `-- name: ActivateSubscription :execrows
+UPDATE subscriptions SET
+  state = 'active',
+  current_period_end = COALESCE($1::timestamptz, current_period_end)
+WHERE id = $2::uuid AND state <> 'cancelled'
+`
+
+type ActivateSubscriptionParams struct {
+	CurrentPeriodEnd pgtype.Timestamptz `json:"current_period_end"`
+	ID               pgtype.UUID        `json:"id"`
+}
+
+// Webhook activation: a late invoice.paid must not resurrect a cancelled
+// (terminal) subscription — the guard keeps cancelled sticky. 0 rows =
+// already cancelled, nothing to emit.
+func (q *Queries) ActivateSubscription(ctx context.Context, arg ActivateSubscriptionParams) (int64, error) {
+	result, err := q.db.Exec(ctx, activateSubscription, arg.CurrentPeriodEnd, arg.ID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const addUsage = `-- name: AddUsage :execrows
 INSERT INTO usage_meters (tenant_id, limit_key, used, period_start)
 VALUES ($1::uuid, $2, $3::bigint,

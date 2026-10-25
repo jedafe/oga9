@@ -28,6 +28,9 @@ SELECT DISTINCT permission FROM (
   WHERE m.organization_id = sqlc.arg(org_id)::uuid
     AND m.user_id = sqlc.arg(user_id)::uuid
   UNION
+  -- Only UNSCOPED appointments confer the base node; a branch/committee-
+  -- scoped seat must not satisfy the unsuffixed check — its grants feed
+  -- the _branch/_committee maps via ScopedPositionNodes (§03 scope filter).
   SELECT pp.permission
   FROM officer_appointments oa
   JOIN terms t ON t.id = oa.term_id AND t.is_current
@@ -37,6 +40,7 @@ SELECT DISTINCT permission FROM (
     AND m.user_id = sqlc.arg(user_id)::uuid
     AND oa.starts_at <= CURRENT_DATE
     AND (oa.ends_at IS NULL OR oa.ends_at >= CURRENT_DATE)
+    AND oa.branch_id IS NULL AND oa.committee_id IS NULL
 );
 
 -- name: ScopedPositionNodes :many
@@ -84,8 +88,9 @@ RETURNING id;
 
 -- name: EndTermAppointments :many
 -- Ends every open appointment of the term; RETURNING rows feed
--- AppointmentEnded events + permission-cache invalidation.
-UPDATE officer_appointments SET ends_at = CURRENT_DATE
+-- AppointmentEnded events + permission-cache invalidation. GREATEST keeps
+-- ends_at >= starts_at for future-dated appointments (never end<start).
+UPDATE officer_appointments SET ends_at = GREATEST(starts_at, CURRENT_DATE)
 WHERE term_id = sqlc.arg(term_id)::uuid AND ends_at IS NULL
 RETURNING id, position_id, member_id;
 
@@ -147,7 +152,7 @@ WHERE cm.org_unit_id = sqlc.arg(unit_id)::uuid
 ORDER BY cm.created_at;
 
 -- name: GetTermOrg :one
-SELECT organization_id, is_current FROM terms WHERE id = sqlc.arg(id)::uuid;
+SELECT organization_id, is_current, starts_at, ends_at FROM terms WHERE id = sqlc.arg(id)::uuid;
 
 -- name: GetPositionSeats :one
 SELECT seats FROM org_positions WHERE id = sqlc.arg(id)::uuid;

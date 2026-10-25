@@ -104,6 +104,9 @@ func Load() (*Config, error) {
 	if cfg.JWTSecret == "change-me" && cfg.Env == "production" {
 		errs = append(errs, errors.New("OGA9_JWT_SECRET must be set in production"))
 	}
+	if cfg.Env == "production" && env("OGA9_LICENSE_SIGNING_KEY", "") == "" {
+		errs = append(errs, errors.New("OGA9_LICENSE_SIGNING_KEY must be set in production"))
+	}
 	if cfg.JWTSecret == "" {
 		errs = append(errs, errors.New("OGA9_JWT_SECRET is empty"))
 	}

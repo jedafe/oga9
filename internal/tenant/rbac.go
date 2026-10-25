@@ -192,6 +192,9 @@ func (s *Service) AppointOfficer(ctx context.Context, oc *OrgCtx, termID, positi
 		if err != nil || fromPg(m.OrganizationID) != oc.OrgID {
 			return ErrNotMember
 		}
+		if m.LifecycleState != "active" {
+			return ErrMemberNotActive // office requires an active member
+		}
 		// position, term and scope units must all belong to this org —
 		// a foreign id would graft another org's grants into this one.
 		po, err := q.GetPositionOrg(ctx, toPg(positionID))
@@ -204,6 +207,11 @@ func (s *Service) AppointOfficer(ctx context.Context, oc *OrgCtx, termID, positi
 		}
 		if !to.IsCurrent {
 			return ErrBadValue // appointing to a closed term grants nothing
+		}
+		// starts_at must fall inside the term window — an appointment can't
+		// outlive (or predate) the cohort that confers its grants.
+		if startsAt.Before(to.StartsAt.Time) || startsAt.After(to.EndsAt.Time) {
+			return ErrBadValue
 		}
 		// seats cap: §03 seats = concurrent holders per term
 		pseats, err := q.GetPositionSeats(ctx, toPg(positionID))
@@ -326,6 +334,9 @@ func (s *Service) AddCommitteeMember(ctx context.Context, oc *OrgCtx, unitID, me
 		m, err := q.GetMembershipByID(ctx, toPg(memberID))
 		if err != nil || fromPg(m.OrganizationID) != oc.OrgID {
 			return ErrNotMember
+		}
+		if m.LifecycleState != "active" {
+			return ErrMemberNotActive // committee seats require an active member
 		}
 		u, err := q.GetUnit(ctx, toPg(unitID)) // committee unit must be ours
 		if err != nil || fromPg(u.OrganizationID) != oc.OrgID || u.Type != "committee" {

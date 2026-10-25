@@ -5,9 +5,55 @@ entries reference engineering phases in `.oos/roadmaps/ROADMAP-BACKEND.md`.
 
 ## [Unreleased]
 
+### Fixed — Phase 04–07 review, round 4
+- Migration numbering: `000060_no_tenant_platform_admin` squatted on a
+  group-8 slot held by `000060_org_invitations` — golang-migrate refused
+  the source outright (CI's psql replay masked it). Renumbered to 000065.
+- §03 scope filter enforced: `ResolveOrgPermissions` no longer unions
+  scoped appointment grants into the base node set — a branch/committee-
+  scoped seat confers only the `_branch`/`_committee` variants via
+  `ScopedPositionNodes` (was: branch officer held the unsuffixed node).
+- `DeactivateApp` re-checks the dependents graph inside its tx on the
+  `FOR UPDATE` installation rows — a concurrent activate(dependent)/
+  deactivate(base) race can't split the dependency graph anymore.
+- Cancelled subscriptions are terminal: `ActivateSubscription` guards
+  `state <> 'cancelled'` so a late `invoice.paid` can't resurrect a
+  cancelled sub (was unconditional `SetSubscriptionState`).
+- `payment.failed`/`invoice.payment_failed` only moves an `active` sub to
+  past_due — trials keep their window, lapsed/cancelled states ack as
+  no-ops instead of transitioning backwards.
+- `ChangePlan` requires payment for a paid target whenever the current
+  plan can't prove the move is a downgrade (unpriced/unlisted current
+  plan, non-enterprise term) — closes a bare `plan_slug` write to paid.
+- Entitlement enforcement points wired (§07): `limit.organizations`
+  counted inside the create tx at `POST /orgs`; `limit.branches`
+  (hq|branch|chapter meter, committees/wings excluded) enforced on
+  branch|chapter `CreateUnit` via `CheckLimit` → `limit_exceeded` 402.
+- App manifest seeds referenced uncatalogued nodes — 000066 maps
+  `org.directory.manage`→`org.listing.manage` (ADR-021) and
+  `org.documents.manage`→`org.documents.upload`.
+- `/me/entitlements` resolves tenants via the `org.admin.billing` node
+  like the rest of the billing surface (was org_admin role only — a
+  delegated billing admin couldn't read it).
+- Office/committee seats require `lifecycle_state='active'` — applied/
+  suspended members get `member_not_active` (409); appointment
+  `starts_at` must fall inside the term window.
+- `EndTermAppointments` sets `ends_at = GREATEST(starts_at, CURRENT_DATE)`
+  — future-dated appointments no longer end before they start.
+- Invite acceptance survives a departed inviter — `granted_by` falls back
+  to NULL instead of aborting the accept tx.
+- Outbox `last_error` now joins all failing consumers (was last-one-wins).
+- Production requires an explicit `OGA9_LICENSE_SIGNING_KEY` — no more
+  silent derivation from the JWT secret (dev fallback unchanged).
+- `billing:retry_payment` stub label corrected to Phase 09 (§12 payments).
+- New tests: scoped-grant resolution + lifecycle/term guards
+  (`rbac_test.go`), webhook terminal-state guards + unpriced-plan gate
+  (`billing_test.go`), starter `limit.organizations` rejection
+  (`tenant_test.go`).
+
 ### Fixed — Phase 07 review, round 3
 - `CloneTenantRoles` no longer clones platform.*-carrying roles into
-  tenants — `platform_admin` is control-plane only (000060 removes clones
+  tenants — `platform_admin` is control-plane only (000065 removes clones
   that already landed)
 - Subscription transitions are compare-and-set (`WHERE state = from`) — a
   stale read can't regress state or emit a phantom `SubscriptionChanged`

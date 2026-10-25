@@ -11,8 +11,11 @@ SELECT app_id, status, activated_at, deactivated_at FROM app_installations
 WHERE tenant_id = sqlc.arg(tenant_id)::uuid;
 
 -- name: ListActiveApps :many
+-- FOR UPDATE serializes activate/deactivate for a tenant — a sibling tx
+-- re-checks the dependency graph only after our commits (no lost-check race).
 SELECT app_id FROM app_installations
-WHERE tenant_id = sqlc.arg(tenant_id)::uuid AND status = 'active';
+WHERE tenant_id = sqlc.arg(tenant_id)::uuid AND status = 'active'
+FOR UPDATE;
 
 -- name: IsAppActive :one
 SELECT EXISTS(

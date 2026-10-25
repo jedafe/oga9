@@ -93,8 +93,11 @@ func (q *Queries) IsAppActive(ctx context.Context, arg IsAppActiveParams) (bool,
 const listActiveApps = `-- name: ListActiveApps :many
 SELECT app_id FROM app_installations
 WHERE tenant_id = $1::uuid AND status = 'active'
+FOR UPDATE
 `
 
+// FOR UPDATE serializes activate/deactivate for a tenant — a sibling tx
+// re-checks the dependency graph only after our commits (no lost-check race).
 func (q *Queries) ListActiveApps(ctx context.Context, tenantID pgtype.UUID) ([]string, error) {
 	rows, err := q.db.Query(ctx, listActiveApps, tenantID)
 	if err != nil {

@@ -125,7 +125,7 @@ func main() {
 	}
 	oauthH := handler.NewOAuthHandler(authSvc, vk, providers, cfg.BaseURL, cfg.AppURL, queue, cfg.JWTSecret)
 	orgSvc := tenant.NewService(pool, vk)
-	orgH := handler.NewOrgHandler(orgSvc)
+	orgH := handler.NewOrgHandler(orgSvc, entSvc)
 
 	// §06/§07 app framework + entitlements/billing
 	appsH := handler.NewAppsHandler(orgSvc, entSvc)

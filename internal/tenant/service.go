@@ -20,6 +20,7 @@ import (
 
 	"github.com/jedafe/oga9/internal/billing"
 	"github.com/jedafe/oga9/internal/db"
+	"github.com/jedafe/oga9/internal/entitlements"
 	"github.com/jedafe/oga9/internal/events"
 )
 
@@ -45,6 +46,7 @@ var (
 	ErrBadBillingEmail  = errors.New("invalid_billing_email")
 	ErrBadScopeUnit     = errors.New("invalid_scope_unit")
 	ErrDuplicateMember  = errors.New("member_already_seated")
+	ErrMemberNotActive  = errors.New("member_not_active")
 )
 
 type Service struct {
@@ -312,9 +314,9 @@ func (s *Service) resolveOrgTenant(ctx context.Context, userID, requested uuid.U
 // CreateOrg creates an organization under the caller's administered tenant
 // (provisioning one on first create), then membership + org_admin role +
 // template instantiation in one tx (§10: creator becomes first member).
-// limit.organizations is intentionally unenforced until the Phase 07
-// entitlement service lands.
-func (s *Service) CreateOrg(ctx context.Context, userID uuid.UUID, name, slug, templateSlug, orgType, country, city, billingEmail string, requestedTenant uuid.UUID) (*Org, error) {
+// §07 enforcement point: limit.organizations caps orgs per tenant — a nil
+// ent skips the gate (unit tests only; handlers always pass the service).
+func (s *Service) CreateOrg(ctx context.Context, userID uuid.UUID, name, slug, templateSlug, orgType, country, city, billingEmail string, requestedTenant uuid.UUID, ent *entitlements.Service) (*Org, error) {
 	slug = strings.ToLower(strings.TrimSpace(slug))
 	if len(name) == 0 {
 		return nil, ErrBadValue
@@ -389,6 +391,17 @@ func (s *Service) CreateOrg(ctx context.Context, userID uuid.UUID, name, slug, t
 			}
 		}
 		var o db.CreateOrgRow
+		// limit.organizations (§07): counted inside the tx so concurrent
+		// creates can't both pass under the cap on a stale count.
+		if ent != nil {
+			n, err := q.CountTenantOrgs(ctx, toPg(tenantID))
+			if err != nil {
+				return err
+			}
+			if allowed, _ := ent.CheckLimit(ctx, tenantID, "limit.organizations", n); !allowed {
+				return ErrLimitExceeded
+			}
+		}
 		o, err = q.CreateOrg(ctx, db.CreateOrgParams{
 			TenantID: toPg(tenantID), Name: name, Slug: slug, TemplateSlug: pgText(templateSlug),
 			OrgType: orgType, CountryCode: pgText(country), City: pgText(city),

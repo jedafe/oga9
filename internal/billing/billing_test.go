@@ -299,6 +299,65 @@ func TestTransitionCAS(t *testing.T) {
 	}
 }
 
+// Terminal/lapsed-state guards: a late invoice.paid can't resurrect a
+// cancelled subscription, and payment.failed only lapses an active one.
+func TestWebhookStateGuards(t *testing.T) {
+	svc, pool := testSvc(t)
+	ctx := context.Background()
+	tenant := mkTenant(t, pool)
+	if _, err := svc.CreateSubscription(ctx, tenant, "starter", "monthly", ""); err != nil {
+		t.Fatal(err)
+	}
+	// payment.failed on trial → trial keeps its window (no past_due skip)
+	body, sig := webhookBody(t, "payment.failed", tenant, "evt-"+uuid.NewString()[:12])
+	rawID, err := svc.RecordWebhook(ctx, "testprov", body, sig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.ProcessWebhook(ctx, rawID); err != nil {
+		t.Fatal(err)
+	}
+	if sub, _ := svc.GetSubscription(ctx, tenant); sub.State != "trial" {
+		t.Fatalf("failed charge on trial should be a no-op, got %s", sub.State)
+	}
+	// cancelled + late invoice.paid → stays cancelled (terminal)
+	if err := svc.Cancel(ctx, tenant, uuid.Nil); err != nil {
+		t.Fatal(err)
+	}
+	body, sig = webhookBody(t, "invoice.paid", tenant, "evt-"+uuid.NewString()[:12])
+	rawID, err = svc.RecordWebhook(ctx, "testprov", body, sig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.ProcessWebhook(ctx, rawID); err != nil {
+		t.Fatal(err)
+	}
+	if sub, _ := svc.GetSubscription(ctx, tenant); sub.State != "cancelled" {
+		t.Fatalf("late payment resurrected a cancelled sub to %s", sub.State)
+	}
+}
+
+// An unpriced/unlisted current plan can't prove a paid target is a
+// downgrade — self-serve demands payment instead of a bare slug write.
+func TestChangePlanUnpricedCurrent(t *testing.T) {
+	svc, pool := testSvc(t)
+	ctx := context.Background()
+	tenant := mkTenant(t, pool)
+	if _, err := svc.CreateSubscription(ctx, tenant, "starter", "monthly", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx,
+		"UPDATE subscriptions SET plan_slug='enterprise', state='active' WHERE tenant_id=$1", tenant); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.ChangePlan(ctx, tenant, "basic", uuid.Nil); err != ErrPaymentRequired {
+		t.Fatalf("enterprise→basic paid move should need payment, got %v", err)
+	}
+	if err := svc.ChangePlan(ctx, tenant, "starter", uuid.Nil); err != nil {
+		t.Fatalf("free-plan move should still be allowed, got %v", err)
+	}
+}
+
 func TestStaleWebhookRedrive(t *testing.T) {
 	svc, pool := testSvc(t)
 	ctx := context.Background()

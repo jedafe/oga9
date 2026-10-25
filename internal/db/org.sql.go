@@ -78,6 +78,21 @@ func (q *Queries) CloneTenantRoles(ctx context.Context, tenantID pgtype.UUID) er
 	return err
 }
 
+const countMemberCapableUnits = `-- name: CountMemberCapableUnits :one
+SELECT count(*) FROM org_units
+WHERE organization_id = $1::uuid AND archived_at IS NULL
+  AND type IN ('hq','branch','chapter')
+`
+
+// limit.branches meter: member-capable structural units (hq|branch|chapter)
+// count; committees/wings never do (plans-entitlements-catalog).
+func (q *Queries) CountMemberCapableUnits(ctx context.Context, orgID pgtype.UUID) (int64, error) {
+	row := q.db.QueryRow(ctx, countMemberCapableUnits, orgID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const countTenantOrgs = `-- name: CountTenantOrgs :one
 SELECT count(*) FROM organizations WHERE tenant_id = $1 AND deleted_at IS NULL
 `

@@ -134,30 +134,33 @@ func (s *Service) DeactivateApp(ctx context.Context, oc *OrgCtx, appID string) e
 	if row.MvpRequired {
 		return ErrAppRequired
 	}
-	active, err := s.q.ListActiveApps(ctx, toPg(oc.TenantID))
-	if err != nil {
-		return err
-	}
-	inSet := false
-	for _, other := range active {
-		if other == appID {
-			inSet = true
-			continue
-		}
-		otherRow, err := s.q.GetApp(ctx, other)
+	return s.withTx(ctx, func(q *db.Queries) error {
+		// Dependents + install state are re-checked inside the tx — a
+		// concurrent activate(dependent)/deactivate(base) race otherwise
+		// breaks the dependency graph (FOR UPDATE serializes the check).
+		active, err := q.ListActiveApps(ctx, toPg(oc.TenantID))
 		if err != nil {
-			continue
+			return err
 		}
-		for _, req := range manifestOf(otherRow.Manifest).Requires {
-			if req == appID {
-				return ErrAppHasDependents
+		inSet := false
+		for _, other := range active {
+			if other == appID {
+				inSet = true
+				continue
+			}
+			otherRow, err := q.GetApp(ctx, other)
+			if err != nil {
+				continue
+			}
+			for _, req := range manifestOf(otherRow.Manifest).Requires {
+				if req == appID {
+					return ErrAppHasDependents
+				}
 			}
 		}
-	}
-	if !inSet {
-		return nil // never installed or already deactivated — idempotent no-op, no event
-	}
-	return s.withTx(ctx, func(q *db.Queries) error {
+		if !inSet {
+			return nil // never installed or already deactivated — idempotent no-op, no event
+		}
 		iid, err := q.DeactivateApp(ctx, db.DeactivateAppParams{TenantID: toPg(oc.TenantID), AppID: appID})
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil // concurrent deactivate won the race — idempotent no-op

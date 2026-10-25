@@ -220,7 +220,7 @@ func (q *Queries) EndAppointment(ctx context.Context, arg EndAppointmentParams) 
 }
 
 const endTermAppointments = `-- name: EndTermAppointments :many
-UPDATE officer_appointments SET ends_at = CURRENT_DATE
+UPDATE officer_appointments SET ends_at = GREATEST(starts_at, CURRENT_DATE)
 WHERE term_id = $1::uuid AND ends_at IS NULL
 RETURNING id, position_id, member_id
 `
@@ -232,7 +232,8 @@ type EndTermAppointmentsRow struct {
 }
 
 // Ends every open appointment of the term; RETURNING rows feed
-// AppointmentEnded events + permission-cache invalidation.
+// AppointmentEnded events + permission-cache invalidation. GREATEST keeps
+// ends_at >= starts_at for future-dated appointments (never end<start).
 func (q *Queries) EndTermAppointments(ctx context.Context, termID pgtype.UUID) ([]EndTermAppointmentsRow, error) {
 	rows, err := q.db.Query(ctx, endTermAppointments, termID)
 	if err != nil {
@@ -276,18 +277,25 @@ func (q *Queries) GetPositionSeats(ctx context.Context, id pgtype.UUID) (int32, 
 }
 
 const getTermOrg = `-- name: GetTermOrg :one
-SELECT organization_id, is_current FROM terms WHERE id = $1::uuid
+SELECT organization_id, is_current, starts_at, ends_at FROM terms WHERE id = $1::uuid
 `
 
 type GetTermOrgRow struct {
 	OrganizationID pgtype.UUID `json:"organization_id"`
 	IsCurrent      bool        `json:"is_current"`
+	StartsAt       pgtype.Date `json:"starts_at"`
+	EndsAt         pgtype.Date `json:"ends_at"`
 }
 
 func (q *Queries) GetTermOrg(ctx context.Context, id pgtype.UUID) (GetTermOrgRow, error) {
 	row := q.db.QueryRow(ctx, getTermOrg, id)
 	var i GetTermOrgRow
-	err := row.Scan(&i.OrganizationID, &i.IsCurrent)
+	err := row.Scan(
+		&i.OrganizationID,
+		&i.IsCurrent,
+		&i.StartsAt,
+		&i.EndsAt,
+	)
 	return i, err
 }
 
@@ -530,6 +538,9 @@ SELECT DISTINCT permission FROM (
   WHERE m.organization_id = $1::uuid
     AND m.user_id = $2::uuid
   UNION
+  -- Only UNSCOPED appointments confer the base node; a branch/committee-
+  -- scoped seat must not satisfy the unsuffixed check — its grants feed
+  -- the _branch/_committee maps via ScopedPositionNodes (§03 scope filter).
   SELECT pp.permission
   FROM officer_appointments oa
   JOIN terms t ON t.id = oa.term_id AND t.is_current
@@ -539,6 +550,7 @@ SELECT DISTINCT permission FROM (
     AND m.user_id = $2::uuid
     AND oa.starts_at <= CURRENT_DATE
     AND (oa.ends_at IS NULL OR oa.ends_at >= CURRENT_DATE)
+    AND oa.branch_id IS NULL AND oa.committee_id IS NULL
 )
 `
 

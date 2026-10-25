@@ -92,9 +92,9 @@ func Handlers(d Deps) map[string]asynq.HandlerFunc {
 		TypeSubscriptionSweep: subscriptionSweep(d.Billing, d.Queue),
 		TypeProcessWebhook:    processWebhook(d.Billing),
 		// Stubs — registered now (catalog-reserved), implemented when their
-		// sections land: retry_payment needs §12 payments; license 14;
-		// provision 12.
-		TypeRetryPayment:    stub(TypeRetryPayment, "Phase 12"),
+		// sections land: retry_payment needs §12 payments (Phase 09);
+		// license 14; provision 12.
+		TypeRetryPayment:    stub(TypeRetryPayment, "Phase 09"),
 		TypeLicenseReminder: stub(TypeLicenseReminder, "Phase 14"),
 		TypeTenantProvision: stub(TypeTenantProvision, "Phase 12"),
 	}

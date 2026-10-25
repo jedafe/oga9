@@ -41,6 +41,15 @@ WHERE id = sqlc.arg(id)::uuid;
 UPDATE subscriptions SET plan_slug = sqlc.arg(plan_slug)
 WHERE id = sqlc.arg(id)::uuid;
 
+-- name: ActivateSubscription :execrows
+-- Webhook activation: a late invoice.paid must not resurrect a cancelled
+-- (terminal) subscription — the guard keeps cancelled sticky. 0 rows =
+-- already cancelled, nothing to emit.
+UPDATE subscriptions SET
+  state = 'active',
+  current_period_end = COALESCE(sqlc.arg(current_period_end)::timestamptz, current_period_end)
+WHERE id = sqlc.arg(id)::uuid AND state <> 'cancelled';
+
 -- name: TransitionSubscriptionState :execrows
 -- Compare-and-set: fires only while the subscription still holds the state
 -- the caller read — concurrent lifecycle writers can't regress or

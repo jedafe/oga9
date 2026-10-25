@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jedafe/oga9/internal/db"
+	"github.com/jedafe/oga9/internal/entitlements"
 	"github.com/jedafe/oga9/internal/events"
 )
 
@@ -133,8 +134,10 @@ func (s *Service) ListUnits(ctx context.Context, orgID uuid.UUID) ([]Unit, error
 }
 
 // CreateUnit validates same-org parent + DAG (no self-parent via DB; cycle
-// impossible on create since the node doesn't exist yet).
-func (s *Service) CreateUnit(ctx context.Context, oc *OrgCtx, parentID uuid.UUID, typ, label, name, slug string) (uuid.UUID, error) {
+// impossible on create since the node doesn't exist yet). §07 enforcement
+// point: limit.branches caps member-capable units (hq|branch|chapter) —
+// enforced on branch|chapter creation (the org's hq is always allowed).
+func (s *Service) CreateUnit(ctx context.Context, oc *OrgCtx, parentID uuid.UUID, typ, label, name, slug string, ent *entitlements.Service) (uuid.UUID, error) {
 	if !unitTypes[typ] {
 		return uuid.Nil, ErrBadUnitType
 	}
@@ -152,6 +155,15 @@ func (s *Service) CreateUnit(ctx context.Context, oc *OrgCtx, parentID uuid.UUID
 	}
 	var id pgtype.UUID
 	err := s.withTx(ctx, func(q *db.Queries) error {
+		if ent != nil && (typ == "branch" || typ == "chapter") {
+			n, err := q.CountMemberCapableUnits(ctx, toPg(oc.OrgID))
+			if err != nil {
+				return err
+			}
+			if allowed, _ := ent.CheckLimit(ctx, oc.TenantID, "limit.branches", n); !allowed {
+				return ErrLimitExceeded
+			}
+		}
 		r, err := q.CreateUnit(ctx, db.CreateUnitParams{
 			OrganizationID: toPg(oc.OrgID), ParentUnitID: pgUUIDPtr(parentID),
 			Type: typ, LevelLabel: pgText(label), Name: name, Slug: slug,
@@ -443,12 +455,17 @@ func (s *Service) AcceptInvitation(ctx context.Context, userID uuid.UUID, token 
 			}); err != nil {
 				return err
 			}
-			mb, err := q.GetMembershipByID(ctx, inv.InvitedBy)
-			if err != nil {
+			// A departed inviter shouldn't block acceptance — granted_by
+			// falls back to NULL (invited_by points at a membership that may
+			// no longer exist, e.g. expelled/resigned).
+			var grantedBy pgtype.UUID
+			if mb, err := q.GetMembershipByID(ctx, inv.InvitedBy); err == nil {
+				grantedBy = mb.UserID
+			} else if err != pgx.ErrNoRows {
 				return err
 			}
 			if err := q.AssignRoleBySlug(ctx, db.AssignRoleBySlugParams{
-				UserID: toPg(userID), TenantID: tenantID, GrantedBy: mb.UserID, Slug: "member",
+				UserID: toPg(userID), TenantID: tenantID, GrantedBy: grantedBy, Slug: "member",
 			}); err != nil {
 				return err
 			}

@@ -187,9 +187,11 @@ func (h *BillingHandler) Invoices(w http.ResponseWriter, r *http.Request) {
 }
 
 // Entitlements — merged capability+limit view per administered tenant.
+// Same org.admin.billing node gate as the rest of the /billing surface —
+// a delegated billing admin (node, no org_admin role) sees this too.
 func (h *BillingHandler) Entitlements(w http.ResponseWriter, r *http.Request) {
 	userID := middleware.UserID(r.Context())
-	admins, err := h.orgSvc.AdminTenants(r.Context(), userID)
+	admins, err := h.orgSvc.TenantsWithNode(r.Context(), userID, "org.admin.billing")
 	if err != nil {
 		httpx.WriteErr(w, 500, "internal_error", "tenant lookup failed")
 		return

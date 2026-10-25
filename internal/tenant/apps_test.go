@@ -25,7 +25,7 @@ func TestAppLifecycle(t *testing.T) {
 	svc, pool := testSvc(t)
 	ctx := context.Background()
 	owner := mkUser(t, pool, "appown"+uuid.NewString()[:8]+"@test.oga9")
-	org, err := svc.CreateOrg(ctx, owner, "Apps Union", "ap"+uuid.NewString()[:6], "union", "union", "NG", "Lagos", "o@t.co", uuid.Nil)
+	org, err := svc.CreateOrg(ctx, owner, "Apps Union", "ap"+uuid.NewString()[:6], "union", "union", "NG", "Lagos", "o@t.co", uuid.Nil, nil)
 	if err != nil {
 		t.Fatalf("create org: %v", err)
 	}
@@ -139,7 +139,7 @@ func TestNoPlatformAdminClone(t *testing.T) {
 	svc, pool := testSvc(t)
 	ctx := context.Background()
 	owner := mkUser(t, pool, "padm"+uuid.NewString()[:8]+"@test.oga9")
-	org, err := svc.CreateOrg(ctx, owner, "Clone Union", "cl"+uuid.NewString()[:6], "union", "union", "NG", "Lagos", "o@t.co", uuid.Nil)
+	org, err := svc.CreateOrg(ctx, owner, "Clone Union", "cl"+uuid.NewString()[:6], "union", "union", "NG", "Lagos", "o@t.co", uuid.Nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -161,7 +161,7 @@ func TestTenantsWithNode(t *testing.T) {
 	ctx := context.Background()
 	owner := mkUser(t, pool, "nodew"+uuid.NewString()[:8]+"@test.oga9")
 	stranger := mkUser(t, pool, "nodex"+uuid.NewString()[:8]+"@test.oga9")
-	org, err := svc.CreateOrg(ctx, owner, "Node Union", "nd"+uuid.NewString()[:6], "union", "union", "NG", "Lagos", "o@t.co", uuid.Nil)
+	org, err := svc.CreateOrg(ctx, owner, "Node Union", "nd"+uuid.NewString()[:6], "union", "union", "NG", "Lagos", "o@t.co", uuid.Nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

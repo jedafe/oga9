@@ -30,6 +30,13 @@ RETURNING id;
 -- name: CountTenantOrgs :one
 SELECT count(*) FROM organizations WHERE tenant_id = $1 AND deleted_at IS NULL;
 
+-- name: CountMemberCapableUnits :one
+-- limit.branches meter: member-capable structural units (hq|branch|chapter)
+-- count; committees/wings never do (plans-entitlements-catalog).
+SELECT count(*) FROM org_units
+WHERE organization_id = sqlc.arg(org_id)::uuid AND archived_at IS NULL
+  AND type IN ('hq','branch','chapter');
+
 -- name: ListOrgAdminTenants :many
 -- Tenants where the caller holds the org_admin role — the server-side
 -- "my tenant" resolution for POST /orgs (Rule 24).

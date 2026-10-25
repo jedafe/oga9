@@ -251,7 +251,10 @@ func (s *Service) ChangePlan(ctx context.Context, tenantID uuid.UUID, plan strin
 	}
 	targetPrice, targetOK := selfServePrice(target, sub.BillingTerm)
 	curPrice, curOK := selfServePrice(cur, sub.BillingTerm)
-	if !targetOK || (curOK && targetPrice > curPrice) {
+	// Free/sidegrade/downgrade only: a paid target needs payment whenever the
+	// current plan can't prove the move is strictly cheaper — an unpriced or
+	// unlisted current plan offers no comparison (never a bare slug write).
+	if !targetOK || (targetPrice > 0 && (!curOK || targetPrice > curPrice)) {
 		return ErrPaymentRequired
 	}
 	return s.withTx(ctx, func(q *db.Queries) error {
@@ -280,16 +283,21 @@ func (s *Service) Cancel(ctx context.Context, tenantID uuid.UUID, actor uuid.UUI
 }
 
 // activate marks the subscription active (webhook: payment succeeded) and
-// extends the period end.
+// extends the period end. Cancelled stays cancelled — a late invoice.paid
+// can't resurrect a terminal subscription (ActivateSubscription guards).
 func (s *Service) activate(ctx context.Context, q *db.Queries, sub *db.Subscriptions) error {
 	period := 30 * 24 * time.Hour
 	if sub.BillingTerm == "annual" || sub.BillingTerm == "enterprise_contract" {
 		period = 365 * 24 * time.Hour
 	}
-	if err := q.SetSubscriptionState(ctx, db.SetSubscriptionStateParams{
-		ID: sub.ID, State: "active", CurrentPeriodEnd: pgTime(time.Now().Add(period)),
-	}); err != nil {
+	n, err := q.ActivateSubscription(ctx, db.ActivateSubscriptionParams{
+		ID: sub.ID, CurrentPeriodEnd: pgTime(time.Now().Add(period)),
+	})
+	if err != nil {
 		return err
+	}
+	if n == 0 {
+		return nil // cancelled — terminal; no state change, no event
 	}
 	return events.Emit(ctx, q, uuid.UUID(sub.TenantID.Bytes), uuid.Nil, "SubscriptionChanged",
 		"subscription", uuid.UUID(sub.ID.Bytes), uuid.Nil, true,
@@ -517,6 +525,12 @@ func (s *Service) ProcessWebhook(ctx context.Context, rawEventID uuid.UUID) erro
 				return err
 			}
 		case "invoice.payment_failed", "payment.failed":
+			// Failed charge only moves an active sub to past_due — trials
+			// keep their window, lapsed states are already past the point,
+			// cancelled is terminal.
+			if sub.State != "active" {
+				return mark()
+			}
 			graceEnd := time.Now().Add(time.Duration(s.settingInt(ctx, "billing.grace_period_days", 14)) * 24 * time.Hour)
 			if err := s.transition(ctx, q, &sub, "past_due", graceEnd, time.Time{}, uuid.Nil); err != nil {
 				return err

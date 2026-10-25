@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"log"
 	"sort"
+	"strings"
 
 	"github.com/google/uuid"
 	"github.com/hibiken/asynq"
@@ -116,7 +117,7 @@ func (d *Dispatcher) dispatch(ctx context.Context, r db.FetchPendingEventsRow) e
 	if err != nil {
 		return d.q.DeadLetterEvent(ctx, db.DeadLetterEventParams{ID: r.ID, LastError: pgtype.Text{String: "payload unmarshal: " + err.Error(), Valid: true}})
 	}
-	failed := ""
+	var failures []string
 	for _, name := range d.names() {
 		logged, err := d.q.ConsumerLogged(ctx, db.ConsumerLoggedParams{Consumer: name, EventID: r.ID})
 		if err != nil {
@@ -126,13 +127,14 @@ func (d *Dispatcher) dispatch(ctx context.Context, r db.FetchPendingEventsRow) e
 			continue
 		}
 		if err := d.runConsumer(ctx, name, e); err != nil {
-			failed = fmt.Sprintf("%s: %v", name, err)
+			failures = append(failures, fmt.Sprintf("%s: %v", name, err))
 			log.Printf("outbox: consumer %s on %s failed: %v", name, e.Type, err)
 		}
 	}
-	if failed == "" {
+	if len(failures) == 0 {
 		return d.q.MarkEventDispatched(ctx, r.ID)
 	}
+	failed := strings.Join(failures, "; ")
 	if e.Attempts+1 >= MaxAttempts {
 		return d.q.DeadLetterEvent(ctx, db.DeadLetterEventParams{
 			ID: r.ID, LastError: pgtype.Text{String: "dead: " + failed, Valid: true},

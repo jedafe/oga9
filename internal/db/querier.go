@@ -14,6 +14,10 @@ type Querier interface {
 	// Re-activation is an upsert: clears the deactivated marker (idempotent —
 	// activating an active app is a no-op state-wise).
 	ActivateApp(ctx context.Context, arg ActivateAppParams) (pgtype.UUID, error)
+	// Webhook activation: a late invoice.paid must not resurrect a cancelled
+	// (terminal) subscription — the guard keeps cancelled sticky. 0 rows =
+	// already cancelled, nothing to emit.
+	ActivateSubscription(ctx context.Context, arg ActivateSubscriptionParams) (int64, error)
 	AddCommitteeMember(ctx context.Context, arg AddCommitteeMemberParams) (pgtype.UUID, error)
 	AddUsage(ctx context.Context, arg AddUsageParams) (int64, error)
 	AppointOfficer(ctx context.Context, arg AppointOfficerParams) (pgtype.UUID, error)
@@ -36,6 +40,9 @@ type Querier interface {
 	ConsumerLogged(ctx context.Context, arg ConsumerLoggedParams) (bool, error)
 	// DLQ depth for the queue-depth metric (ADR-020 reliability signal).
 	CountDeadEvents(ctx context.Context, maxAttempts int32) (int64, error)
+	// limit.branches meter: member-capable structural units (hq|branch|chapter)
+	// count; committees/wings never do (plans-entitlements-catalog).
+	CountMemberCapableUnits(ctx context.Context, orgID pgtype.UUID) (int64, error)
 	// Active seat occupancy for a position within a term (seats cap, §03).
 	CountPositionSeats(ctx context.Context, arg CountPositionSeatsParams) (int64, error)
 	CountTenantOrgs(ctx context.Context, tenantID pgtype.UUID) (int64, error)
@@ -69,7 +76,8 @@ type Querier interface {
 	EmitDomainEvent(ctx context.Context, arg EmitDomainEventParams) error
 	EndAppointment(ctx context.Context, arg EndAppointmentParams) (EndAppointmentRow, error)
 	// Ends every open appointment of the term; RETURNING rows feed
-	// AppointmentEnded events + permission-cache invalidation.
+	// AppointmentEnded events + permission-cache invalidation. GREATEST keeps
+	// ends_at >= starts_at for future-dated appointments (never end<start).
 	EndTermAppointments(ctx context.Context, termID pgtype.UUID) ([]EndTermAppointmentsRow, error)
 	// Outbox claim set: undelivered events under the attempt cap whose backoff
 	// has elapsed (next_attempt_at), oldest first.
@@ -125,6 +133,8 @@ type Querier interface {
 	IsAppActive(ctx context.Context, arg IsAppActiveParams) (bool, error)
 	LinkEntities(ctx context.Context, arg LinkEntitiesParams) error
 	LinkOAuthProvider(ctx context.Context, arg LinkOAuthProviderParams) error
+	// FOR UPDATE serializes activate/deactivate for a tenant — a sibling tx
+	// re-checks the dependency graph only after our commits (no lost-check race).
 	ListActiveApps(ctx context.Context, tenantID pgtype.UUID) ([]string, error)
 	// Governance roster: appointment + position/term/officer display names.
 	ListAppointments(ctx context.Context, orgID pgtype.UUID) ([]ListAppointmentsRow, error)

@@ -12,6 +12,7 @@ import (
 	valkey "github.com/valkey-io/valkey-go"
 
 	"github.com/jedafe/oga9/internal/db"
+	"github.com/jedafe/oga9/internal/entitlements"
 )
 
 func testSvc(t *testing.T) (*Service, *pgxpool.Pool) {
@@ -55,7 +56,8 @@ func TestOrgLifecycleFlow(t *testing.T) {
 	member := mkUser(t, pool, memberEmail)
 	stranger := mkUser(t, pool, "stg"+uuid.NewString()[:8]+"@test.oga9")
 
-	org, err := svc.CreateOrg(ctx, owner, "Test Union", "tu"+uuid.NewString()[:6], "union", "union", "NG", "Lagos", "owner@test.oga9", uuid.Nil)
+	ent := entitlements.NewService(pool, svc.vk)
+	org, err := svc.CreateOrg(ctx, owner, "Test Union", "tu"+uuid.NewString()[:6], "union", "union", "NG", "Lagos", "owner@test.oga9", uuid.Nil, ent)
 	if err != nil {
 		t.Fatalf("create org: %v", err)
 	}
@@ -63,8 +65,17 @@ func TestOrgLifecycleFlow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolve ctx: %v", err)
 	}
+	// §07 limit gate: starter allows limit.organizations=1 — a second org on
+	// the same tenant is denied until the plan offers more headroom.
+	if _, err := svc.CreateOrg(ctx, owner, "Starter Blocked", "sb"+uuid.NewString()[:6], "union", "union", "NG", "Enugu", "", uuid.Nil, ent); err != ErrLimitExceeded {
+		t.Fatalf("starter second org should hit limit.organizations, got %v", err)
+	}
+	if _, err := pool.Exec(ctx, "UPDATE subscriptions SET plan_slug='professional' WHERE tenant_id=$1", org.TenantID); err != nil {
+		t.Fatal(err)
+	}
+	ent.Invalidate(ctx, org.TenantID) // plan change → drop the cached starter set
 	// second org by the same owner attaches to their administered tenant
-	org2same, err := svc.CreateOrg(ctx, owner, "Owner Second", "os"+uuid.NewString()[:6], "union", "union", "NG", "Enugu", "", uuid.Nil)
+	org2same, err := svc.CreateOrg(ctx, owner, "Owner Second", "os"+uuid.NewString()[:6], "union", "union", "NG", "Enugu", "", uuid.Nil, ent)
 	if err != nil {
 		t.Fatalf("create second org: %v", err)
 	}
@@ -72,7 +83,7 @@ func TestOrgLifecycleFlow(t *testing.T) {
 		t.Fatal("second org should attach to the caller's existing tenant")
 	}
 	// a foreign tenant_id is verified server-side — member can't use it
-	if _, err := svc.CreateOrg(ctx, member, "Hijack", "hj"+uuid.NewString()[:6], "union", "union", "NG", "X", "x@t.co", org.TenantID); err != ErrNoTenant {
+	if _, err := svc.CreateOrg(ctx, member, "Hijack", "hj"+uuid.NewString()[:6], "union", "union", "NG", "X", "x@t.co", org.TenantID, ent); err != ErrNoTenant {
 		t.Fatalf("foreign tenant_id should be rejected, got %v", err)
 	}
 	if !svc.HasPermission(ctx, owner, org.ID, "org.structure.manage") {
@@ -83,11 +94,11 @@ func TestOrgLifecycleFlow(t *testing.T) {
 	}
 
 	// units: parent, child, cycle rejected, archive guard
-	hq, err := svc.CreateUnit(ctx, oc, uuid.Nil, "hq", "general", "HQ", "hq")
+	hq, err := svc.CreateUnit(ctx, oc, uuid.Nil, "hq", "general", "HQ", "hq", ent)
 	if err != nil {
 		t.Fatalf("unit: %v", err)
 	}
-	br, err := svc.CreateUnit(ctx, oc, hq, "branch", "lagos", "Lagos Branch", "lagos")
+	br, err := svc.CreateUnit(ctx, oc, hq, "branch", "lagos", "Lagos Branch", "lagos", ent)
 	if err != nil {
 		t.Fatalf("branch: %v", err)
 	}
@@ -139,7 +150,7 @@ func TestOrgLifecycleFlow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("invite2: %v", err)
 	}
-	org2, err := svc.CreateOrg(ctx, stranger, "Other Club", "oc"+uuid.NewString()[:6], "social-club", "", "NG", "Abuja", "stg@test.oga9", uuid.Nil)
+	org2, err := svc.CreateOrg(ctx, stranger, "Other Club", "oc"+uuid.NewString()[:6], "social-club", "", "NG", "Abuja", "stg@test.oga9", uuid.Nil, ent)
 	if err != nil {
 		t.Fatalf("create org2: %v", err)
 	}

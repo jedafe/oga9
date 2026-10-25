@@ -9,14 +9,20 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+	"github.com/jedafe/oga9/internal/entitlements"
 	"github.com/jedafe/oga9/internal/httpx"
 	"github.com/jedafe/oga9/internal/middleware"
 	"github.com/jedafe/oga9/internal/tenant"
 )
 
-type OrgHandler struct{ svc *tenant.Service }
+type OrgHandler struct {
+	svc *tenant.Service
+	ent *entitlements.Service
+}
 
-func NewOrgHandler(svc *tenant.Service) *OrgHandler { return &OrgHandler{svc: svc} }
+func NewOrgHandler(svc *tenant.Service, ent *entitlements.Service) *OrgHandler {
+	return &OrgHandler{svc: svc, ent: ent}
+}
 
 func orgErr(w http.ResponseWriter, err error) {
 	switch {
@@ -64,6 +70,8 @@ func orgErr(w http.ResponseWriter, err error) {
 		httpx.WriteErr(w, 400, "invalid_scope_unit", "committee_id must reference a committee unit; branch_id a structural unit")
 	case errors.Is(err, tenant.ErrDuplicateMember):
 		httpx.WriteErr(w, 409, "member_already_seated", "member is already in this committee")
+	case errors.Is(err, tenant.ErrMemberNotActive):
+		httpx.WriteErr(w, 409, "member_not_active", "member must be active to hold office or a committee seat")
 	case errors.Is(err, tenant.ErrInviteNoContact):
 		httpx.WriteErr(w, 400, "validation_failed", "email or phone required")
 	case errors.Is(err, tenant.ErrInviteNotFound):
@@ -95,7 +103,7 @@ func (h *OrgHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	org, err := h.svc.CreateOrg(r.Context(), middleware.UserID(r.Context()),
-		req.Name, req.Slug, req.TemplateSlug, req.OrgType, req.Country, req.City, req.BillingEmail, req.TenantID)
+		req.Name, req.Slug, req.TemplateSlug, req.OrgType, req.Country, req.City, req.BillingEmail, req.TenantID, h.ent)
 	if err != nil {
 		orgErr(w, err)
 		return
@@ -177,7 +185,7 @@ func (h *OrgHandler) CreateUnit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id, err := h.svc.CreateUnit(r.Context(), middleware.OrgCtx(r.Context()),
-		req.ParentID, req.Type, req.LevelLabel, req.Name, req.Slug)
+		req.ParentID, req.Type, req.LevelLabel, req.Name, req.Slug, h.ent)
 	if err != nil {
 		orgErr(w, err)
 		return
