@@ -18,6 +18,9 @@ type Querier interface {
 	// (terminal) subscription — the guard keeps cancelled sticky. 0 rows =
 	// already cancelled, nothing to emit.
 	ActivateSubscription(ctx context.Context, arg ActivateSubscriptionParams) (int64, error)
+	// Extra sponsors attached at intake (sponsor_required up to 2); they
+	// migrate onto the membership on approve.
+	AddApplicationSponsor(ctx context.Context, arg AddApplicationSponsorParams) error
 	AddCommitteeMember(ctx context.Context, arg AddCommitteeMemberParams) (pgtype.UUID, error)
 	AddSponsor(ctx context.Context, arg AddSponsorParams) error
 	AddUsage(ctx context.Context, arg AddUsageParams) (int64, error)
@@ -39,6 +42,9 @@ type Querier interface {
 	// statement — concurrent logins can't both consume the same code.
 	ConsumeRecoveryCode(ctx context.Context, arg ConsumeRecoveryCodeParams) (pgtype.UUID, error)
 	ConsumerLogged(ctx context.Context, arg ConsumerLoggedParams) (bool, error)
+	// Total sponsors across the application's primary sponsor_member_id plus
+	// any application-staged rows — the sponsor_required numerator at approve.
+	CountApplicationSponsors(ctx context.Context, applicationID pgtype.UUID) (int32, error)
 	// DLQ depth for the queue-depth metric (ADR-020 reliability signal).
 	CountDeadEvents(ctx context.Context, maxAttempts int32) (int64, error)
 	// limit.branches meter: member-capable structural units (hq|branch|chapter)
@@ -91,7 +97,8 @@ type Querier interface {
 	// ends_at >= starts_at for future-dated appointments (never end<start).
 	EndTermAppointments(ctx context.Context, termID pgtype.UUID) ([]EndTermAppointmentsRow, error)
 	// Import idempotency: a retried member_import worker must not mint a
-	// second open application for the same org+email (Rule 27).
+	// second open application for the same applicant (Rule 27) — dedupe on
+	// email when present, phone otherwise.
 	ExistsOpenApplicationByEmail(ctx context.Context, arg ExistsOpenApplicationByEmailParams) (bool, error)
 	// Outbox claim set: undelivered events under the attempt cap whose backoff
 	// has elapsed (next_attempt_at), oldest first.
@@ -207,6 +214,7 @@ type Querier interface {
 	// AND the member's application aggregates (ADR-014 "complete replayable
 	// journey" — the intake trail belongs in the history too).
 	MemberHistory(ctx context.Context, arg MemberHistoryParams) ([]MemberHistoryRow, error)
+	MoveApplicationSponsors(ctx context.Context, arg MoveApplicationSponsorsParams) error
 	// Atomic per-org sequence for member_no ({SLUG}-{YYYY}-{seq5}); the lock
 	// serializes concurrent approvals so numbers are unique and never reused.
 	NextMemberNoSeq(ctx context.Context, id pgtype.UUID) (int64, error)
@@ -280,6 +288,10 @@ type Querier interface {
 	UpsertOrgSetting(ctx context.Context, arg UpsertOrgSettingParams) error
 	UserCommitteeUnits(ctx context.Context, arg UserCommitteeUnitsParams) ([]pgtype.UUID, error)
 	UserRequiresMFA(ctx context.Context, userID pgtype.UUID) (bool, error)
+	// Self-service withdrawal: only the applicant's own row, and only while
+	// pre-decision. CAS source states keep a raced admin decision from
+	// being clobbered.
+	WithdrawApplication(ctx context.Context, arg WithdrawApplicationParams) (WithdrawApplicationRow, error)
 }
 
 var _ Querier = (*Queries)(nil)

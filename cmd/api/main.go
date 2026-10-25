@@ -226,6 +226,9 @@ func main() {
 			r.Get("/org-templates", orgH.Templates)
 			r.Post("/orgs", orgH.Create)
 			r.With(middleware.RateLimit(vk, "invite_accept", 10, time.Minute)).Post("/invitations/{token}/accept", orgH.Accept)
+			// applicant self-service — no OrgCtx (a pre-decision applicant
+			// has no membership); the handler verifies ownership.
+			r.Post("/orgs/{org_id}/applications/{application_id}/withdraw", memberH.Withdraw)
 			r.Group(func(r chi.Router) {
 				r.Use(middleware.RequireOrgCtx(orgSvc))
 				r.With(middleware.RequireOrgPermission(orgSvc, "org.members.view")).Get("/orgs/{org_id}", orgH.Get)

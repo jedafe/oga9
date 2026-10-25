@@ -11,10 +11,29 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const addApplicationSponsor = `-- name: AddApplicationSponsor :exec
+INSERT INTO member_sponsors (application_id, sponsor_member_id, kind)
+VALUES ($1, $2, $3)
+ON CONFLICT DO NOTHING
+`
+
+type AddApplicationSponsorParams struct {
+	ApplicationID   pgtype.UUID `json:"application_id"`
+	SponsorMemberID pgtype.UUID `json:"sponsor_member_id"`
+	Kind            string      `json:"kind"`
+}
+
+// Extra sponsors attached at intake (sponsor_required up to 2); they
+// migrate onto the membership on approve.
+func (q *Queries) AddApplicationSponsor(ctx context.Context, arg AddApplicationSponsorParams) error {
+	_, err := q.db.Exec(ctx, addApplicationSponsor, arg.ApplicationID, arg.SponsorMemberID, arg.Kind)
+	return err
+}
+
 const addSponsor = `-- name: AddSponsor :exec
 INSERT INTO member_sponsors (membership_id, sponsor_member_id, kind)
 VALUES ($1, $2, $3)
-ON CONFLICT (membership_id, sponsor_member_id) DO NOTHING
+ON CONFLICT DO NOTHING
 `
 
 type AddSponsorParams struct {
@@ -26,6 +45,23 @@ type AddSponsorParams struct {
 func (q *Queries) AddSponsor(ctx context.Context, arg AddSponsorParams) error {
 	_, err := q.db.Exec(ctx, addSponsor, arg.MembershipID, arg.SponsorMemberID, arg.Kind)
 	return err
+}
+
+const countApplicationSponsors = `-- name: CountApplicationSponsors :one
+SELECT (
+  SELECT count(*) FROM member_sponsors
+  WHERE application_id = $1::uuid AND kind = 'sponsor'
+) + (SELECT CASE WHEN sponsor_member_id IS NOT NULL THEN 1 ELSE 0 END
+     FROM membership_applications WHERE id = $1::uuid)
+`
+
+// Total sponsors across the application's primary sponsor_member_id plus
+// any application-staged rows — the sponsor_required numerator at approve.
+func (q *Queries) CountApplicationSponsors(ctx context.Context, applicationID pgtype.UUID) (int32, error) {
+	row := q.db.QueryRow(ctx, countApplicationSponsors, applicationID)
+	var column_1 int32
+	err := row.Scan(&column_1)
+	return column_1, err
 }
 
 const countSponsors = `-- name: CountSponsors :one
@@ -159,20 +195,23 @@ func (q *Queries) EndMemberAppointments(ctx context.Context, memberID pgtype.UUI
 const existsOpenApplicationByEmail = `-- name: ExistsOpenApplicationByEmail :one
 SELECT EXISTS(
   SELECT 1 FROM membership_applications
-  WHERE organization_id = $1 AND lower(email::text) = lower($2)
-    AND status IN ('applied','screened','approved')
+  WHERE organization_id = $1::uuid AND status IN ('applied','screened','approved')
+    AND (($2 <> '' AND lower(email::text) = lower($2))
+      OR ($2 = '' AND $3 <> '' AND phone = $3))
 )
 `
 
 type ExistsOpenApplicationByEmailParams struct {
-	OrganizationID pgtype.UUID `json:"organization_id"`
-	Lower          string      `json:"lower"`
+	OrgID pgtype.UUID `json:"org_id"`
+	Email interface{} `json:"email"`
+	Phone interface{} `json:"phone"`
 }
 
 // Import idempotency: a retried member_import worker must not mint a
-// second open application for the same org+email (Rule 27).
+// second open application for the same applicant (Rule 27) — dedupe on
+// email when present, phone otherwise.
 func (q *Queries) ExistsOpenApplicationByEmail(ctx context.Context, arg ExistsOpenApplicationByEmailParams) (bool, error) {
-	row := q.db.QueryRow(ctx, existsOpenApplicationByEmail, arg.OrganizationID, arg.Lower)
+	row := q.db.QueryRow(ctx, existsOpenApplicationByEmail, arg.OrgID, arg.Email, arg.Phone)
 	var exists bool
 	err := row.Scan(&exists)
 	return exists, err
@@ -456,12 +495,13 @@ func (q *Queries) ListApplications(ctx context.Context, arg ListApplicationsPara
 
 const listMembers = `-- name: ListMembers :many
 SELECT m.id, m.user_id, m.member_no, m.category, m.lifecycle_state, m.dues_standing,
-       m.joined_at, u.display_name, u.email
+       m.joined_at, m.org_unit_id, u.display_name, u.email
 FROM organization_memberships m
 JOIN users u ON u.id = m.user_id
 WHERE m.organization_id = $1::uuid
   AND ($2 = '' OR m.category = $2)
   AND ($3 = '' OR m.lifecycle_state = $3)
+  AND ($4::uuid IS NULL OR m.org_unit_id = $4::uuid)
 ORDER BY u.display_name
 `
 
@@ -469,6 +509,7 @@ type ListMembersParams struct {
 	OrgID    pgtype.UUID `json:"org_id"`
 	Category interface{} `json:"category"`
 	State    interface{} `json:"state"`
+	UnitID   pgtype.UUID `json:"unit_id"`
 }
 
 type ListMembersRow struct {
@@ -479,12 +520,18 @@ type ListMembersRow struct {
 	LifecycleState string             `json:"lifecycle_state"`
 	DuesStanding   string             `json:"dues_standing"`
 	JoinedAt       pgtype.Timestamptz `json:"joined_at"`
+	OrgUnitID      pgtype.UUID        `json:"org_unit_id"`
 	DisplayName    string             `json:"display_name"`
 	Email          string             `json:"email"`
 }
 
 func (q *Queries) ListMembers(ctx context.Context, arg ListMembersParams) ([]ListMembersRow, error) {
-	rows, err := q.db.Query(ctx, listMembers, arg.OrgID, arg.Category, arg.State)
+	rows, err := q.db.Query(ctx, listMembers,
+		arg.OrgID,
+		arg.Category,
+		arg.State,
+		arg.UnitID,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -500,6 +547,7 @@ func (q *Queries) ListMembers(ctx context.Context, arg ListMembersParams) ([]Lis
 			&i.LifecycleState,
 			&i.DuesStanding,
 			&i.JoinedAt,
+			&i.OrgUnitID,
 			&i.DisplayName,
 			&i.Email,
 		); err != nil {
@@ -684,6 +732,22 @@ func (q *Queries) MemberHistory(ctx context.Context, arg MemberHistoryParams) ([
 	return items, nil
 }
 
+const moveApplicationSponsors = `-- name: MoveApplicationSponsors :exec
+UPDATE member_sponsors SET membership_id = $1::uuid,
+                          application_id = NULL
+WHERE application_id = $2::uuid
+`
+
+type MoveApplicationSponsorsParams struct {
+	MembershipID  pgtype.UUID `json:"membership_id"`
+	ApplicationID pgtype.UUID `json:"application_id"`
+}
+
+func (q *Queries) MoveApplicationSponsors(ctx context.Context, arg MoveApplicationSponsorsParams) error {
+	_, err := q.db.Exec(ctx, moveApplicationSponsors, arg.MembershipID, arg.ApplicationID)
+	return err
+}
+
 const nextMemberNoSeq = `-- name: NextMemberNoSeq :one
 UPDATE organizations SET member_no_seq = member_no_seq + 1
 WHERE id = $1
@@ -700,20 +764,27 @@ func (q *Queries) NextMemberNoSeq(ctx context.Context, id pgtype.UUID) (int64, e
 }
 
 const patchMembership = `-- name: PatchMembership :one
-UPDATE organization_memberships SET category = COALESCE($1, category)
-WHERE id = $2::uuid AND organization_id = $3::uuid
+UPDATE organization_memberships SET category = COALESCE($1, category),
+  org_unit_id = COALESCE($2::uuid, org_unit_id)
+WHERE id = $3::uuid AND organization_id = $4::uuid
 RETURNING id
 `
 
 type PatchMembershipParams struct {
-	Category pgtype.Text `json:"category"`
-	ID       pgtype.UUID `json:"id"`
-	OrgID    pgtype.UUID `json:"org_id"`
+	Category  pgtype.Text `json:"category"`
+	OrgUnitID pgtype.UUID `json:"org_unit_id"`
+	ID        pgtype.UUID `json:"id"`
+	OrgID     pgtype.UUID `json:"org_id"`
 }
 
 // Limited self/admin-editable fields; lifecycle never changes here.
 func (q *Queries) PatchMembership(ctx context.Context, arg PatchMembershipParams) (pgtype.UUID, error) {
-	row := q.db.QueryRow(ctx, patchMembership, arg.Category, arg.ID, arg.OrgID)
+	row := q.db.QueryRow(ctx, patchMembership,
+		arg.Category,
+		arg.OrgUnitID,
+		arg.ID,
+		arg.OrgID,
+	)
 	var id pgtype.UUID
 	err := row.Scan(&id)
 	return id, err
@@ -853,5 +924,31 @@ func (q *Queries) TransitionMembership(ctx context.Context, arg TransitionMember
 	)
 	var i TransitionMembershipRow
 	err := row.Scan(&i.ID, &i.UserID)
+	return i, err
+}
+
+const withdrawApplication = `-- name: WithdrawApplication :one
+UPDATE membership_applications SET status = 'withdrawn', decided_at = now()
+WHERE id = $1 AND user_id = $2 AND status IN ('applied','screened')
+RETURNING id, organization_id
+`
+
+type WithdrawApplicationParams struct {
+	ID     pgtype.UUID `json:"id"`
+	UserID pgtype.UUID `json:"user_id"`
+}
+
+type WithdrawApplicationRow struct {
+	ID             pgtype.UUID `json:"id"`
+	OrganizationID pgtype.UUID `json:"organization_id"`
+}
+
+// Self-service withdrawal: only the applicant's own row, and only while
+// pre-decision. CAS source states keep a raced admin decision from
+// being clobbered.
+func (q *Queries) WithdrawApplication(ctx context.Context, arg WithdrawApplicationParams) (WithdrawApplicationRow, error) {
+	row := q.db.QueryRow(ctx, withdrawApplication, arg.ID, arg.UserID)
+	var i WithdrawApplicationRow
+	err := row.Scan(&i.ID, &i.OrganizationID)
 	return i, err
 }

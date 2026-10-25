@@ -106,16 +106,21 @@ func (s *Service) memberNo(ctx context.Context, q *db.Queries, orgID uuid.UUID) 
 	return no, nil
 }
 
-// Apply files a membership application. Public pre-signup applications
-// pass userID=uuid.Nil (email carries identity until they register).
-// org.membership.sponsor_required is enforced at APPROVE (§11 test
-// scenario) — intake stays open so a screener can attach sponsors later.
-func (s *Service) Apply(ctx context.Context, orgID, userID uuid.UUID, email, phone string, answers json.RawMessage, sponsorID uuid.UUID) (uuid.UUID, error) {
+// Apply files a membership application. sponsorIDs[0] is the primary
+// sponsor (sponsor_member_id column); extras stage as application-linked
+// member_sponsors rows and migrate to the membership on approve —
+// satisfying sponsor_required up to 2. Every sponsor must be an active
+// member of the same org. sponsor_required is enforced at APPROVE (§11
+// test scenario) — intake stays open so a screener can attach sponsors.
+func (s *Service) Apply(ctx context.Context, orgID, userID uuid.UUID, email, phone string, answers json.RawMessage, sponsorIDs []uuid.UUID) (uuid.UUID, error) {
 	if email == "" && phone == "" {
 		return uuid.Nil, ErrInviteNoContact
 	}
 	if len(answers) == 0 {
 		answers = json.RawMessage("{}")
+	}
+	if len(sponsorIDs) > 2 {
+		return uuid.Nil, ErrBadValue // catalog caps sponsor_required at 2
 	}
 	if userID != uuid.Nil {
 		if n, err := s.q.GetApplicationCountForUser(ctx, db.GetApplicationCountForUserParams{OrganizationID: toPg(orgID), UserID: toPg(userID)}); err != nil {
@@ -124,24 +129,35 @@ func (s *Service) Apply(ctx context.Context, orgID, userID uuid.UUID, email, pho
 			return uuid.Nil, ErrAlreadyApplied
 		}
 	}
+	var primary pgtype.UUID
+	if len(sponsorIDs) > 0 {
+		primary = toPg(sponsorIDs[0])
+	}
 	var id uuid.UUID
 	err := s.withTx(ctx, func(q *db.Queries) error {
-		if sponsorID != uuid.Nil {
-			sp, err := q.GetMembershipByID(ctx, toPg(sponsorID))
+		for _, sid := range sponsorIDs {
+			sp, err := q.GetMembershipByID(ctx, toPg(sid))
 			if err != nil || fromPg(sp.OrganizationID) != orgID || sp.LifecycleState != "active" {
-				return ErrNotMember // sponsor must be an active member of this org
+				return ErrNotMember // sponsors must be active members of this org
 			}
 		}
 		r, err := q.CreateApplication(ctx, db.CreateApplicationParams{
 			OrganizationID: toPg(orgID), UserID: pgUUIDPtr(userID),
 			Email: pgText(email), Phone: pgText(phone),
 			Answers:         answers,
-			SponsorMemberID: pgUUIDPtr(sponsorID),
+			SponsorMemberID: primary,
 		})
 		if err != nil {
 			return err
 		}
 		id = fromPg(r)
+		for _, sid := range sponsorIDs[min(len(sponsorIDs), 1):] {
+			if err := q.AddApplicationSponsor(ctx, db.AddApplicationSponsorParams{
+				ApplicationID: r, SponsorMemberID: toPg(sid), Kind: "sponsor",
+			}); err != nil {
+				return err
+			}
+		}
 		return events.Emit(ctx, q, uuid.Nil, orgID, "MemberApplied", "membership_application", id, userID, true,
 			map[string]any{"application_id": id, "org_id": orgID, "user_id": userID, "email": email})
 	})
@@ -158,7 +174,7 @@ func (s *Service) PublicApply(ctx context.Context, slug, email, phone string, an
 	if err != nil {
 		return uuid.Nil, err
 	}
-	return s.Apply(ctx, fromPg(org.ID), uuid.Nil, email, phone, answers, uuid.Nil)
+	return s.Apply(ctx, fromPg(org.ID), uuid.Nil, email, phone, answers, nil)
 }
 
 // PublicApplyForm feeds GET /directory/orgs/{slug}/apply — the org's
@@ -231,17 +247,21 @@ func (s *Service) DecideApplication(ctx context.Context, oc *OrgCtx, appID uuid.
 	return s.withTx(ctx, func(q *db.Queries) error {
 		if to == "approved" {
 			// §11 test: approve enforces org.membership.sponsor_required —
-			// a sponsor must be an active member of this org.
+			// total sponsors (primary + staged) must reach the org's count.
 			if raw, err := q.GetOrgSetting(ctx, db.GetOrgSettingParams{
 				OrganizationID: toPg(oc.OrgID), Key: "org.membership.sponsor_required",
 			}); err == nil && len(raw) > 0 {
 				var required float64
-				if json.Unmarshal(raw, &required) == nil && required > 0 && !app.SponsorMemberID.Valid {
-					return ErrSponsorRequired
+				if json.Unmarshal(raw, &required) == nil && required > 0 {
+					if n, err := q.CountApplicationSponsors(ctx, toPg(appID)); err != nil {
+						return err
+					} else if int64(n) < int64(required) {
+						return ErrSponsorRequired
+					}
 				}
 			}
 		}
-		row, err := q.SetApplicationStatus(ctx, db.SetApplicationStatusParams{
+		_, err = q.SetApplicationStatus(ctx, db.SetApplicationStatusParams{
 			ID: toPg(appID), Column2: from, Status: to, ScreenedBy: pgUUIDPtr(oc.MembershipID),
 		})
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -290,11 +310,15 @@ func (s *Service) DecideApplication(ctx context.Context, oc *OrgCtx, appID uuid.
 			}); err != nil {
 				return err
 			}
-			return events.Emit(ctx, q, oc.TenantID, oc.OrgID, "SponsorshipRecorded", "organization_membership", fromPg(mid), oc.UserID, true,
-				map[string]any{"membership_id": fromPg(mid), "sponsor_member_id": fromPg(app.SponsorMemberID), "kind": "sponsor"})
+			if err := events.Emit(ctx, q, oc.TenantID, oc.OrgID, "SponsorshipRecorded", "organization_membership", fromPg(mid), oc.UserID, true,
+				map[string]any{"membership_id": fromPg(mid), "sponsor_member_id": fromPg(app.SponsorMemberID), "kind": "sponsor"}); err != nil {
+				return err
+			}
 		}
-		_ = row
-		return nil
+		// staged extras become membership sponsor rows too.
+		return q.MoveApplicationSponsors(ctx, db.MoveApplicationSponsorsParams{
+			ApplicationID: toPg(appID), MembershipID: mid,
+		})
 	})
 }
 
@@ -386,9 +410,11 @@ func (s *Service) TransitionMember(ctx context.Context, oc *OrgCtx, memberID uui
 	return nil
 }
 
-// Members lists the directory with optional category/state filters.
-func (s *Service) Members(ctx context.Context, oc *OrgCtx, category, state string) ([]db.ListMembersRow, error) {
-	return s.q.ListMembers(ctx, db.ListMembersParams{OrgID: toPg(oc.OrgID), Category: category, State: state})
+// Members lists the directory with optional category/state/unit filters.
+func (s *Service) Members(ctx context.Context, oc *OrgCtx, category, state string, unitID uuid.UUID) ([]db.ListMembersRow, error) {
+	return s.q.ListMembers(ctx, db.ListMembersParams{
+		OrgID: toPg(oc.OrgID), Category: category, State: state, UnitID: pgUUIDPtr(unitID),
+	})
 }
 
 func (s *Service) MemberDetail(ctx context.Context, oc *OrgCtx, memberID uuid.UUID) (db.GetMembershipFullRow, error) {
@@ -399,16 +425,41 @@ func (s *Service) MemberDetail(ctx context.Context, oc *OrgCtx, memberID uuid.UU
 	return m, err
 }
 
-// PatchMember is the limited admin edit surface — category only; lifecycle
-// never changes here (transitions are explicit).
-func (s *Service) PatchMember(ctx context.Context, oc *OrgCtx, memberID uuid.UUID, category string) error {
-	if !memberCategories[category] {
+// PatchMember is the limited admin edit surface — category + home-unit
+// scope; lifecycle never changes here (transitions are explicit).
+func (s *Service) PatchMember(ctx context.Context, oc *OrgCtx, memberID uuid.UUID, category string, unitID uuid.UUID) error {
+	if category != "" && !memberCategories[category] {
 		return ErrBadCategory
 	}
+	if unitID != uuid.Nil {
+		u, err := s.q.GetUnit(ctx, toPg(unitID))
+		if err != nil || fromPg(u.OrganizationID) != oc.OrgID {
+			return ErrBadScopeUnit // scope must be a unit of this org
+		}
+	}
 	if _, err := s.q.PatchMembership(ctx, db.PatchMembershipParams{
-		ID: toPg(memberID), OrgID: toPg(oc.OrgID), Category: pgText(category),
+		ID: toPg(memberID), OrgID: toPg(oc.OrgID), Category: pgText(category), OrgUnitID: pgUUIDPtr(unitID),
 	}); errors.Is(err, pgx.ErrNoRows) {
 		return ErrNotMember
+	} else {
+		return err
+	}
+}
+
+// WithdrawApplication is the applicant's self-service path (catalogued
+// "self" node) — their own application only, and only while pre-decision.
+func (s *Service) WithdrawApplication(ctx context.Context, userID, orgID, appID uuid.UUID) error {
+	app, err := s.q.GetApplication(ctx, toPg(appID))
+	if errors.Is(err, pgx.ErrNoRows) || fromPg(app.OrganizationID) != orgID || fromPg(app.UserID) != userID {
+		return ErrApplicationNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if _, err := s.q.WithdrawApplication(ctx, db.WithdrawApplicationParams{
+		ID: toPg(appID), UserID: toPg(userID),
+	}); errors.Is(err, pgx.ErrNoRows) {
+		return ErrInvalidTransition // already decided
 	} else {
 		return err
 	}
@@ -542,16 +593,14 @@ func (s *Service) ProcessImport(ctx context.Context, importID uuid.UUID) error {
 			continue
 		}
 		// Rule 27 idempotency: a retried worker skips rows that already
-		// produced an open application for this org+email.
-		if email != "" {
-			if exists, err := s.q.ExistsOpenApplicationByEmail(ctx, db.ExistsOpenApplicationByEmailParams{
-				OrganizationID: imp.OrganizationID, Lower: email,
-			}); err != nil {
-				return err
-			} else if exists {
-				ok++ // already created — counts as success on replay
-				continue
-			}
+		// produced an open application for this applicant (email or phone).
+		if exists, err := s.q.ExistsOpenApplicationByEmail(ctx, db.ExistsOpenApplicationByEmailParams{
+			OrgID: imp.OrganizationID, Email: email, Phone: phone,
+		}); err != nil {
+			return err
+		} else if exists {
+			ok++ // already created — counts as success on replay
+			continue
 		}
 		_, err := s.q.CreateApplication(ctx, db.CreateApplicationParams{
 			OrganizationID: imp.OrganizationID, Email: pgText(email), Phone: pgText(phone),

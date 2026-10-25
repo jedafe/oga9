@@ -165,6 +165,8 @@ type MemberSponsors struct {
 	SponsorMemberID pgtype.UUID        `json:"sponsor_member_id"`
 	Kind            string             `json:"kind"`
 	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+	ID              pgtype.UUID        `json:"id"`
+	ApplicationID   pgtype.UUID        `json:"application_id"`
 }
 
 type MembershipApplications struct {
@@ -188,6 +190,24 @@ type MembershipCards struct {
 	Design       []byte             `json:"design"`
 	IssuedAt     pgtype.Timestamptz `json:"issued_at"`
 	RevokedAt    pgtype.Timestamptz `json:"revoked_at"`
+}
+
+type MembershipHistory struct {
+	ID             pgtype.UUID        `json:"id"`
+	EventType      string             `json:"event_type"`
+	AggregateType  string             `json:"aggregate_type"`
+	AggregateID    pgtype.UUID        `json:"aggregate_id"`
+	TenantID       pgtype.UUID        `json:"tenant_id"`
+	ActorID        pgtype.UUID        `json:"actor_id"`
+	Payload        []byte             `json:"payload"`
+	OccurredAt     pgtype.Timestamptz `json:"occurred_at"`
+	DispatchedAt   pgtype.Timestamptz `json:"dispatched_at"`
+	Attempts       int32              `json:"attempts"`
+	LastError      pgtype.Text        `json:"last_error"`
+	OrganizationID pgtype.UUID        `json:"organization_id"`
+	Sourced        bool               `json:"sourced"`
+	NextAttemptAt  pgtype.Timestamptz `json:"next_attempt_at"`
+	RedriveCount   int32              `json:"redrive_count"`
 }
 
 type MembershipRenewals struct {
@@ -286,6 +306,7 @@ type OrganizationMemberships struct {
 	CreatedAt      pgtype.Timestamptz `json:"created_at"`
 	DuesStanding   string             `json:"dues_standing"`
 	LastRenewedAt  pgtype.Timestamptz `json:"last_renewed_at"`
+	OrgUnitID      pgtype.UUID        `json:"org_unit_id"`
 }
 
 type OrganizationRelationships struct {

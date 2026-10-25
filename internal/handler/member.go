@@ -54,10 +54,16 @@ func memberErr(w http.ResponseWriter, err error) {
 	}
 }
 
-// Members — GET /orgs/{id}/members?category=&state= (view_any).
+// Members — GET /orgs/{id}/members?category=&state=&unit= (view_any).
 func (h *MemberHandler) Members(w http.ResponseWriter, r *http.Request) {
 	oc := middleware.OrgCtx(r.Context())
-	rows, err := h.svc.Members(r.Context(), oc, r.URL.Query().Get("category"), r.URL.Query().Get("state"))
+	var unitID uuid.UUID
+	if u := r.URL.Query().Get("unit"); u != "" {
+		if p, err := uuid.Parse(u); err == nil {
+			unitID = p
+		}
+	}
+	rows, err := h.svc.Members(r.Context(), oc, r.URL.Query().Get("category"), r.URL.Query().Get("state"), unitID)
 	if err != nil {
 		memberErr(w, err)
 		return
@@ -81,21 +87,23 @@ func (h *MemberHandler) Member(w http.ResponseWriter, r *http.Request) {
 	httpx.WriteData(w, 200, m)
 }
 
-// PatchMember — PATCH /orgs/{id}/members/{mid} (manage): category only.
+// PatchMember — PATCH /orgs/{id}/members/{mid} (manage): category +
+// home-unit scope only; lifecycle never changes here.
 func (h *MemberHandler) PatchMember(w http.ResponseWriter, r *http.Request) {
 	mid, _ := uuid.Parse(chi.URLParam(r, "member_id"))
 	var req struct {
-		Category string `json:"category"`
+		Category string    `json:"category"`
+		UnitID   uuid.UUID `json:"unit_id"`
 	}
-	if err := httpx.Decode(w, r, &req); err != nil || req.Category == "" {
-		httpx.WriteErr(w, 400, "validation_failed", "category required")
+	if err := httpx.Decode(w, r, &req); err != nil || (req.Category == "" && req.UnitID == uuid.Nil) {
+		httpx.WriteErr(w, 400, "validation_failed", "category or unit_id required")
 		return
 	}
-	if err := h.svc.PatchMember(r.Context(), middleware.OrgCtx(r.Context()), mid, req.Category); err != nil {
+	if err := h.svc.PatchMember(r.Context(), middleware.OrgCtx(r.Context()), mid, req.Category, req.UnitID); err != nil {
 		memberErr(w, err)
 		return
 	}
-	httpx.WriteData(w, 200, map[string]any{"id": mid, "category": req.Category})
+	httpx.WriteData(w, 200, map[string]any{"id": mid})
 }
 
 // Transition — POST /orgs/{id}/members/{mid}/transition {to: suspend|
@@ -177,17 +185,17 @@ func (h *MemberHandler) History(w http.ResponseWriter, r *http.Request) {
 func (h *MemberHandler) Apply(w http.ResponseWriter, r *http.Request) {
 	oc := middleware.OrgCtx(r.Context())
 	var req struct {
-		UserID  uuid.UUID       `json:"user_id"`
-		Email   string          `json:"email"`
-		Phone   string          `json:"phone"`
-		Answers json.RawMessage `json:"answers"`
-		Sponsor uuid.UUID       `json:"sponsor_member_id"`
+		UserID   uuid.UUID       `json:"user_id"`
+		Email    string          `json:"email"`
+		Phone    string          `json:"phone"`
+		Answers  json.RawMessage `json:"answers"`
+		Sponsors []uuid.UUID     `json:"sponsor_member_ids"`
 	}
 	if err := httpx.Decode(w, r, &req); err != nil {
 		httpx.WriteErr(w, 400, "validation_failed", "invalid body")
 		return
 	}
-	id, err := h.svc.Apply(r.Context(), oc.OrgID, req.UserID, req.Email, req.Phone, req.Answers, req.Sponsor)
+	id, err := h.svc.Apply(r.Context(), oc.OrgID, req.UserID, req.Email, req.Phone, req.Answers, req.Sponsors)
 	if err != nil {
 		memberErr(w, err)
 		return
@@ -221,6 +229,19 @@ func (h *MemberHandler) Decide(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httpx.WriteData(w, 200, map[string]any{"id": aid, "action": req.Action})
+}
+
+// Withdraw — POST /orgs/{id}/applications/{aid}/withdraw (self): the
+// applicant's own row only. Outside the orgCtx group on purpose — a
+// pre-decision applicant has no membership yet.
+func (h *MemberHandler) Withdraw(w http.ResponseWriter, r *http.Request) {
+	orgID, _ := uuid.Parse(chi.URLParam(r, "org_id"))
+	appID, _ := uuid.Parse(chi.URLParam(r, "application_id"))
+	if err := h.svc.WithdrawApplication(r.Context(), middleware.UserID(r.Context()), orgID, appID); err != nil {
+		memberErr(w, err)
+		return
+	}
+	httpx.WriteData(w, 200, map[string]any{"id": appID, "status": "withdrawn"})
 }
 
 // PublicApply — POST /directory/orgs/{slug}/apply: unauthenticated intake.
@@ -288,7 +309,7 @@ func (h *MemberHandler) Import(w http.ResponseWriter, r *http.Request) {
 // Export — GET /orgs/{id}/members/export (export node): synchronous CSV —
 // the async membership:export file-delivery path lands with blob storage.
 func (h *MemberHandler) Export(w http.ResponseWriter, r *http.Request) {
-	rows, err := h.svc.Members(r.Context(), middleware.OrgCtx(r.Context()), "", "")
+	rows, err := h.svc.Members(r.Context(), middleware.OrgCtx(r.Context()), "", "", uuid.Nil)
 	if err != nil {
 		memberErr(w, err)
 		return

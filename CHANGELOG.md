@@ -5,6 +5,26 @@ entries reference engineering phases in `.oos/roadmaps/ROADMAP-BACKEND.md`.
 
 ## [Unreleased]
 
+### Fixed — Phase 08 review, round 2 (spec gaps)
+- Member home-unit scope: `organization_memberships.org_unit_id`
+  (000075) — the §11 `unit` directory filter is now real
+  (`GET /members?unit=`, `PATCH {unit_id}` validated same-org).
+- `sponsor_required: 2` implemented: applications carry
+  `sponsor_member_ids[]` — the primary lands in
+  `sponsor_member_id`, extras stage in `member_sponsors.application_id`
+  (new nullable column + partial uniques, 000075) and migrate onto the
+  membership on approve; the approve gate counts total sponsors.
+- Applicant self-withdrawal: `POST /orgs/{id}/applications/{aid}/withdraw`
+  — deliberately outside the orgCtx group (a pre-decision applicant has
+  no membership); ownership + open-status checked in the service.
+- `membership_history` DB view over `domain_events` — sourced
+  membership-family aggregates (§11 "sourced event stream").
+- Import dedupe widened to email-or-phone — phone-only rows replayed
+  into duplicates.
+- Empty `sponsorIDs` slice no longer panics the extras loop.
+- Spec updated first: §11 documents `org_unit_id`, application-stage
+  sponsors, `membership_history`; routes catalog gains the withdraw row.
+
 ### Fixed — Phase 08 review, round 1
 - `DecideApplication` no longer emits an empty `event_type` on withdraw
   (no `MemberWithdrawn` event exists in the catalog — Rule 12) and no

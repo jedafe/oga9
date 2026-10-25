@@ -49,12 +49,13 @@ WHERE m.id = $1;
 
 -- name: ListMembers :many
 SELECT m.id, m.user_id, m.member_no, m.category, m.lifecycle_state, m.dues_standing,
-       m.joined_at, u.display_name, u.email
+       m.joined_at, m.org_unit_id, u.display_name, u.email
 FROM organization_memberships m
 JOIN users u ON u.id = m.user_id
 WHERE m.organization_id = sqlc.arg(org_id)::uuid
   AND (sqlc.arg(category) = '' OR m.category = sqlc.arg(category))
   AND (sqlc.arg(state) = '' OR m.lifecycle_state = sqlc.arg(state))
+  AND (sqlc.narg(unit_id)::uuid IS NULL OR m.org_unit_id = sqlc.narg(unit_id)::uuid)
 ORDER BY u.display_name;
 
 -- name: TransitionMembership :one
@@ -69,14 +70,36 @@ RETURNING id, user_id;
 
 -- name: PatchMembership :one
 -- Limited self/admin-editable fields; lifecycle never changes here.
-UPDATE organization_memberships SET category = COALESCE(sqlc.narg(category), category)
+UPDATE organization_memberships SET category = COALESCE(sqlc.narg(category), category),
+  org_unit_id = COALESCE(sqlc.narg(org_unit_id)::uuid, org_unit_id)
 WHERE id = sqlc.arg(id)::uuid AND organization_id = sqlc.arg(org_id)::uuid
 RETURNING id;
 
 -- name: AddSponsor :exec
 INSERT INTO member_sponsors (membership_id, sponsor_member_id, kind)
 VALUES (sqlc.arg(membership_id), sqlc.arg(sponsor_member_id), sqlc.arg(kind))
-ON CONFLICT (membership_id, sponsor_member_id) DO NOTHING;
+ON CONFLICT DO NOTHING;
+
+-- name: AddApplicationSponsor :exec
+-- Extra sponsors attached at intake (sponsor_required up to 2); they
+-- migrate onto the membership on approve.
+INSERT INTO member_sponsors (application_id, sponsor_member_id, kind)
+VALUES (sqlc.arg(application_id), sqlc.arg(sponsor_member_id), sqlc.arg(kind))
+ON CONFLICT DO NOTHING;
+
+-- name: CountApplicationSponsors :one
+-- Total sponsors across the application's primary sponsor_member_id plus
+-- any application-staged rows — the sponsor_required numerator at approve.
+SELECT (
+  SELECT count(*) FROM member_sponsors
+  WHERE application_id = sqlc.arg(application_id)::uuid AND kind = 'sponsor'
+) + (SELECT CASE WHEN sponsor_member_id IS NOT NULL THEN 1 ELSE 0 END
+     FROM membership_applications WHERE id = sqlc.arg(application_id)::uuid);
+
+-- name: MoveApplicationSponsors :exec
+UPDATE member_sponsors SET membership_id = sqlc.arg(membership_id)::uuid,
+                          application_id = NULL
+WHERE application_id = sqlc.arg(application_id)::uuid;
 
 -- name: CountSponsors :one
 SELECT count(*) FROM member_sponsors WHERE membership_id = $1 AND kind = 'sponsor';
@@ -156,17 +179,27 @@ WHERE organization_id = sqlc.arg(org_id)::uuid
          WHERE organization_id = sqlc.arg(org_id)::uuid AND user_id = sqlc.arg(user_id)::uuid))
 ORDER BY occurred_at;
 
+-- name: WithdrawApplication :one
+-- Self-service withdrawal: only the applicant's own row, and only while
+-- pre-decision. CAS source states keep a raced admin decision from
+-- being clobbered.
+UPDATE membership_applications SET status = 'withdrawn', decided_at = now()
+WHERE id = $1 AND user_id = $2 AND status IN ('applied','screened')
+RETURNING id, organization_id;
+
 -- name: GetApplicationCountForUser :one
 SELECT count(*) FROM membership_applications
 WHERE organization_id = $1 AND user_id = $2 AND status IN ('applied','screened','approved');
 
 -- name: ExistsOpenApplicationByEmail :one
 -- Import idempotency: a retried member_import worker must not mint a
--- second open application for the same org+email (Rule 27).
+-- second open application for the same applicant (Rule 27) — dedupe on
+-- email when present, phone otherwise.
 SELECT EXISTS(
   SELECT 1 FROM membership_applications
-  WHERE organization_id = $1 AND lower(email::text) = lower($2)
-    AND status IN ('applied','screened','approved')
+  WHERE organization_id = sqlc.arg(org_id)::uuid AND status IN ('applied','screened','approved')
+    AND ((sqlc.arg(email) <> '' AND lower(email::text) = lower(sqlc.arg(email)))
+      OR (sqlc.arg(email) = '' AND sqlc.arg(phone) <> '' AND phone = sqlc.arg(phone)))
 );
 
 -- name: ListUserMemberships :many
