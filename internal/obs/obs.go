@@ -30,15 +30,23 @@ func routePattern(r *http.Request) string {
 	return p
 }
 
+// probe paths — k8s/monitor hits flood logs and skew latency stats.
+func isProbe(r *http.Request) bool { return r.URL.Path == "/health" }
+
 // RequestLog emits one structured line per request. The route is the chi
 // template (/orgs/{org_id}/...) — never the raw path, so logs carry no
 // per-entity id spam.
 func RequestLog(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if isProbe(r) {
+			next.ServeHTTP(w, r)
+			return
+		}
 		start := time.Now()
 		ww := chimiddleware.NewWrapResponseWriter(w, r.ProtoMajor)
 		next.ServeHTTP(ww, r)
 		slog.Info("http_request",
+			"request_id", chimiddleware.GetReqID(r.Context()),
 			"method", r.Method,
 			"route", routePattern(r),
 			"status", ww.Status(),
@@ -85,6 +93,10 @@ func record(route string, ms float64, status int) {
 // Metrics records request latency per route template (not raw path).
 func Metrics(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if isProbe(r) {
+			next.ServeHTTP(w, r)
+			return
+		}
 		start := time.Now()
 		ww := chimiddleware.NewWrapResponseWriter(w, r.ProtoMajor)
 		next.ServeHTTP(ww, r)

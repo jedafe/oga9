@@ -99,9 +99,15 @@ func main() {
 		r.Use(sentryhttp.New(sentryhttp.Options{Repanic: true}).Handle)
 	}
 	r.Use(chimiddleware.Recoverer)
+	// resolved client IP must land in ctx BEFORE obs logging and every
+	// rate-limit bucket — otherwise the proxy's addr is what gets counted.
+	r.Use(middleware.ResolveIP(cfg.TrustedProxies))
 	// §13.05: structured access log + per-route latency reservoir.
 	r.Use(obs.Metrics)
 	r.Use(obs.RequestLog)
+	// §13.03: global read tier — bounds GET/HEAD per IP; stricter
+	// per-endpoint buckets (auth/write/upload/payment) stack on top.
+	r.Use(middleware.RateLimitReads(vk, "read", 240, time.Minute))
 
 	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
 		if err := pool.Ping(r.Context()); err != nil {
@@ -152,6 +158,7 @@ func main() {
 	wsGw := realtime.NewGateway(chatSvc, vk, cfg.BaseDomain)
 	// §15 platform control plane — provision pipeline + operator routes.
 	platSvc := platform.NewService(pool)
+	platSvc.SetStore(storage.New(cfg.UploadsDir)) // §13.06 async tenant exports
 	platSvc.SetOrgBootstrap(func(ctx context.Context, userID uuid.UUID, name, slug, templateSlug, orgType, country, city, billingEmail string, requestedTenant uuid.UUID) (uuid.UUID, error) {
 		org, err := orgSvc.CreateOrg(ctx, userID, name, slug, templateSlug, orgType, country, city, billingEmail, requestedTenant, entSvc)
 		if err != nil {
@@ -247,7 +254,6 @@ func main() {
 		log.Fatalf("schedule %s: %v", tasks.TypeSubscriptionSweep, err)
 	}
 
-	r.Use(middleware.ResolveIP(cfg.TrustedProxies))
 	r.Route("/api/v1", func(r chi.Router) {
 		r.Get("/", func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
@@ -299,6 +305,8 @@ func main() {
 			r.With(middleware.RequirePlatformNode(pool, "platform.tenants.manage")).Get("/platform/tenants", platH.Tenants)
 			r.With(middleware.RequirePlatformNode(pool, "platform.tenants.manage")).Get("/platform/tenants/{tenant_id}", platH.Tenant)
 			r.With(middleware.RequirePlatformNode(pool, "platform.tenants.manage")).Get("/platform/tenants/{tenant_id}/export", platH.ExportTenant)
+			r.With(middleware.RequirePlatformNode(pool, "platform.tenants.manage"), middleware.RateLimit(vk, "platform", 10, time.Minute)).Post("/platform/tenants/{tenant_id}/export", platH.StartTenantExport)
+			r.With(middleware.RequirePlatformNode(pool, "platform.tenants.manage")).Get("/platform/tenants/{tenant_id}/exports/{export_id}", platH.DownloadTenantExport)
 			r.With(middleware.RequirePlatformNode(pool, "platform.tenants.manage"), middleware.RateLimit(vk, "platform", 30, time.Minute)).Post("/platform/tenants", platH.CreateTenant)
 			r.With(middleware.RequirePlatformNode(pool, "platform.tenants.manage")).Post("/platform/tenants/{tenant_id}/suspend", platH.SuspendTenant)
 			r.With(middleware.RequirePlatformNode(pool, "platform.tenants.manage")).Post("/platform/tenants/{tenant_id}/reinstate", platH.ReinstateTenant)

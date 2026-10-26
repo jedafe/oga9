@@ -38,8 +38,10 @@ type Querier interface {
 	AddUsage(ctx context.Context, arg AddUsageParams) (int64, error)
 	// Re-mark correction between fined statuses (late<->absent): the open fine
 	// takes the new amount rather than keeping the stale one or duplicating
-	// against the (member,type,period) unique. partially_paid/paid rows are
-	// left alone — money already moved; that's a credit/reversal decision.
+	// against the (member,type,period) unique. A previously-waived fine is
+	// REVIVED (re-mark made it due again — the waive was for the old mark).
+	// partially_paid/paid rows are left alone — money already moved; that's a
+	// credit/reversal decision.
 	AdjustFineForPeriod(ctx context.Context, arg AdjustFineForPeriodParams) (int64, error)
 	AppointOfficer(ctx context.Context, arg AppointOfficerParams) (pgtype.UUID, error)
 	// draft → approved CAS; approved rows are immutable (no UPDATE surface).
@@ -217,6 +219,7 @@ type Querier interface {
 	// sqlc queries for tenants, organizations, memberships, units, settings,
 	// invitations, branding (Phase 03).
 	CreateTenant(ctx context.Context, arg CreateTenantParams) (pgtype.UUID, error)
+	CreateTenantExport(ctx context.Context, arg CreateTenantExportParams) (TenantExports, error)
 	CreateTenantRow(ctx context.Context, arg CreateTenantRowParams) (Tenants, error)
 	CreateTerm(ctx context.Context, arg CreateTermParams) (pgtype.UUID, error)
 	CreateUnit(ctx context.Context, arg CreateUnitParams) (pgtype.UUID, error)
@@ -268,6 +271,14 @@ type Querier interface {
 	// their account, or not at all).
 	ExistsOrgMemberByContact(ctx context.Context, arg ExistsOrgMemberByContactParams) (bool, error)
 	ExpiredOpenDrives(ctx context.Context) ([]ExpiredOpenDrivesRow, error)
+	// org-scoped parents' children: rows keyed by FK to an org-scoped table
+	// without carrying the scope column themselves (chat_messages.channel_id,
+	// minutes.activity_id, document_versions.document_id, ...). Without this
+	// pass the Rule-28 export silently drops them.
+	ExportChildFKs(ctx context.Context) ([]ExportChildFKsRow, error)
+	// preferences are user-keyed (no scope column) — join through the org's
+	// memberships so member prefs land in the export too.
+	ExportOrgNotificationPrefs(ctx context.Context, orgIds []pgtype.UUID) (string, error)
 	// every table carrying a scope column — the export stays complete as the
 	// schema grows; no per-table code to forget.
 	ExportScopedTables(ctx context.Context, columnName interface{}) ([]string, error)
@@ -363,6 +374,8 @@ type Querier interface {
 	GetSystemSetting(ctx context.Context, key string) ([]byte, error)
 	GetTemplate(ctx context.Context, slug string) ([]byte, error)
 	GetTenant(ctx context.Context, id pgtype.UUID) (GetTenantRow, error)
+	GetTenantExport(ctx context.Context, arg GetTenantExportParams) (TenantExports, error)
+	GetTenantExportByID(ctx context.Context, id pgtype.UUID) (TenantExports, error)
 	GetTenantRow(ctx context.Context, id pgtype.UUID) (Tenants, error)
 	GetTermOrg(ctx context.Context, id pgtype.UUID) (GetTermOrgRow, error)
 	GetUnit(ctx context.Context, id pgtype.UUID) (GetUnitRow, error)
@@ -510,6 +523,10 @@ type Querier interface {
 	MarkObligationsOverdue(ctx context.Context, graceDays int32) ([]MarkObligationsOverdueRow, error)
 	// daily sweep: open items past due_date flip to overdue.
 	MarkOverdueActionItems(ctx context.Context) ([]MarkOverdueActionItemsRow, error)
+	// CAS: only a live/failed row finishes — a retry after a marked failure
+	// CAN complete (the blob is valid; 'failed' just records the last error).
+	MarkTenantExportDone(ctx context.Context, arg MarkTenantExportDoneParams) (int64, error)
+	MarkTenantExportFailed(ctx context.Context, arg MarkTenantExportFailedParams) error
 	// Idempotent worker completion — a redrive sees processed_at set and skips.
 	MarkWebhookProcessed(ctx context.Context, id pgtype.UUID) (int64, error)
 	// meeting_reminder fan-out (MeetingReminderDue): unit-scoped meetings

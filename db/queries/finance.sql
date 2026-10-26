@@ -470,13 +470,16 @@ SELECT * FROM payments WHERE organization_id = $1 AND activity_id = $2
 -- name: AdjustFineForPeriod :execrows
 -- Re-mark correction between fined statuses (late<->absent): the open fine
 -- takes the new amount rather than keeping the stale one or duplicating
--- against the (member,type,period) unique. partially_paid/paid rows are
--- left alone — money already moved; that's a credit/reversal decision.
-UPDATE obligations o SET amount_minor = $4
+-- against the (member,type,period) unique. A previously-waived fine is
+-- REVIVED (re-mark made it due again — the waive was for the old mark).
+-- partially_paid/paid rows are left alone — money already moved; that's a
+-- credit/reversal decision.
+UPDATE obligations o SET amount_minor = $4,
+  status = CASE WHEN o.status='waived' THEN 'open' ELSE o.status END
 FROM contribution_types ct
 WHERE ct.id = o.contribution_type_id AND ct.key = 'fine'
   AND o.membership_id = $1 AND o.organization_id = $2
-  AND o.period_label = $3 AND o.status IN ('open','overdue');
+  AND o.period_label = $3 AND o.status IN ('open','overdue','waived');
 
 -- name: WaiveFineForPeriod :many
 -- Re-mark correction: revoke an open assessed fine for one member+period

@@ -50,3 +50,20 @@ func RateLimit(vk valkey.Client, bucket string, limit int64, window time.Duratio
 		})
 	}
 }
+
+// RateLimitReads — the global read tier (§13.03): bounds GET/HEAD traffic
+// per IP without touching the stricter per-endpoint write/auth buckets.
+// Probes (/health) are exempt.
+func RateLimitReads(vk valkey.Client, bucket string, limit int64, window time.Duration) func(http.Handler) http.Handler {
+	limited := RateLimit(vk, bucket, limit, window)
+	return func(next http.Handler) http.Handler {
+		h := limited(next)
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/health" || (r.Method != http.MethodGet && r.Method != http.MethodHead) {
+				next.ServeHTTP(w, r)
+				return
+			}
+			h.ServeHTTP(w, r)
+		})
+	}
+}

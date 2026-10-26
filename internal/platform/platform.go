@@ -6,11 +6,14 @@
 package platform
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -21,6 +24,7 @@ import (
 	"github.com/jedafe/oga9/internal/billing"
 	"github.com/jedafe/oga9/internal/db"
 	"github.com/jedafe/oga9/internal/events"
+	"github.com/jedafe/oga9/internal/storage"
 )
 
 var (
@@ -73,8 +77,12 @@ type Service struct {
 	// auth.CreateSupportSession (Rule 26: platform never writes
 	// user_sessions itself).
 	sessionFn func(ctx context.Context, supportSessionID, targetUserID uuid.UUID, ttl time.Duration, ip, ua string) (token string, sessionID uuid.UUID, err error)
-	trial     int64 // default trial days — operator may override per request
+	trial     int64          // default trial days — operator may override per request
+	store     *storage.Store // tenant_exports blob backend (§13.06 async export)
 }
+
+// SetStore wires the export blob backend (same uploads dir as documents).
+func (s *Service) SetStore(st *storage.Store) { s.store = st }
 
 func NewService(pool *pgxpool.Pool) *Service {
 	return &Service{pool: pool, q: db.New(pool), trial: 14}
@@ -539,11 +547,24 @@ func (s *Service) SetSessionMinter(fn func(ctx context.Context, supportSessionID
 // information_schema — DB-sourced but never trusted raw into SQL text.
 var validIdent = regexp.MustCompile(`^[a-z_][a-z0-9_]*$`)
 
-// ExportTenant produces the full Rule-28 data export: every org-scoped and
-// tenant-scoped table dumped to JSON, plus a credential-free user
-// projection. The export itself is audited like any sensitive platform
-// read (ADR-020: data-minimized, operator-visible in the audit trail).
+// ExportTenant is the synchronous GET path — audits, then builds the doc.
 func (s *Service) ExportTenant(ctx context.Context, tenantID, actor uuid.UUID) ([]byte, error) {
+	if err := s.auditExport(ctx, tenantID, actor); err != nil {
+		return nil, err // Rule 10: failed audit write aborts
+	}
+	return s.buildExport(ctx, tenantID)
+}
+
+func (s *Service) auditExport(ctx context.Context, tenantID, actor uuid.UUID) error {
+	return s.withTx(ctx, func(q *db.Queries) error {
+		return s.audit(ctx, q, tenantID, actor, "tenant.export", "tenant", tenantID, nil)
+	})
+}
+
+// buildExport produces the full Rule-28 data export: every org-scoped and
+// tenant-scoped table dumped to JSON, plus a credential-free user
+// projection (ADR-020 data minimization).
+func (s *Service) buildExport(ctx context.Context, tenantID uuid.UUID) ([]byte, error) {
 	if _, err := s.q.GetTenantRow(ctx, toPg(tenantID)); err != nil {
 		return nil, ErrNotFound
 	}
@@ -597,22 +618,154 @@ func (s *Service) ExportTenant(ctx context.Context, tenantID, actor uuid.UUID) (
 			tnTables[tbl] = rows
 		}
 	}
+	// children keyed by FK to an org-scoped parent (chat_messages,
+	// minutes, attendances, document_versions, ...) — they carry no scope
+	// column, so they're joined through the parent's org instead. FKs to
+	// different org parents OR together (a sponsor edge kept by either side).
+	childFKs, err := s.q.ExportChildFKs(ctx)
+	if err != nil {
+		return nil, err
+	}
+	grouped := map[string][]db.ExportChildFKsRow{}
+	for _, fk := range childFKs {
+		grouped[fk.ChildTable] = append(grouped[fk.ChildTable], fk)
+	}
+	for tbl, fks := range grouped {
+		if _, already := orgTables[tbl]; already || !validIdent.MatchString(tbl) {
+			continue
+		}
+		var conds []string
+		for _, fk := range fks {
+			if !validIdent.MatchString(fk.ChildCol) || !validIdent.MatchString(fk.ParentTable) || !validIdent.MatchString(fk.ParentCol) {
+				continue
+			}
+			conds = append(conds, fmt.Sprintf("t.%s IN (SELECT %s FROM %s WHERE organization_id = ANY($1))",
+				fk.ChildCol, `"`+fk.ParentCol+`"`, `"`+fk.ParentTable+`"`))
+		}
+		if len(conds) == 0 {
+			continue
+		}
+		var b []byte
+		if err := s.pool.QueryRow(ctx, fmt.Sprintf(
+			`SELECT COALESCE(jsonb_agg(t),'[]'::jsonb) FROM %s t WHERE %s`,
+			`"`+tbl+`"`, strings.Join(conds, " OR ")), orgArr).Scan(&b); err != nil {
+			return nil, fmt.Errorf("export %s: %w", tbl, err)
+		}
+		orgTables[tbl] = b
+	}
 	users, err := s.q.ExportTenantUsers(ctx, toPg(tenantID))
 	if err != nil {
 		return nil, err
 	}
-	// audit the export — a full-data read is as sensitive as impersonation.
-	if err := s.withTx(ctx, func(q *db.Queries) error {
-		return s.audit(ctx, q, tenantID, actor, "tenant.export", "tenant", tenantID,
-			map[string]any{"org_count": len(orgIDs)})
-	}); err != nil {
-		return nil, err // Rule 10: failed audit write aborts
+	prefs, err := s.q.ExportOrgNotificationPrefs(ctx, orgArr)
+	if err != nil {
+		return nil, err
+	}
+	tnRow, err := s.q.ExportTenantRow(ctx, toPg(tenantID))
+	if err != nil {
+		return nil, err
 	}
 	return json.Marshal(map[string]any{
-		"tenant_id":     tenantID,
-		"exported_at":   time.Now().UTC(),
-		"tenant_tables": tnTables,
-		"org_tables":    orgTables,
-		"users":         json.RawMessage(users),
+		"tenant_id":                tenantID,
+		"exported_at":              time.Now().UTC(),
+		"tenant":                   json.RawMessage(tnRow),
+		"tenant_tables":            tnTables,
+		"org_tables":               orgTables,
+		"users":                    json.RawMessage(users),
+		"notification_preferences": json.RawMessage(prefs),
 	})
+}
+
+// ---------- async tenant export (tenant:export worker — §13.06) ----------
+
+// RequestTenantExport audits + creates the durable row; the handler
+// enqueues tenant:export {export_id} (Rule 8 — the request never blocks
+// on the dump).
+func (s *Service) RequestTenantExport(ctx context.Context, tenantID, actor uuid.UUID) (uuid.UUID, error) {
+	if _, err := s.q.GetTenantRow(ctx, toPg(tenantID)); err != nil {
+		return uuid.Nil, ErrNotFound
+	}
+	var id uuid.UUID
+	err := s.withTx(ctx, func(q *db.Queries) error {
+		// audit-first (Rule 10) — the row + audit commit together.
+		if err := s.audit(ctx, q, tenantID, actor, "tenant.export", "tenant", tenantID,
+			map[string]any{"mode": "async"}); err != nil {
+			return err
+		}
+		row, err := q.CreateTenantExport(ctx, db.CreateTenantExportParams{
+			TenantID: toPg(tenantID), RequestedBy: toPg(actor)})
+		if err != nil {
+			return err
+		}
+		id = fromPg(row.ID)
+		return nil
+	})
+	return id, err
+}
+
+// RunTenantExport is the tenant:export worker body: build → store blob →
+// mark done. Idempotent (Rule 27): a retry re-builds and the done CAS
+// no-ops; a failure marks the row failed with the error.
+func (s *Service) RunTenantExport(ctx context.Context, exportID uuid.UUID) error {
+	e, err := s.q.GetTenantExportByID(ctx, toPg(exportID))
+	if err != nil {
+		return nil // row gone
+	}
+	if e.Status == "done" {
+		return nil // replay after success
+	}
+	if s.store == nil {
+		return errors.New("export store not wired")
+	}
+	fail := func(err error) error {
+		_ = s.q.MarkTenantExportFailed(ctx, db.MarkTenantExportFailedParams{
+			ID: e.ID, Error: pgText(err.Error())})
+		return err
+	}
+	data, err := s.buildExport(ctx, fromPg(e.TenantID))
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			_ = fail(err)
+			return nil // tenant gone — permanent, not worth retrying
+		}
+		return fail(err)
+	}
+	key := "tenant-export/" + exportID.String() + ".json"
+	if err := s.store.Put(ctx, key, bytes.NewReader(data)); err != nil {
+		return fail(err)
+	}
+	n, err := s.q.MarkTenantExportDone(ctx, db.MarkTenantExportDoneParams{
+		ID: e.ID, StorageKey: pgText(key)})
+	if err != nil {
+		return err
+	}
+	if n == 0 && e.Status == "processing" {
+		return errors.New("export row lost processing claim") // raced — retry
+	}
+	return nil
+}
+
+// DownloadTenantExport streams a finished export blob. Returns
+// (reader, status, error): status lets the handler 202 a still-running job.
+func (s *Service) DownloadTenantExport(ctx context.Context, tenantID, exportID uuid.UUID) (io.ReadCloser, string, error) {
+	e, err := s.q.GetTenantExport(ctx, db.GetTenantExportParams{ID: toPg(exportID), TenantID: toPg(tenantID)})
+	if err != nil {
+		return nil, "", ErrNotFound
+	}
+	// self-heal: a row stuck 'processing' past the worker lease means the
+	// enqueue failed after commit — mark it failed so the client sees a
+	// terminal state, not an eternal 202.
+	if e.Status == "processing" && time.Since(e.CreatedAt.Time) > 15*time.Minute {
+		_ = s.q.MarkTenantExportFailed(ctx, db.MarkTenantExportFailedParams{
+			ID: e.ID, Error: pgText("export never completed — worker never ran")})
+		return nil, "failed", nil
+	}
+	if e.Status != "done" {
+		return nil, e.Status, nil
+	}
+	r, err := s.store.Open(ctx, e.StorageKey.String)
+	if err != nil {
+		return nil, "", err
+	}
+	return r, e.Status, nil
 }

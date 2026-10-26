@@ -185,9 +185,8 @@ func (h *FinanceHandler) UpdateSchedule(w http.ResponseWriter, r *http.Request) 
 
 func (h *FinanceHandler) Obligations(w http.ResponseWriter, r *http.Request) {
 	oc := middleware.OrgCtx(r.Context())
-	mid, err := uuid.Parse(r.URL.Query().Get("member"))
-	if err != nil {
-		httpx.WriteErr(w, 400, "invalid_id", "malformed identifier")
+	mid, ok := httpx.OptUUID(w, r.URL.Query().Get("member"))
+	if !ok {
 		return
 	}
 	list, err := h.svc.ListObligations(r.Context(), oc, mid,
@@ -564,14 +563,12 @@ func (h *FinanceHandler) ObligationsStatus(w http.ResponseWriter, r *http.Reques
 	if !h.statementGate(w, r, oc) {
 		return
 	}
-	sid, err := uuid.Parse(r.URL.Query().Get("schedule"))
-	if err != nil {
-		httpx.WriteErr(w, 400, "invalid_id", "malformed identifier")
+	sid, ok := httpx.OptUUID(w, r.URL.Query().Get("schedule"))
+	if !ok {
 		return
 	}
-	tid, err := uuid.Parse(r.URL.Query().Get("type"))
-	if err != nil {
-		httpx.WriteErr(w, 400, "invalid_id", "malformed identifier")
+	tid, ok := httpx.OptUUID(w, r.URL.Query().Get("type"))
+	if !ok {
 		return
 	}
 	list, err := h.svc.ObligationsStatus(r.Context(), oc, sid,

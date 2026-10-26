@@ -9,7 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"sync"
 
 	"github.com/google/uuid"
@@ -45,6 +45,7 @@ const (
 	TypeSubscriptionSweep = "billing:subscription_state_sweep"
 	TypeLicenseReminder   = "license:renewal_reminder"
 	TypeTenantProvision   = "tenant:provision"
+	TypeTenantExport      = "tenant:export"
 	TypeSchedulerTick     = "scheduler:tick"
 	TypeMemberImport      = "membership:import"
 	TypeMemberExport      = "membership:export"
@@ -172,7 +173,7 @@ func dailyGate(vk valkey.Client, name string, fn func(context.Context) error) fu
 		claimed, err := vk.Do(ctx, vk.B().Set().Key("oga9:sweep:daily:"+name).
 			Value("1").Nx().ExSeconds(86400).Build()).AsBool()
 		if err != nil {
-			log.Printf("sweep gate %s: %v", name, err)
+			slog.Warn("sweep_gate", "name", name, "err", err)
 			return fn(ctx) // gate unreadable — run anyway, never stall the sweep
 		}
 		if !claimed {
@@ -327,6 +328,7 @@ func Handlers(d Deps) map[string]asynq.HandlerFunc {
 		// gateways land (ADR-012 deferred surface).
 		TypeLicenseReminder:         stub(TypeLicenseReminder, "Phase 14"),
 		TypeTenantProvision:         tenantProvision(d.Platform),
+		TypeTenantExport:            tenantExport(d.Platform),
 		TypePaymentsProviderWebhook: stub(TypePaymentsProviderWebhook, "payment gateways (ADR-012)"),
 	}
 }
@@ -415,7 +417,7 @@ func sendMail(m *mailer.Mailer) asynq.HandlerFunc {
 			return err
 		}
 		if err := m.Send(p.To, p.Subject, p.Body); err != nil {
-			log.Printf("mail task %s failed: %v", t.Type(), err)
+			slog.Warn("mail_task_failed", "type", t.Type(), "err", err)
 			return err // asynq retries
 		}
 		return nil
@@ -444,7 +446,7 @@ func retryDead(pool *pgxpool.Pool) asynq.HandlerFunc {
 			return err
 		}
 		if n > 0 {
-			log.Printf("events:retry_dead re-drove %d dead-lettered event(s)", n)
+			slog.Info("events_retry_dead", "redrove", n)
 		}
 		return nil
 	}
@@ -538,12 +540,11 @@ func schedulerTick(redisAddr string, pool *pgxpool.Pool) asynq.HandlerFunc {
 				continue
 			}
 			if qi.Pending+qi.Retry+qi.Archived > 0 {
-				log.Printf("queue %s: pending=%d active=%d retry=%d archived=%d",
-					name, qi.Pending, qi.Active, qi.Retry, qi.Archived)
+				slog.Info("queue_depth", "queue", name, "pending", qi.Pending, "active", qi.Active, "retry", qi.Retry, "archived", qi.Archived)
 			}
 		}
 		if dead, err := q.CountDeadEvents(ctx, events.MaxAttempts); err == nil && dead > 0 {
-			log.Printf("events DLQ depth: %d", dead)
+			slog.Warn("events_dlq", "dead", dead)
 		}
 		// Sweeps run concurrently — a slow one can't stall the tick or the
 		// others; a panic is contained to its own sweep.
@@ -554,11 +555,11 @@ func schedulerTick(redisAddr string, pool *pgxpool.Pool) asynq.HandlerFunc {
 				defer wg.Done()
 				defer func() {
 					if r := recover(); r != nil {
-						log.Printf("scheduler tick sweep panic: %v", r)
+						slog.Error("tick_sweep_panic", "err", r)
 					}
 				}()
 				if err := sw(ctx); err != nil {
-					log.Printf("scheduler tick sweep failed: %v", err)
+					slog.Warn("tick_sweep_failed", "err", err)
 				}
 			}(sweep)
 		}
@@ -666,7 +667,7 @@ func notifEmail(m *mailer.Mailer, pool *pgxpool.Pool) asynq.HandlerFunc {
 			return err
 		}
 		if err := m.Send(p.To, p.Subject, p.Body); err != nil {
-			log.Printf("mail task %s failed: %v", t.Type(), err)
+			slog.Warn("mail_task_failed", "type", t.Type(), "err", err)
 			return err // asynq retries — delivered_at stays unset until success
 		}
 		if id, err := uuid.Parse(p.NotificationID); err == nil {
@@ -729,7 +730,7 @@ func presenceScan(vk valkey.Client) func(context.Context) error {
 			cur = res.Cursor
 		}
 		if n > 0 {
-			log.Printf("chat:presence_sweep: %d live presence keys", n)
+			slog.Info("presence_sweep", "live_keys", n)
 		}
 		return nil
 	}
@@ -780,5 +781,36 @@ func tenantProvision(svc *platform.Service) asynq.HandlerFunc {
 		}
 		_, _, _, err := svc.Provision(ctx, in, in.RequestedBy)
 		return err
+	}
+}
+
+// NewTenantExportTask — tenant:export {export_id}: durable-row-driven
+// (the row is the idempotency record; retries re-run build+store).
+func NewTenantExportTask(exportID uuid.UUID) (*asynq.Task, error) {
+	b, err := json.Marshal(map[string]string{"export_id": exportID.String()})
+	if err != nil {
+		return nil, err
+	}
+	return asynq.NewTask(TypeTenantExport, b, asynq.Queue("default"), asynq.MaxRetry(3)), nil
+}
+
+// tenantExport — §13.06: builds the export JSON, stores the blob, marks
+// the tenant_exports row done.
+func tenantExport(svc *platform.Service) asynq.HandlerFunc {
+	return func(ctx context.Context, t *asynq.Task) error {
+		var p struct {
+			ExportID string `json:"export_id"`
+		}
+		if err := json.Unmarshal(t.Payload(), &p); err != nil {
+			return fmt.Errorf("tenant:export payload: %w", err)
+		}
+		if svc == nil {
+			return fmt.Errorf("platform service not wired")
+		}
+		id, err := uuid.Parse(p.ExportID)
+		if err != nil {
+			return nil // malformed id — retrying won't help
+		}
+		return svc.RunTenantExport(ctx, id)
 	}
 }

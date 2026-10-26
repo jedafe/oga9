@@ -204,3 +204,51 @@ SELECT COALESCE(jsonb_agg(j), '[]'::jsonb)::text FROM (
 -- the tenant row itself + its non-secret control-plane rows come through
 -- the tenant-scoped dump; this header anchors the export document.
 SELECT to_jsonb(t)::text FROM tenants t WHERE t.id = $1;
+
+-- name: ExportChildFKs :many
+-- org-scoped parents' children: rows keyed by FK to an org-scoped table
+-- without carrying the scope column themselves (chat_messages.channel_id,
+-- minutes.activity_id, document_versions.document_id, ...). Without this
+-- pass the Rule-28 export silently drops them.
+SELECT DISTINCT
+  kcu.table_name::text  AS child_table,
+  kcu.column_name::text AS child_col,
+  ccu.table_name::text  AS parent_table,
+  ccu.column_name::text AS parent_col
+FROM information_schema.table_constraints tc
+JOIN information_schema.key_column_usage kcu
+  ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema
+JOIN information_schema.constraint_column_usage ccu
+  ON tc.constraint_name = ccu.constraint_name AND tc.table_schema = ccu.table_schema
+WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_schema = 'public'
+  AND ccu.table_name IN (
+    SELECT table_name FROM information_schema.columns
+    WHERE table_schema = 'public' AND column_name = 'organization_id')
+ORDER BY 1;
+
+-- name: ExportOrgNotificationPrefs :one
+-- preferences are user-keyed (no scope column) — join through the org's
+-- memberships so member prefs land in the export too.
+SELECT COALESCE(jsonb_agg(t),'[]'::jsonb)::text FROM notification_preferences t
+WHERE t.user_id IN (
+  SELECT m.user_id FROM organization_memberships m
+  WHERE m.organization_id = ANY(sqlc.arg(org_ids)::uuid[]));
+
+-- name: CreateTenantExport :one
+INSERT INTO tenant_exports (tenant_id, requested_by) VALUES ($1,$2) RETURNING *;
+
+-- name: GetTenantExport :one
+SELECT * FROM tenant_exports WHERE id = $1 AND tenant_id = $2;
+
+-- name: MarkTenantExportDone :execrows
+-- CAS: only a live/failed row finishes — a retry after a marked failure
+-- CAN complete (the blob is valid; 'failed' just records the last error).
+UPDATE tenant_exports SET status='done', storage_key=$2, error=NULL, completed_at=now()
+WHERE id=$1 AND status IN ('processing','failed');
+
+-- name: MarkTenantExportFailed :exec
+UPDATE tenant_exports SET status='failed', error=$2, completed_at=now()
+WHERE id=$1 AND status='processing';
+
+-- name: GetTenantExportByID :one
+SELECT * FROM tenant_exports WHERE id = $1;

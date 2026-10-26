@@ -152,6 +152,31 @@ func (q *Queries) CreateSupportSession(ctx context.Context, arg CreateSupportSes
 	return i, err
 }
 
+const createTenantExport = `-- name: CreateTenantExport :one
+INSERT INTO tenant_exports (tenant_id, requested_by) VALUES ($1,$2) RETURNING id, tenant_id, requested_by, storage_key, error, status, created_at, completed_at
+`
+
+type CreateTenantExportParams struct {
+	TenantID    pgtype.UUID `json:"tenant_id"`
+	RequestedBy pgtype.UUID `json:"requested_by"`
+}
+
+func (q *Queries) CreateTenantExport(ctx context.Context, arg CreateTenantExportParams) (TenantExports, error) {
+	row := q.db.QueryRow(ctx, createTenantExport, arg.TenantID, arg.RequestedBy)
+	var i TenantExports
+	err := row.Scan(
+		&i.ID,
+		&i.TenantID,
+		&i.RequestedBy,
+		&i.StorageKey,
+		&i.Error,
+		&i.Status,
+		&i.CreatedAt,
+		&i.CompletedAt,
+	)
+	return i, err
+}
+
 const createTenantRow = `-- name: CreateTenantRow :one
 INSERT INTO tenants (name, slug, billing_email, edition, status)
 VALUES ($1, $2, $3,
@@ -197,6 +222,76 @@ func (q *Queries) EndSupportSession(ctx context.Context, id pgtype.UUID) (int64,
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const exportChildFKs = `-- name: ExportChildFKs :many
+SELECT DISTINCT
+  kcu.table_name::text  AS child_table,
+  kcu.column_name::text AS child_col,
+  ccu.table_name::text  AS parent_table,
+  ccu.column_name::text AS parent_col
+FROM information_schema.table_constraints tc
+JOIN information_schema.key_column_usage kcu
+  ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema
+JOIN information_schema.constraint_column_usage ccu
+  ON tc.constraint_name = ccu.constraint_name AND tc.table_schema = ccu.table_schema
+WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_schema = 'public'
+  AND ccu.table_name IN (
+    SELECT table_name FROM information_schema.columns
+    WHERE table_schema = 'public' AND column_name = 'organization_id')
+ORDER BY 1
+`
+
+type ExportChildFKsRow struct {
+	ChildTable  string `json:"child_table"`
+	ChildCol    string `json:"child_col"`
+	ParentTable string `json:"parent_table"`
+	ParentCol   string `json:"parent_col"`
+}
+
+// org-scoped parents' children: rows keyed by FK to an org-scoped table
+// without carrying the scope column themselves (chat_messages.channel_id,
+// minutes.activity_id, document_versions.document_id, ...). Without this
+// pass the Rule-28 export silently drops them.
+func (q *Queries) ExportChildFKs(ctx context.Context) ([]ExportChildFKsRow, error) {
+	rows, err := q.db.Query(ctx, exportChildFKs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ExportChildFKsRow
+	for rows.Next() {
+		var i ExportChildFKsRow
+		if err := rows.Scan(
+			&i.ChildTable,
+			&i.ChildCol,
+			&i.ParentTable,
+			&i.ParentCol,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const exportOrgNotificationPrefs = `-- name: ExportOrgNotificationPrefs :one
+SELECT COALESCE(jsonb_agg(t),'[]'::jsonb)::text FROM notification_preferences t
+WHERE t.user_id IN (
+  SELECT m.user_id FROM organization_memberships m
+  WHERE m.organization_id = ANY($1::uuid[]))
+`
+
+// preferences are user-keyed (no scope column) — join through the org's
+// memberships so member prefs land in the export too.
+func (q *Queries) ExportOrgNotificationPrefs(ctx context.Context, orgIds []pgtype.UUID) (string, error) {
+	row := q.db.QueryRow(ctx, exportOrgNotificationPrefs, orgIds)
+	var column_1 string
+	err := row.Scan(&column_1)
+	return column_1, err
 }
 
 const exportScopedTables = `-- name: ExportScopedTables :many
@@ -355,6 +450,51 @@ func (q *Queries) GetSupportSession(ctx context.Context, id pgtype.UUID) (Suppor
 		&i.ExpiresAt,
 		&i.EndedAt,
 		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const getTenantExport = `-- name: GetTenantExport :one
+SELECT id, tenant_id, requested_by, storage_key, error, status, created_at, completed_at FROM tenant_exports WHERE id = $1 AND tenant_id = $2
+`
+
+type GetTenantExportParams struct {
+	ID       pgtype.UUID `json:"id"`
+	TenantID pgtype.UUID `json:"tenant_id"`
+}
+
+func (q *Queries) GetTenantExport(ctx context.Context, arg GetTenantExportParams) (TenantExports, error) {
+	row := q.db.QueryRow(ctx, getTenantExport, arg.ID, arg.TenantID)
+	var i TenantExports
+	err := row.Scan(
+		&i.ID,
+		&i.TenantID,
+		&i.RequestedBy,
+		&i.StorageKey,
+		&i.Error,
+		&i.Status,
+		&i.CreatedAt,
+		&i.CompletedAt,
+	)
+	return i, err
+}
+
+const getTenantExportByID = `-- name: GetTenantExportByID :one
+SELECT id, tenant_id, requested_by, storage_key, error, status, created_at, completed_at FROM tenant_exports WHERE id = $1
+`
+
+func (q *Queries) GetTenantExportByID(ctx context.Context, id pgtype.UUID) (TenantExports, error) {
+	row := q.db.QueryRow(ctx, getTenantExportByID, id)
+	var i TenantExports
+	err := row.Scan(
+		&i.ID,
+		&i.TenantID,
+		&i.RequestedBy,
+		&i.StorageKey,
+		&i.Error,
+		&i.Status,
+		&i.CreatedAt,
+		&i.CompletedAt,
 	)
 	return i, err
 }
@@ -693,6 +833,41 @@ func (q *Queries) LiveSupportSessionsForUser(ctx context.Context, targetUserID p
 		return nil, err
 	}
 	return items, nil
+}
+
+const markTenantExportDone = `-- name: MarkTenantExportDone :execrows
+UPDATE tenant_exports SET status='done', storage_key=$2, error=NULL, completed_at=now()
+WHERE id=$1 AND status IN ('processing','failed')
+`
+
+type MarkTenantExportDoneParams struct {
+	ID         pgtype.UUID `json:"id"`
+	StorageKey pgtype.Text `json:"storage_key"`
+}
+
+// CAS: only a live/failed row finishes — a retry after a marked failure
+// CAN complete (the blob is valid; 'failed' just records the last error).
+func (q *Queries) MarkTenantExportDone(ctx context.Context, arg MarkTenantExportDoneParams) (int64, error) {
+	result, err := q.db.Exec(ctx, markTenantExportDone, arg.ID, arg.StorageKey)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const markTenantExportFailed = `-- name: MarkTenantExportFailed :exec
+UPDATE tenant_exports SET status='failed', error=$2, completed_at=now()
+WHERE id=$1 AND status='processing'
+`
+
+type MarkTenantExportFailedParams struct {
+	ID    pgtype.UUID `json:"id"`
+	Error pgtype.Text `json:"error"`
+}
+
+func (q *Queries) MarkTenantExportFailed(ctx context.Context, arg MarkTenantExportFailedParams) error {
+	_, err := q.db.Exec(ctx, markTenantExportFailed, arg.ID, arg.Error)
+	return err
 }
 
 const overrideSubscription = `-- name: OverrideSubscription :execrows

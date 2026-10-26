@@ -70,8 +70,11 @@ jobs:
       OGA9_BACKUP_DIR: /tmp/oga9-backups
     steps:
       - uses: actions/checkout@v4
-      - name: install pg client
-        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+      - name: install pg client (PGDG 18 — must match the pg18 service image)
+        run: |
+          sudo sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/postgres.gpg
+          sudo apt-get update && sudo apt-get install -y postgresql-client-18
       - name: apply migrations
         run: |
           for f in db/migrations/*.up.sql; do

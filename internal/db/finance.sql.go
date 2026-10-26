@@ -106,11 +106,12 @@ func (q *Queries) ActivityDonations(ctx context.Context, arg ActivityDonationsPa
 }
 
 const adjustFineForPeriod = `-- name: AdjustFineForPeriod :execrows
-UPDATE obligations o SET amount_minor = $4
+UPDATE obligations o SET amount_minor = $4,
+  status = CASE WHEN o.status='waived' THEN 'open' ELSE o.status END
 FROM contribution_types ct
 WHERE ct.id = o.contribution_type_id AND ct.key = 'fine'
   AND o.membership_id = $1 AND o.organization_id = $2
-  AND o.period_label = $3 AND o.status IN ('open','overdue')
+  AND o.period_label = $3 AND o.status IN ('open','overdue','waived')
 `
 
 type AdjustFineForPeriodParams struct {
@@ -122,8 +123,10 @@ type AdjustFineForPeriodParams struct {
 
 // Re-mark correction between fined statuses (late<->absent): the open fine
 // takes the new amount rather than keeping the stale one or duplicating
-// against the (member,type,period) unique. partially_paid/paid rows are
-// left alone — money already moved; that's a credit/reversal decision.
+// against the (member,type,period) unique. A previously-waived fine is
+// REVIVED (re-mark made it due again — the waive was for the old mark).
+// partially_paid/paid rows are left alone — money already moved; that's a
+// credit/reversal decision.
 func (q *Queries) AdjustFineForPeriod(ctx context.Context, arg AdjustFineForPeriodParams) (int64, error) {
 	result, err := q.db.Exec(ctx, adjustFineForPeriod,
 		arg.MembershipID,

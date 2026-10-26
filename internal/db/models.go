@@ -740,6 +740,17 @@ type SystemSettings struct {
 	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
 }
 
+type TenantExports struct {
+	ID          pgtype.UUID        `json:"id"`
+	TenantID    pgtype.UUID        `json:"tenant_id"`
+	RequestedBy pgtype.UUID        `json:"requested_by"`
+	StorageKey  pgtype.Text        `json:"storage_key"`
+	Error       pgtype.Text        `json:"error"`
+	Status      string             `json:"status"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+	CompletedAt pgtype.Timestamptz `json:"completed_at"`
+}
+
 type TenantProvisions struct {
 	ID                  pgtype.UUID        `json:"id"`
 	RequestID           string             `json:"request_id"`

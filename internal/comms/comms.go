@@ -487,8 +487,10 @@ func (s *Service) EventNotifyConsumer(ctx context.Context, q *db.Queries, e even
 		}
 		body := fmt.Sprintf("%s starts %s", a.Title, a.StartsAt.Time.Format("2006-01-02 15:04"))
 		for _, uid := range users {
+			// ref = event id: a rescheduled meeting re-arms the reminder and
+			// its new event must notify again (activity-ref would suppress it).
 			if err := s.notifyOnce(ctx, q, e, fromPg(uid), "meeting_reminder",
-				"Meeting reminder", body, "activity", a.ID); err != nil {
+				"Meeting reminder", body, "activity", toPg(e.ID)); err != nil {
 				return err
 			}
 		}

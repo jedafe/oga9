@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"time"
@@ -201,9 +202,8 @@ func (h *PlatformHandler) UpsertPlan(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *PlatformHandler) Deployments(w http.ResponseWriter, r *http.Request) {
-	tid, err := uuid.Parse(r.URL.Query().Get("tenant_id"))
-	if err != nil {
-		httpx.WriteErr(w, 400, "invalid_id", "malformed identifier")
+	tid, ok := httpx.OptUUID(w, r.URL.Query().Get("tenant_id"))
+	if !ok {
 		return
 	}
 	list, err := h.svc.ListDeployments(r.Context(), tid)
@@ -286,10 +286,66 @@ func (h *PlatformHandler) ExportTenant(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(data)
 }
 
-func (h *PlatformHandler) Audit(w http.ResponseWriter, r *http.Request) {
-	tid, err := uuid.Parse(r.URL.Query().Get("tenant_id"))
+// StartTenantExport — POST /platform/tenants/{tid}/export: audits,
+// creates the durable tenant_exports row, enqueues tenant:export (Rule 8).
+func (h *PlatformHandler) StartTenantExport(w http.ResponseWriter, r *http.Request) {
+	tid, err := uuid.Parse(chi.URLParam(r, "tenant_id"))
 	if err != nil {
 		httpx.WriteErr(w, 400, "invalid_id", "malformed identifier")
+		return
+	}
+	eid, err := h.svc.RequestTenantExport(r.Context(), tid, middleware.UserID(r.Context()))
+	if err != nil {
+		platErr(w, err)
+		return
+	}
+	t, err := tasks.NewTenantExportTask(eid)
+	if err != nil {
+		platErr(w, err)
+		return
+	}
+	if _, err := h.queue.EnqueueContext(r.Context(), t); err != nil {
+		platErr(w, err)
+		return
+	}
+	httpx.WriteData(w, 202, map[string]any{"export_id": eid, "status": "processing"})
+}
+
+// DownloadTenantExport — GET /platform/tenants/{tid}/exports/{eid}:
+// streams the finished blob; 202 while the worker is still building.
+func (h *PlatformHandler) DownloadTenantExport(w http.ResponseWriter, r *http.Request) {
+	tid, err := uuid.Parse(chi.URLParam(r, "tenant_id"))
+	if err != nil {
+		httpx.WriteErr(w, 400, "invalid_id", "malformed identifier")
+		return
+	}
+	eid, err := uuid.Parse(chi.URLParam(r, "export_id"))
+	if err != nil {
+		httpx.WriteErr(w, 400, "invalid_id", "malformed identifier")
+		return
+	}
+	blob, status, err := h.svc.DownloadTenantExport(r.Context(), tid, eid)
+	if err != nil {
+		platErr(w, err)
+		return
+	}
+	if status == "failed" {
+		httpx.WriteErr(w, 409, "export_failed", "export failed — request a new one")
+		return
+	}
+	if status != "done" {
+		httpx.WriteData(w, 202, map[string]any{"export_id": eid, "status": status})
+		return
+	}
+	defer blob.Close()
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=oga9-tenant-%s.json", tid))
+	_, _ = io.Copy(w, blob)
+}
+
+func (h *PlatformHandler) Audit(w http.ResponseWriter, r *http.Request) {
+	tid, ok := httpx.OptUUID(w, r.URL.Query().Get("tenant_id"))
+	if !ok {
 		return
 	}
 	list, err := h.svc.AuditEvents(r.Context(), tid, r.URL.Query().Get("action"))
@@ -301,9 +357,8 @@ func (h *PlatformHandler) Audit(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *PlatformHandler) Usage(w http.ResponseWriter, r *http.Request) {
-	tid, err := uuid.Parse(r.URL.Query().Get("tenant_id"))
-	if err != nil {
-		httpx.WriteErr(w, 400, "invalid_id", "malformed identifier")
+	tid, ok := httpx.OptUUID(w, r.URL.Query().Get("tenant_id"))
+	if !ok {
 		return
 	}
 	list, err := h.svc.Usage(r.Context(), tid)

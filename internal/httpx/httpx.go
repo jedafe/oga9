@@ -6,6 +6,8 @@ package httpx
 import (
 	"encoding/json"
 	"net/http"
+
+	"github.com/google/uuid"
 )
 
 func WriteData(w http.ResponseWriter, status int, data any) {
@@ -31,4 +33,19 @@ func WriteErrDetails(w http.ResponseWriter, status int, code, msg string, detail
 // Decode reads a JSON body with a 1 MiB cap — enough for any current route.
 func Decode(w http.ResponseWriter, r *http.Request, v any) error {
 	return json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(v)
+}
+
+// OptUUID parses an OPTIONAL uuid query/form value: empty means "no
+// filter" (Nil), malformed non-empty is a 400. Path params should use a
+// plain uuid.Parse + error check instead (chi always supplies a value).
+func OptUUID(w http.ResponseWriter, raw string) (uuid.UUID, bool) {
+	if raw == "" {
+		return uuid.Nil, true
+	}
+	id, err := uuid.Parse(raw)
+	if err != nil {
+		WriteErr(w, 400, "invalid_id", "malformed identifier")
+		return uuid.Nil, false
+	}
+	return id, true
 }

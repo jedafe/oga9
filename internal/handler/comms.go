@@ -182,9 +182,8 @@ func (h *CommsHandler) UploadDocument(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer f.Close()
-	uid, err := uuid.Parse(r.FormValue("unit_id"))
-	if err != nil {
-		httpx.WriteErr(w, 400, "invalid_id", "malformed identifier")
+	uid, ok := httpx.OptUUID(w, r.FormValue("unit_id"))
+	if !ok {
 		return
 	}
 	id, err := h.svc.Upload(r.Context(), oc, r.FormValue("kind"),
