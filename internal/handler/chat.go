@@ -77,7 +77,11 @@ func (h *ChatHandler) CreateChannel(w http.ResponseWriter, r *http.Request) {
 
 func (h *ChatHandler) Messages(w http.ResponseWriter, r *http.Request) {
 	oc := middleware.OrgCtx(r.Context())
-	cid, _ := uuid.Parse(chi.URLParam(r, "channel_id"))
+	cid, err := uuid.Parse(chi.URLParam(r, "channel_id"))
+	if err != nil {
+		httpx.WriteErr(w, 400, "invalid_id", "malformed identifier")
+		return
+	}
 	var before *time.Time
 	if b := r.URL.Query().Get("before"); b != "" {
 		if t, err := time.Parse(time.RFC3339Nano, b); err == nil {
@@ -94,7 +98,11 @@ func (h *ChatHandler) Messages(w http.ResponseWriter, r *http.Request) {
 
 func (h *ChatHandler) PostMessage(w http.ResponseWriter, r *http.Request) {
 	oc := middleware.OrgCtx(r.Context())
-	cid, _ := uuid.Parse(chi.URLParam(r, "channel_id"))
+	cid, err := uuid.Parse(chi.URLParam(r, "channel_id"))
+	if err != nil {
+		httpx.WriteErr(w, 400, "invalid_id", "malformed identifier")
+		return
+	}
 	var req struct {
 		Kind       string    `json:"kind"`
 		Body       string    `json:"body"`
@@ -117,8 +125,16 @@ func (h *ChatHandler) PostMessage(w http.ResponseWriter, r *http.Request) {
 // Delete — own message always; `org.chat.moderate` allows others.
 func (h *ChatHandler) DeleteMessage(w http.ResponseWriter, r *http.Request) {
 	oc := middleware.OrgCtx(r.Context())
-	cid, _ := uuid.Parse(chi.URLParam(r, "channel_id"))
-	mid, _ := uuid.Parse(chi.URLParam(r, "message_id"))
+	cid, err := uuid.Parse(chi.URLParam(r, "channel_id"))
+	if err != nil {
+		httpx.WriteErr(w, 400, "invalid_id", "malformed identifier")
+		return
+	}
+	mid, err := uuid.Parse(chi.URLParam(r, "message_id"))
+	if err != nil {
+		httpx.WriteErr(w, 400, "invalid_id", "malformed identifier")
+		return
+	}
 	mod := h.orgSvc.HasPermission(r.Context(), oc.UserID, oc.OrgID, "org.chat.moderate")
 	if err := h.svc.Delete(r.Context(), oc, cid, mid, mod); err != nil {
 		chatErr(w, err)
@@ -130,8 +146,16 @@ func (h *ChatHandler) DeleteMessage(w http.ResponseWriter, r *http.Request) {
 // EditMessage — PATCH body edit within the org's edit window; own only.
 func (h *ChatHandler) EditMessage(w http.ResponseWriter, r *http.Request) {
 	oc := middleware.OrgCtx(r.Context())
-	cid, _ := uuid.Parse(chi.URLParam(r, "channel_id"))
-	mid, _ := uuid.Parse(chi.URLParam(r, "message_id"))
+	cid, err := uuid.Parse(chi.URLParam(r, "channel_id"))
+	if err != nil {
+		httpx.WriteErr(w, 400, "invalid_id", "malformed identifier")
+		return
+	}
+	mid, err := uuid.Parse(chi.URLParam(r, "message_id"))
+	if err != nil {
+		httpx.WriteErr(w, 400, "invalid_id", "malformed identifier")
+		return
+	}
 	var req struct {
 		Body string `json:"body"`
 	}
@@ -148,7 +172,11 @@ func (h *ChatHandler) EditMessage(w http.ResponseWriter, r *http.Request) {
 
 func (h *ChatHandler) MarkRead(w http.ResponseWriter, r *http.Request) {
 	oc := middleware.OrgCtx(r.Context())
-	cid, _ := uuid.Parse(chi.URLParam(r, "channel_id"))
+	cid, err := uuid.Parse(chi.URLParam(r, "channel_id"))
+	if err != nil {
+		httpx.WriteErr(w, 400, "invalid_id", "malformed identifier")
+		return
+	}
 	var req struct {
 		MessageID uuid.UUID `json:"message_id"`
 	}
@@ -164,7 +192,11 @@ func (h *ChatHandler) MarkRead(w http.ResponseWriter, r *http.Request) {
 // member on a custom/dm/committee channel; derived kinds refuse.
 func (h *ChatHandler) AddMember(w http.ResponseWriter, r *http.Request) {
 	oc := middleware.OrgCtx(r.Context())
-	cid, _ := uuid.Parse(chi.URLParam(r, "channel_id"))
+	cid, err := uuid.Parse(chi.URLParam(r, "channel_id"))
+	if err != nil {
+		httpx.WriteErr(w, 400, "invalid_id", "malformed identifier")
+		return
+	}
 	var req struct {
 		MembershipID uuid.UUID `json:"membership_id"`
 		Role         string    `json:"role"`
@@ -182,7 +214,11 @@ func (h *ChatHandler) AddMember(w http.ResponseWriter, r *http.Request) {
 
 func (h *ChatHandler) Mute(w http.ResponseWriter, r *http.Request) {
 	oc := middleware.OrgCtx(r.Context())
-	cid, _ := uuid.Parse(chi.URLParam(r, "channel_id"))
+	cid, err := uuid.Parse(chi.URLParam(r, "channel_id"))
+	if err != nil {
+		httpx.WriteErr(w, 400, "invalid_id", "malformed identifier")
+		return
+	}
 	var req struct {
 		Until *time.Time `json:"until"`
 	}
@@ -216,7 +252,11 @@ func (h *ChatHandler) StartRoom(w http.ResponseWriter, r *http.Request) {
 // JoinRoom — returns the room name + a short-lived LiveKit access token.
 func (h *ChatHandler) JoinRoom(w http.ResponseWriter, r *http.Request) {
 	oc := middleware.OrgCtx(r.Context())
-	rid, _ := uuid.Parse(chi.URLParam(r, "room_id"))
+	rid, err := uuid.Parse(chi.URLParam(r, "room_id"))
+	if err != nil {
+		httpx.WriteErr(w, 400, "invalid_id", "malformed identifier")
+		return
+	}
 	name, token, url, err := h.svc.JoinRoom(r.Context(), oc, rid)
 	if err != nil {
 		chatErr(w, err)
@@ -228,7 +268,11 @@ func (h *ChatHandler) JoinRoom(w http.ResponseWriter, r *http.Request) {
 
 func (h *ChatHandler) LeaveRoom(w http.ResponseWriter, r *http.Request) {
 	oc := middleware.OrgCtx(r.Context())
-	rid, _ := uuid.Parse(chi.URLParam(r, "room_id"))
+	rid, err := uuid.Parse(chi.URLParam(r, "room_id"))
+	if err != nil {
+		httpx.WriteErr(w, 400, "invalid_id", "malformed identifier")
+		return
+	}
 	if err := h.svc.LeaveRoom(r.Context(), oc, rid); err != nil {
 		chatErr(w, err)
 		return
@@ -239,7 +283,11 @@ func (h *ChatHandler) LeaveRoom(w http.ResponseWriter, r *http.Request) {
 // EndRoom — starter or `org.chat.moderate`.
 func (h *ChatHandler) EndRoom(w http.ResponseWriter, r *http.Request) {
 	oc := middleware.OrgCtx(r.Context())
-	rid, _ := uuid.Parse(chi.URLParam(r, "room_id"))
+	rid, err := uuid.Parse(chi.URLParam(r, "room_id"))
+	if err != nil {
+		httpx.WriteErr(w, 400, "invalid_id", "malformed identifier")
+		return
+	}
 	mod := h.orgSvc.HasPermission(r.Context(), oc.UserID, oc.OrgID, "org.chat.moderate")
 	if err := h.svc.EndRoom(r.Context(), oc, rid, mod); err != nil {
 		chatErr(w, err)
@@ -261,7 +309,11 @@ func (h *ChatHandler) LiveRooms(w http.ResponseWriter, r *http.Request) {
 // custom/dm channel; derived kinds refuse (they end with their source).
 func (h *ChatHandler) Archive(w http.ResponseWriter, r *http.Request) {
 	oc := middleware.OrgCtx(r.Context())
-	cid, _ := uuid.Parse(chi.URLParam(r, "channel_id"))
+	cid, err := uuid.Parse(chi.URLParam(r, "channel_id"))
+	if err != nil {
+		httpx.WriteErr(w, 400, "invalid_id", "malformed identifier")
+		return
+	}
 	if err := h.svc.ArchiveChannel(r.Context(), oc, cid); err != nil {
 		chatErr(w, err)
 		return
@@ -273,8 +325,16 @@ func (h *ChatHandler) Archive(w http.ResponseWriter, r *http.Request) {
 // (channels.manage) or self-leave on custom/dm channels.
 func (h *ChatHandler) RemoveMember(w http.ResponseWriter, r *http.Request) {
 	oc := middleware.OrgCtx(r.Context())
-	cid, _ := uuid.Parse(chi.URLParam(r, "channel_id"))
-	mid, _ := uuid.Parse(chi.URLParam(r, "member_id"))
+	cid, err := uuid.Parse(chi.URLParam(r, "channel_id"))
+	if err != nil {
+		httpx.WriteErr(w, 400, "invalid_id", "malformed identifier")
+		return
+	}
+	mid, err := uuid.Parse(chi.URLParam(r, "member_id"))
+	if err != nil {
+		httpx.WriteErr(w, 400, "invalid_id", "malformed identifier")
+		return
+	}
 	if mid != oc.MembershipID &&
 		!h.orgSvc.HasPermission(r.Context(), oc.UserID, oc.OrgID, "org.chat.channels.manage") {
 		chatErr(w, chat.ErrForbidden)

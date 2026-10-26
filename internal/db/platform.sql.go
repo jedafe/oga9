@@ -199,6 +199,92 @@ func (q *Queries) EndSupportSession(ctx context.Context, id pgtype.UUID) (int64,
 	return result.RowsAffected(), nil
 }
 
+const exportScopedTables = `-- name: ExportScopedTables :many
+SELECT DISTINCT table_name::text FROM information_schema.columns
+WHERE table_schema = 'public' AND column_name = $1
+ORDER BY table_name
+`
+
+// every table carrying a scope column — the export stays complete as the
+// schema grows; no per-table code to forget.
+func (q *Queries) ExportScopedTables(ctx context.Context, columnName interface{}) ([]string, error) {
+	rows, err := q.db.Query(ctx, exportScopedTables, columnName)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []string
+	for rows.Next() {
+		var table_name string
+		if err := rows.Scan(&table_name); err != nil {
+			return nil, err
+		}
+		items = append(items, table_name)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const exportTenantOrgIDs = `-- name: ExportTenantOrgIDs :many
+
+SELECT id FROM organizations WHERE tenant_id = $1
+`
+
+// ---------- tenant export (Rule 28 — §13.06) ----------
+func (q *Queries) ExportTenantOrgIDs(ctx context.Context, tenantID pgtype.UUID) ([]pgtype.UUID, error) {
+	rows, err := q.db.Query(ctx, exportTenantOrgIDs, tenantID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []pgtype.UUID
+	for rows.Next() {
+		var id pgtype.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const exportTenantRow = `-- name: ExportTenantRow :one
+SELECT to_jsonb(t)::text FROM tenants t WHERE t.id = $1
+`
+
+// the tenant row itself + its non-secret control-plane rows come through
+// the tenant-scoped dump; this header anchors the export document.
+func (q *Queries) ExportTenantRow(ctx context.Context, id pgtype.UUID) (string, error) {
+	row := q.db.QueryRow(ctx, exportTenantRow, id)
+	var column_1 string
+	err := row.Scan(&column_1)
+	return column_1, err
+}
+
+const exportTenantUsers = `-- name: ExportTenantUsers :one
+SELECT COALESCE(jsonb_agg(j), '[]'::jsonb)::text FROM (
+  SELECT jsonb_build_object('id',u.id,'email',u.email,'display_name',u.display_name,
+    'status',u.status,'is_verified',u.is_verified,'created_at',u.created_at) AS j
+  FROM users u WHERE u.id IN (
+    SELECT m.user_id FROM organization_memberships m
+    JOIN organizations o ON o.id = m.organization_id WHERE o.tenant_id = $1)
+) t
+`
+
+// minimal user projection for the export — never credentials or secrets
+// (ADR-020 data minimization).
+func (q *Queries) ExportTenantUsers(ctx context.Context, tenantID pgtype.UUID) (string, error) {
+	row := q.db.QueryRow(ctx, exportTenantUsers, tenantID)
+	var column_1 string
+	err := row.Scan(&column_1)
+	return column_1, err
+}
+
 const finishProvision = `-- name: FinishProvision :execrows
 UPDATE tenant_provisions SET status = $2, tenant_id = $3,
   organization_id = $4, owner_user_id = $5, error = $6, completed_at = now()

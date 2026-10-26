@@ -176,3 +176,31 @@ SELECT EXISTS (
   WHERE ura.user_id = $1 AND r.tenant_id IS NULL
     AND rp.permission LIKE 'platform.%')
 ;
+
+-- ---------- tenant export (Rule 28 — §13.06) ----------
+
+-- name: ExportTenantOrgIDs :many
+SELECT id FROM organizations WHERE tenant_id = $1;
+
+-- name: ExportScopedTables :many
+-- every table carrying a scope column — the export stays complete as the
+-- schema grows; no per-table code to forget.
+SELECT DISTINCT table_name::text FROM information_schema.columns
+WHERE table_schema = 'public' AND column_name = $1
+ORDER BY table_name;
+
+-- name: ExportTenantUsers :one
+-- minimal user projection for the export — never credentials or secrets
+-- (ADR-020 data minimization).
+SELECT COALESCE(jsonb_agg(j), '[]'::jsonb)::text FROM (
+  SELECT jsonb_build_object('id',u.id,'email',u.email,'display_name',u.display_name,
+    'status',u.status,'is_verified',u.is_verified,'created_at',u.created_at) AS j
+  FROM users u WHERE u.id IN (
+    SELECT m.user_id FROM organization_memberships m
+    JOIN organizations o ON o.id = m.organization_id WHERE o.tenant_id = $1)
+) t;
+
+-- name: ExportTenantRow :one
+-- the tenant row itself + its non-secret control-plane rows come through
+-- the tenant-scoped dump; this header anchors the export document.
+SELECT to_jsonb(t)::text FROM tenants t WHERE t.id = $1;

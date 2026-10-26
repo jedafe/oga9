@@ -92,7 +92,11 @@ func (h *MemberHandler) Members(w http.ResponseWriter, r *http.Request) {
 // Member — GET /orgs/{id}/members/{mid}: view_any, or the member's own row.
 func (h *MemberHandler) Member(w http.ResponseWriter, r *http.Request) {
 	oc := middleware.OrgCtx(r.Context())
-	mid, _ := uuid.Parse(chi.URLParam(r, "member_id"))
+	mid, err := uuid.Parse(chi.URLParam(r, "member_id"))
+	if err != nil {
+		httpx.WriteErr(w, 400, "invalid_id", "malformed identifier")
+		return
+	}
 	if mid != oc.MembershipID && !h.svc.HasPermission(r.Context(), oc.UserID, oc.OrgID, "org.members.view_any") {
 		httpx.WriteErr(w, 403, "forbidden", "insufficient permission")
 		return
@@ -111,7 +115,11 @@ func (h *MemberHandler) Member(w http.ResponseWriter, r *http.Request) {
 // privileges, a member can't reclassify themselves.
 func (h *MemberHandler) PatchMember(w http.ResponseWriter, r *http.Request) {
 	oc := middleware.OrgCtx(r.Context())
-	mid, _ := uuid.Parse(chi.URLParam(r, "member_id"))
+	mid, err := uuid.Parse(chi.URLParam(r, "member_id"))
+	if err != nil {
+		httpx.WriteErr(w, 400, "invalid_id", "malformed identifier")
+		return
+	}
 	var req struct {
 		Category string    `json:"category"`
 		UnitID   uuid.UUID `json:"unit_id"`
@@ -139,7 +147,11 @@ func (h *MemberHandler) PatchMember(w http.ResponseWriter, r *http.Request) {
 // Transition — POST /orgs/{id}/members/{mid}/transition {to: suspend|
 // reinstate|expel|resign|deceased|life|register|activate} (manage).
 func (h *MemberHandler) Transition(w http.ResponseWriter, r *http.Request) {
-	mid, _ := uuid.Parse(chi.URLParam(r, "member_id"))
+	mid, err := uuid.Parse(chi.URLParam(r, "member_id"))
+	if err != nil {
+		httpx.WriteErr(w, 400, "invalid_id", "malformed identifier")
+		return
+	}
 	var req struct {
 		To string `json:"to"`
 	}
@@ -187,7 +199,11 @@ func (h *MemberHandler) Resign(w http.ResponseWriter, r *http.Request) {
 // mint free good-standing.
 func (h *MemberHandler) Renew(w http.ResponseWriter, r *http.Request) {
 	oc := middleware.OrgCtx(r.Context())
-	mid, _ := uuid.Parse(chi.URLParam(r, "member_id"))
+	mid, err := uuid.Parse(chi.URLParam(r, "member_id"))
+	if err != nil {
+		httpx.WriteErr(w, 400, "invalid_id", "malformed identifier")
+		return
+	}
 	var req struct {
 		Period    string    `json:"period_label"`
 		StartsAt  string    `json:"starts_at"`
@@ -220,7 +236,11 @@ func (h *MemberHandler) Renew(w http.ResponseWriter, r *http.Request) {
 
 // Card — POST /orgs/{id}/members/{mid}/card (card.issue): issue a member card.
 func (h *MemberHandler) Card(w http.ResponseWriter, r *http.Request) {
-	mid, _ := uuid.Parse(chi.URLParam(r, "member_id"))
+	mid, err := uuid.Parse(chi.URLParam(r, "member_id"))
+	if err != nil {
+		httpx.WriteErr(w, 400, "invalid_id", "malformed identifier")
+		return
+	}
 	var req struct {
 		Design json.RawMessage `json:"design"`
 	}
@@ -235,7 +255,11 @@ func (h *MemberHandler) Card(w http.ResponseWriter, r *http.Request) {
 
 // History — GET /orgs/{id}/members/{mid}/history (view_any): sourced event stream.
 func (h *MemberHandler) History(w http.ResponseWriter, r *http.Request) {
-	mid, _ := uuid.Parse(chi.URLParam(r, "member_id"))
+	mid, err := uuid.Parse(chi.URLParam(r, "member_id"))
+	if err != nil {
+		httpx.WriteErr(w, 400, "invalid_id", "malformed identifier")
+		return
+	}
 	rows, err := h.svc.MemberHistory(r.Context(), middleware.OrgCtx(r.Context()), mid)
 	if err != nil {
 		memberErr(w, err)
@@ -279,7 +303,11 @@ func (h *MemberHandler) Applications(w http.ResponseWriter, r *http.Request) {
 // Decide — POST /orgs/{id}/applications/{aid}/decision {action: screen|
 // approve|reject|withdraw} (approve node).
 func (h *MemberHandler) Decide(w http.ResponseWriter, r *http.Request) {
-	aid, _ := uuid.Parse(chi.URLParam(r, "application_id"))
+	aid, err := uuid.Parse(chi.URLParam(r, "application_id"))
+	if err != nil {
+		httpx.WriteErr(w, 400, "invalid_id", "malformed identifier")
+		return
+	}
 	var req struct {
 		Action   string      `json:"action"`
 		Sponsors []uuid.UUID `json:"sponsor_member_ids"` // screener-attached at decision time
@@ -299,8 +327,16 @@ func (h *MemberHandler) Decide(w http.ResponseWriter, r *http.Request) {
 // applicant's own row only. Outside the orgCtx group on purpose — a
 // pre-decision applicant has no membership yet.
 func (h *MemberHandler) Withdraw(w http.ResponseWriter, r *http.Request) {
-	orgID, _ := uuid.Parse(chi.URLParam(r, "org_id"))
-	appID, _ := uuid.Parse(chi.URLParam(r, "application_id"))
+	orgID, err := uuid.Parse(chi.URLParam(r, "org_id"))
+	if err != nil {
+		httpx.WriteErr(w, 400, "invalid_id", "malformed identifier")
+		return
+	}
+	appID, err := uuid.Parse(chi.URLParam(r, "application_id"))
+	if err != nil {
+		httpx.WriteErr(w, 400, "invalid_id", "malformed identifier")
+		return
+	}
 	if err := h.svc.WithdrawApplication(r.Context(), middleware.UserID(r.Context()), orgID, appID); err != nil {
 		memberErr(w, err)
 		return
@@ -482,7 +518,11 @@ func (h *MemberHandler) ExportAsync(w http.ResponseWriter, r *http.Request) {
 // ExportDownload — GET /orgs/{id}/members/exports/{eid}: the stored CSV.
 func (h *MemberHandler) ExportDownload(w http.ResponseWriter, r *http.Request) {
 	oc := middleware.OrgCtx(r.Context())
-	eid, _ := uuid.Parse(chi.URLParam(r, "export_id"))
+	eid, err := uuid.Parse(chi.URLParam(r, "export_id"))
+	if err != nil {
+		httpx.WriteErr(w, 400, "invalid_id", "malformed identifier")
+		return
+	}
 	e, err := h.svc.ExportDownload(r.Context(), oc, eid)
 	if err != nil {
 		memberErr(w, err)

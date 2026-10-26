@@ -268,6 +268,17 @@ type Querier interface {
 	// their account, or not at all).
 	ExistsOrgMemberByContact(ctx context.Context, arg ExistsOrgMemberByContactParams) (bool, error)
 	ExpiredOpenDrives(ctx context.Context) ([]ExpiredOpenDrivesRow, error)
+	// every table carrying a scope column — the export stays complete as the
+	// schema grows; no per-table code to forget.
+	ExportScopedTables(ctx context.Context, columnName interface{}) ([]string, error)
+	// ---------- tenant export (Rule 28 — §13.06) ----------
+	ExportTenantOrgIDs(ctx context.Context, tenantID pgtype.UUID) ([]pgtype.UUID, error)
+	// the tenant row itself + its non-secret control-plane rows come through
+	// the tenant-scoped dump; this header anchors the export document.
+	ExportTenantRow(ctx context.Context, id pgtype.UUID) (string, error)
+	// minimal user projection for the export — never credentials or secrets
+	// (ADR-020 data minimization).
+	ExportTenantUsers(ctx context.Context, tenantID pgtype.UUID) (string, error)
 	FailPayment(ctx context.Context, arg FailPaymentParams) (int64, error)
 	// Outbox claim set: undelivered events under the attempt cap whose backoff
 	// has elapsed (next_attempt_at), oldest first. FOR NO KEY UPDATE SKIP

@@ -84,7 +84,11 @@ func (h *CommsHandler) CreateAnnouncement(w http.ResponseWriter, r *http.Request
 // immediate publish (Rule 8 fire-and-forget).
 func (h *CommsHandler) PublishAnnouncement(w http.ResponseWriter, r *http.Request) {
 	oc := middleware.OrgCtx(r.Context())
-	aid, _ := uuid.Parse(chi.URLParam(r, "announcement_id"))
+	aid, err := uuid.Parse(chi.URLParam(r, "announcement_id"))
+	if err != nil {
+		httpx.WriteErr(w, 400, "invalid_id", "malformed identifier")
+		return
+	}
 	if err := h.svc.PublishDraft(r.Context(), oc, aid); err != nil {
 		commsErr(w, err)
 		return
@@ -97,7 +101,11 @@ func (h *CommsHandler) PublishAnnouncement(w http.ResponseWriter, r *http.Reques
 
 func (h *CommsHandler) RetractAnnouncement(w http.ResponseWriter, r *http.Request) {
 	oc := middleware.OrgCtx(r.Context())
-	aid, _ := uuid.Parse(chi.URLParam(r, "announcement_id"))
+	aid, err := uuid.Parse(chi.URLParam(r, "announcement_id"))
+	if err != nil {
+		httpx.WriteErr(w, 400, "invalid_id", "malformed identifier")
+		return
+	}
 	if err := h.svc.Retract(r.Context(), oc, aid); err != nil {
 		commsErr(w, err)
 		return
@@ -116,7 +124,11 @@ func (h *CommsHandler) MyNotifications(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *CommsHandler) ReadNotification(w http.ResponseWriter, r *http.Request) {
-	nid, _ := uuid.Parse(chi.URLParam(r, "notification_id"))
+	nid, err := uuid.Parse(chi.URLParam(r, "notification_id"))
+	if err != nil {
+		httpx.WriteErr(w, 400, "invalid_id", "malformed identifier")
+		return
+	}
 	if err := h.svc.MarkRead(r.Context(), middleware.UserID(r.Context()), nid); err != nil {
 		commsErr(w, err)
 		return
@@ -170,7 +182,11 @@ func (h *CommsHandler) UploadDocument(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer f.Close()
-	uid, _ := uuid.Parse(r.FormValue("unit_id"))
+	uid, err := uuid.Parse(r.FormValue("unit_id"))
+	if err != nil {
+		httpx.WriteErr(w, 400, "invalid_id", "malformed identifier")
+		return
+	}
 	id, err := h.svc.Upload(r.Context(), oc, r.FormValue("kind"),
 		r.FormValue("title"), r.FormValue("visibility"), uid, f)
 	if err != nil {
@@ -196,7 +212,11 @@ func (h *CommsHandler) Documents(w http.ResponseWriter, r *http.Request) {
 
 func (h *CommsHandler) DownloadDocument(w http.ResponseWriter, r *http.Request) {
 	oc := middleware.OrgCtx(r.Context())
-	did, _ := uuid.Parse(chi.URLParam(r, "document_id"))
+	did, err := uuid.Parse(chi.URLParam(r, "document_id"))
+	if err != nil {
+		httpx.WriteErr(w, 400, "invalid_id", "malformed identifier")
+		return
+	}
 	manage := h.org.HasPermission(r.Context(), oc.UserID, oc.OrgID, "org.documents.publish")
 	rc, d, err := h.svc.Download(r.Context(), oc, did, manage)
 	if err != nil {
@@ -217,7 +237,11 @@ func (h *CommsHandler) DownloadDocument(w http.ResponseWriter, r *http.Request) 
 
 func (h *CommsHandler) PatchDocument(w http.ResponseWriter, r *http.Request) {
 	oc := middleware.OrgCtx(r.Context())
-	did, _ := uuid.Parse(chi.URLParam(r, "document_id"))
+	did, err := uuid.Parse(chi.URLParam(r, "document_id"))
+	if err != nil {
+		httpx.WriteErr(w, 400, "invalid_id", "malformed identifier")
+		return
+	}
 	var req struct {
 		Title      *string   `json:"title"`
 		Visibility *string   `json:"visibility"`
@@ -236,7 +260,11 @@ func (h *CommsHandler) PatchDocument(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *CommsHandler) ArchiveDocument(w http.ResponseWriter, r *http.Request) {
-	did, _ := uuid.Parse(chi.URLParam(r, "document_id"))
+	did, err := uuid.Parse(chi.URLParam(r, "document_id"))
+	if err != nil {
+		httpx.WriteErr(w, 400, "invalid_id", "malformed identifier")
+		return
+	}
 	if err := h.svc.Archive(r.Context(), middleware.OrgCtx(r.Context()), did); err != nil {
 		commsErr(w, err)
 		return
@@ -246,7 +274,11 @@ func (h *CommsHandler) ArchiveDocument(w http.ResponseWriter, r *http.Request) {
 
 func (h *CommsHandler) NewVersion(w http.ResponseWriter, r *http.Request) {
 	oc := middleware.OrgCtx(r.Context())
-	did, _ := uuid.Parse(chi.URLParam(r, "document_id"))
+	did, err := uuid.Parse(chi.URLParam(r, "document_id"))
+	if err != nil {
+		httpx.WriteErr(w, 400, "invalid_id", "malformed identifier")
+		return
+	}
 	if err := r.ParseMultipartForm(32 << 20); err != nil {
 		httpx.WriteErr(w, 400, "validation_failed", "multipart body expected")
 		return
@@ -271,7 +303,11 @@ func (h *CommsHandler) NewVersion(w http.ResponseWriter, r *http.Request) {
 
 func (h *CommsHandler) DocumentVersions(w http.ResponseWriter, r *http.Request) {
 	oc := middleware.OrgCtx(r.Context())
-	did, _ := uuid.Parse(chi.URLParam(r, "document_id"))
+	did, err := uuid.Parse(chi.URLParam(r, "document_id"))
+	if err != nil {
+		httpx.WriteErr(w, 400, "invalid_id", "malformed identifier")
+		return
+	}
 	manage := h.org.HasPermission(r.Context(), oc.UserID, oc.OrgID, "org.documents.publish")
 	list, err := h.svc.Versions(r.Context(), oc, did, manage)
 	if err != nil {

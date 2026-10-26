@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"time"
 
 	"github.com/google/uuid"
@@ -530,4 +531,88 @@ func (s *Service) SetWelcomeMail(fn WelcomeMail) { s.welcomeFn = fn }
 
 func (s *Service) SetSessionMinter(fn func(ctx context.Context, supportSessionID, targetUserID uuid.UUID, ttl time.Duration, ip, ua string) (string, uuid.UUID, error)) {
 	s.sessionFn = fn
+}
+
+// ---------- tenant export (Rule 28 — §13.06) ----------
+
+// validIdent guards the dynamic table/column names that come back from
+// information_schema — DB-sourced but never trusted raw into SQL text.
+var validIdent = regexp.MustCompile(`^[a-z_][a-z0-9_]*$`)
+
+// ExportTenant produces the full Rule-28 data export: every org-scoped and
+// tenant-scoped table dumped to JSON, plus a credential-free user
+// projection. The export itself is audited like any sensitive platform
+// read (ADR-020: data-minimized, operator-visible in the audit trail).
+func (s *Service) ExportTenant(ctx context.Context, tenantID, actor uuid.UUID) ([]byte, error) {
+	if _, err := s.q.GetTenantRow(ctx, toPg(tenantID)); err != nil {
+		return nil, ErrNotFound
+	}
+	orgIDs, err := s.q.ExportTenantOrgIDs(ctx, toPg(tenantID))
+	if err != nil {
+		return nil, err
+	}
+	orgArr := make([]pgtype.UUID, len(orgIDs))
+	for i, id := range orgIDs {
+		orgArr[i] = id
+	}
+	orgScoped, err := s.q.ExportScopedTables(ctx, "organization_id")
+	if err != nil {
+		return nil, err
+	}
+	tnScoped, err := s.q.ExportScopedTables(ctx, "tenant_id")
+	if err != nil {
+		return nil, err
+	}
+	dump := func(table, col string, arg any) (json.RawMessage, error) {
+		if !validIdent.MatchString(table) || !validIdent.MatchString(col) {
+			return nil, nil
+		}
+		var b []byte
+		err := s.pool.QueryRow(ctx, fmt.Sprintf(
+			`SELECT COALESCE(jsonb_agg(t),'[]'::jsonb) FROM %s t WHERE t.%s = ANY($1)`,
+			`"`+table+`"`, col), arg).Scan(&b)
+		if err != nil {
+			return nil, fmt.Errorf("export %s: %w", table, err)
+		}
+		return b, nil
+	}
+	orgTables := map[string]json.RawMessage{}
+	for _, tbl := range orgScoped {
+		rows, err := dump(tbl, "organization_id", orgArr)
+		if err != nil {
+			return nil, err
+		}
+		if rows != nil {
+			orgTables[tbl] = rows
+		}
+	}
+	tnTables := map[string]json.RawMessage{}
+	tnArr := []pgtype.UUID{toPg(tenantID)}
+	for _, tbl := range tnScoped {
+		rows, err := dump(tbl, "tenant_id", tnArr)
+		if err != nil {
+			return nil, err
+		}
+		if rows != nil {
+			tnTables[tbl] = rows
+		}
+	}
+	users, err := s.q.ExportTenantUsers(ctx, toPg(tenantID))
+	if err != nil {
+		return nil, err
+	}
+	// audit the export — a full-data read is as sensitive as impersonation.
+	if err := s.withTx(ctx, func(q *db.Queries) error {
+		return s.audit(ctx, q, tenantID, actor, "tenant.export", "tenant", tenantID,
+			map[string]any{"org_count": len(orgIDs)})
+	}); err != nil {
+		return nil, err // Rule 10: failed audit write aborts
+	}
+	return json.Marshal(map[string]any{
+		"tenant_id":     tenantID,
+		"exported_at":   time.Now().UTC(),
+		"tenant_tables": tnTables,
+		"org_tables":    orgTables,
+		"users":         json.RawMessage(users),
+	})
 }

@@ -34,6 +34,7 @@ import (
 	"github.com/jedafe/oga9/internal/handler"
 	"github.com/jedafe/oga9/internal/mailer"
 	"github.com/jedafe/oga9/internal/middleware"
+	"github.com/jedafe/oga9/internal/obs"
 	"github.com/jedafe/oga9/internal/platform"
 	"github.com/jedafe/oga9/internal/realtime"
 	"github.com/jedafe/oga9/internal/storage"
@@ -98,6 +99,9 @@ func main() {
 		r.Use(sentryhttp.New(sentryhttp.Options{Repanic: true}).Handle)
 	}
 	r.Use(chimiddleware.Recoverer)
+	// §13.05: structured access log + per-route latency reservoir.
+	r.Use(obs.Metrics)
+	r.Use(obs.RequestLog)
 
 	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
 		if err := pool.Ping(r.Context()); err != nil {
@@ -294,7 +298,8 @@ func main() {
 			// §15 control plane
 			r.With(middleware.RequirePlatformNode(pool, "platform.tenants.manage")).Get("/platform/tenants", platH.Tenants)
 			r.With(middleware.RequirePlatformNode(pool, "platform.tenants.manage")).Get("/platform/tenants/{tenant_id}", platH.Tenant)
-			r.With(middleware.RequirePlatformNode(pool, "platform.tenants.manage")).Post("/platform/tenants", platH.CreateTenant)
+			r.With(middleware.RequirePlatformNode(pool, "platform.tenants.manage")).Get("/platform/tenants/{tenant_id}/export", platH.ExportTenant)
+			r.With(middleware.RequirePlatformNode(pool, "platform.tenants.manage"), middleware.RateLimit(vk, "platform", 30, time.Minute)).Post("/platform/tenants", platH.CreateTenant)
 			r.With(middleware.RequirePlatformNode(pool, "platform.tenants.manage")).Post("/platform/tenants/{tenant_id}/suspend", platH.SuspendTenant)
 			r.With(middleware.RequirePlatformNode(pool, "platform.tenants.manage")).Post("/platform/tenants/{tenant_id}/reinstate", platH.ReinstateTenant)
 			r.With(middleware.RequirePlatformNode(pool, "platform.subscriptions.manage")).Get("/platform/subscriptions", platH.Subscriptions)
@@ -303,11 +308,12 @@ func main() {
 			r.With(middleware.RequirePlatformNode(pool, "platform.plans.manage")).Patch("/platform/plans/{slug}", platH.UpsertPlan)
 			r.With(middleware.RequirePlatformNode(pool, "platform.deployments.manage")).Get("/platform/deployments", platH.Deployments)
 			r.With(middleware.RequirePlatformNode(pool, "platform.deployments.manage")).Post("/platform/deployments", platH.CreateDeployment)
-			r.With(middleware.RequirePlatformNode(pool, "platform.support.impersonate")).Post("/platform/support/impersonate", platH.Impersonate)
+			r.With(middleware.RequirePlatformNode(pool, "platform.support.impersonate"), middleware.RateLimit(vk, "platform", 10, time.Minute)).Post("/platform/support/impersonate", platH.Impersonate)
 			r.With(middleware.RequirePlatformNode(pool, "platform.support.impersonate")).Post("/platform/support/impersonate/{session_id}/end", platH.EndImpersonation)
 			r.Get("/me/support-sessions", platH.MySupportSessions) // §15 banner — tenant-visible
 			r.With(middleware.RequirePlatformNode(pool, "platform.audit.view")).Get("/platform/audit", platH.Audit)
 			r.With(middleware.RequirePlatformNode(pool, "platform.analytics.view")).Get("/platform/usage", platH.Usage)
+			r.With(middleware.RequirePlatformNode(pool, "platform.analytics.view")).Get("/platform/metrics", handler.Metrics(cfg.ValkeyAddr, pool))
 			r.With(middleware.RequirePlatformNode(pool, "platform.flags.manage")).Get("/platform/flags", platH.Flags)
 			r.With(middleware.RequirePlatformNode(pool, "platform.flags.manage")).Post("/platform/flags/{key}", platH.SetFlag)
 			// §07 billing — tenant resolves server-side from the caller's
@@ -329,7 +335,7 @@ func main() {
 			r.Get("/me/notifications", commsH.MyNotifications)
 			r.Post("/me/notifications/{notification_id}/read", commsH.ReadNotification)
 			r.Get("/me/preferences", commsH.GetPrefs)
-			r.Get("/ws", wsGw.ServeWS)
+			r.With(middleware.RateLimit(vk, "ws", 30, time.Minute)).Get("/ws", wsGw.ServeWS)
 			r.Patch("/me/preferences", commsH.SetPrefs)
 			r.Get("/org-templates", orgH.Templates)
 			r.Post("/orgs", orgH.Create)
@@ -404,7 +410,7 @@ func main() {
 					r.With(middleware.RequireOrgPermission(orgSvc, "org.finance.reports.read")).Get("/orgs/{org_id}/finance/obligations", finH.Obligations)
 					r.With(middleware.RequireOrgPermission(orgSvc, "org.finance.statement_view")).Get("/orgs/{org_id}/finance/obligations/status", finH.ObligationsStatus)
 					r.With(middleware.RequireOrgPermission(orgSvc, "org.finance.obligations.manage")).Post("/orgs/{org_id}/finance/obligations/{obligation_id}/waive", finH.WaiveObligation)
-					r.Post("/orgs/{org_id}/finance/payments", finH.RecordPayment) // view_own or payments.record — inside
+					r.With(middleware.RateLimit(vk, "payment", 20, time.Minute)).Post("/orgs/{org_id}/finance/payments", finH.RecordPayment) // view_own or payments.record — inside
 					r.With(middleware.RequireOrgPermission(orgSvc, "org.finance.payments.approve")).Post("/orgs/{org_id}/finance/payments/{payment_id}/confirm", finH.ConfirmPayment)
 					r.With(middleware.RequireOrgPermission(orgSvc, "org.finance.payments.approve")).Post("/orgs/{org_id}/finance/payments/{payment_id}/reverse", finH.ReversePayment)
 					r.With(middleware.RequireOrgPermission(orgSvc, "org.finance.reconcile")).Post("/orgs/{org_id}/finance/payments/{payment_id}/reconcile", finH.ReconcilePayment)
@@ -422,7 +428,7 @@ func main() {
 					r.With(middleware.RequireOrgPermission(orgSvc, "org.finance.drives.manage")).Post("/orgs/{org_id}/finance/drives/{drive_id}/close", finH.CloseDrive)
 					r.With(middleware.RequireOrgPermission(orgSvc, "org.finance.payments.approve")).Post("/orgs/{org_id}/finance/drives/{drive_id}/disburse", finH.DisburseDrive)
 					r.With(middleware.RequireOrgPermission(orgSvc, "org.finance.statement_view")).Get("/orgs/{org_id}/finance/drives/{drive_id}/contributions", finH.DriveContributions)
-					r.With(middleware.RequireOrgPermission(orgSvc, "org.finance.claims.submit_own")).Post("/orgs/{org_id}/finance/claims", finH.SubmitClaim)
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.finance.claims.submit_own"), middleware.RateLimit(vk, "payment", 20, time.Minute)).Post("/orgs/{org_id}/finance/claims", finH.SubmitClaim)
 					r.With(middleware.RequireOrgPermission(orgSvc, "org.finance.claims.review")).Get("/orgs/{org_id}/finance/claims", finH.Claims)
 					r.With(middleware.RequireOrgPermission(orgSvc, "org.finance.claims.review")).Post("/orgs/{org_id}/finance/claims/{claim_id}/confirm", finH.ConfirmClaim)
 					r.With(middleware.RequireOrgPermission(orgSvc, "org.finance.claims.review")).Post("/orgs/{org_id}/finance/claims/{claim_id}/reject", finH.RejectClaim)
@@ -465,7 +471,7 @@ func main() {
 					r.With(middleware.RequireOrgPermission(orgSvc, "org.comms.announce")).Post("/orgs/{org_id}/announcements", commsH.CreateAnnouncement)
 					r.With(middleware.RequireOrgPermission(orgSvc, "org.comms.announce")).Post("/orgs/{org_id}/announcements/{announcement_id}/publish", commsH.PublishAnnouncement)
 					r.With(middleware.RequireOrgPermission(orgSvc, "org.comms.announce")).Post("/orgs/{org_id}/announcements/{announcement_id}/retract", commsH.RetractAnnouncement)
-					r.With(middleware.RequireOrgPermission(orgSvc, "org.documents.upload")).Post("/orgs/{org_id}/documents", commsH.UploadDocument)
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.documents.upload"), middleware.RateLimit(vk, "upload", 10, time.Minute)).Post("/orgs/{org_id}/documents", commsH.UploadDocument)
 					r.With(middleware.RequireOrgPermission(orgSvc, "org.documents.view")).Get("/orgs/{org_id}/documents", commsH.Documents)
 					r.With(middleware.RequireOrgPermission(orgSvc, "org.documents.view")).Get("/orgs/{org_id}/documents/{document_id}/download", commsH.DownloadDocument)
 					r.With(middleware.RequireOrgPermission(orgSvc, "org.documents.publish")).Patch("/orgs/{org_id}/documents/{document_id}", commsH.PatchDocument)
@@ -479,7 +485,7 @@ func main() {
 					r.With(middleware.RequireOrgPermission(orgSvc, "org.chat.channels.manage")).Post("/orgs/{org_id}/channels/{channel_id}/archive", chatH.Archive)
 					r.Delete("/orgs/{org_id}/channels/{channel_id}/members/{member_id}", chatH.RemoveMember) // manage or self — inside
 					r.With(middleware.RequireOrgPermission(orgSvc, "org.chat.use")).Get("/orgs/{org_id}/channels/{channel_id}/messages", chatH.Messages)
-					r.With(middleware.RequireOrgPermission(orgSvc, "org.chat.post")).Post("/orgs/{org_id}/channels/{channel_id}/messages", chatH.PostMessage)
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.chat.post"), middleware.RateLimit(vk, "chat", 60, time.Minute)).Post("/orgs/{org_id}/channels/{channel_id}/messages", chatH.PostMessage)
 					r.With(middleware.RequireOrgPermission(orgSvc, "org.chat.use")).Patch("/orgs/{org_id}/channels/{channel_id}/messages/{message_id}", chatH.EditMessage)
 					r.With(middleware.RequireOrgPermission(orgSvc, "org.chat.use")).Delete("/orgs/{org_id}/channels/{channel_id}/messages/{message_id}", chatH.DeleteMessage)
 					r.With(middleware.RequireOrgPermission(orgSvc, "org.chat.use")).Post("/orgs/{org_id}/channels/{channel_id}/read", chatH.MarkRead)

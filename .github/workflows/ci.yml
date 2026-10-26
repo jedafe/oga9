@@ -49,3 +49,45 @@ jobs:
           git diff --exit-code internal/db
       - name: test
         run: go test ./... -count=1
+
+  # §13 hardening 13.02 — prove backup.sh + restore.sh round-trip: migrate a
+  # scratch DB, seed a marker row, dump, wipe the schema, restore, verify.
+  restore-test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg18
+        env:
+          POSTGRES_USER: oga9
+          POSTGRES_PASSWORD: oga9
+          POSTGRES_DB: oga9
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U oga9"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      OGA9_DATABASE_URL: postgres://oga9:oga9@localhost:5432/oga9?sslmode=disable
+      OGA9_BACKUP_DIR: /tmp/oga9-backups
+    steps:
+      - uses: actions/checkout@v4
+      - name: install pg client
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+      - name: apply migrations
+        run: |
+          for f in db/migrations/*.up.sql; do
+            psql "$OGA9_DATABASE_URL" -v ON_ERROR_STOP=1 -f "$f"
+          done
+      - name: seed marker row
+        run: psql "$OGA9_DATABASE_URL" -v ON_ERROR_STOP=1 -c \
+          "INSERT INTO users (id,email,password_hash,display_name,status) VALUES (gen_random_uuid(),'restore-test@oga9.local','x','RT','active')"
+      - name: backup
+        run: scripts/backup.sh
+      - name: wipe schema
+        run: psql "$OGA9_DATABASE_URL" -v ON_ERROR_STOP=1 \
+          -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"
+      - name: restore
+        run: scripts/restore.sh "$(ls -t $OGA9_BACKUP_DIR/oga9-*.dump | head -1)"
+      - name: verify marker row survived
+        run: |
+          psql "$OGA9_DATABASE_URL" -v ON_ERROR_STOP=1 -tAc \
+            "SELECT count(*) FROM users WHERE email='restore-test@oga9.local'" | grep -qx 1

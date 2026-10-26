@@ -5,6 +5,7 @@ package handler
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"time"
@@ -88,7 +89,11 @@ func (h *PlatformHandler) Tenants(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *PlatformHandler) Tenant(w http.ResponseWriter, r *http.Request) {
-	id, _ := uuid.Parse(chi.URLParam(r, "tenant_id"))
+	id, err := uuid.Parse(chi.URLParam(r, "tenant_id"))
+	if err != nil {
+		httpx.WriteErr(w, 400, "invalid_id", "malformed identifier")
+		return
+	}
 	t, err := h.svc.GetTenant(r.Context(), id)
 	if err != nil {
 		platErr(w, err)
@@ -98,7 +103,11 @@ func (h *PlatformHandler) Tenant(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *PlatformHandler) SuspendTenant(w http.ResponseWriter, r *http.Request) {
-	id, _ := uuid.Parse(chi.URLParam(r, "tenant_id"))
+	id, err := uuid.Parse(chi.URLParam(r, "tenant_id"))
+	if err != nil {
+		httpx.WriteErr(w, 400, "invalid_id", "malformed identifier")
+		return
+	}
 	var in struct {
 		Reason string `json:"reason"`
 	}
@@ -111,7 +120,11 @@ func (h *PlatformHandler) SuspendTenant(w http.ResponseWriter, r *http.Request) 
 }
 
 func (h *PlatformHandler) ReinstateTenant(w http.ResponseWriter, r *http.Request) {
-	id, _ := uuid.Parse(chi.URLParam(r, "tenant_id"))
+	id, err := uuid.Parse(chi.URLParam(r, "tenant_id"))
+	if err != nil {
+		httpx.WriteErr(w, 400, "invalid_id", "malformed identifier")
+		return
+	}
 	if err := h.svc.ReinstateTenant(r.Context(), id, middleware.UserID(r.Context())); err != nil {
 		platErr(w, err)
 		return
@@ -129,7 +142,11 @@ func (h *PlatformHandler) Subscriptions(w http.ResponseWriter, r *http.Request) 
 }
 
 func (h *PlatformHandler) OverrideSubscription(w http.ResponseWriter, r *http.Request) {
-	sid, _ := uuid.Parse(chi.URLParam(r, "subscription_id"))
+	sid, err := uuid.Parse(chi.URLParam(r, "subscription_id"))
+	if err != nil {
+		httpx.WriteErr(w, 400, "invalid_id", "malformed identifier")
+		return
+	}
 	var in struct {
 		TenantID  uuid.UUID  `json:"tenant_id"`
 		Plan      string     `json:"plan"`
@@ -184,7 +201,11 @@ func (h *PlatformHandler) UpsertPlan(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *PlatformHandler) Deployments(w http.ResponseWriter, r *http.Request) {
-	tid, _ := uuid.Parse(r.URL.Query().Get("tenant_id"))
+	tid, err := uuid.Parse(r.URL.Query().Get("tenant_id"))
+	if err != nil {
+		httpx.WriteErr(w, 400, "invalid_id", "malformed identifier")
+		return
+	}
 	list, err := h.svc.ListDeployments(r.Context(), tid)
 	if err != nil {
 		platErr(w, err)
@@ -234,7 +255,11 @@ func (h *PlatformHandler) Impersonate(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *PlatformHandler) EndImpersonation(w http.ResponseWriter, r *http.Request) {
-	sid, _ := uuid.Parse(chi.URLParam(r, "session_id"))
+	sid, err := uuid.Parse(chi.URLParam(r, "session_id"))
+	if err != nil {
+		httpx.WriteErr(w, 400, "invalid_id", "malformed identifier")
+		return
+	}
 	if err := h.svc.EndImpersonation(r.Context(), sid, middleware.UserID(r.Context())); err != nil {
 		platErr(w, err)
 		return
@@ -242,8 +267,31 @@ func (h *PlatformHandler) EndImpersonation(w http.ResponseWriter, r *http.Reques
 	httpx.WriteData(w, 200, map[string]any{"support_session_id": sid, "ended": true})
 }
 
+// ExportTenant — GET /platform/tenants/{tenant_id}/export: the Rule-28
+// full-data export. Audited inside the service (a failed audit aborts).
+func (h *PlatformHandler) ExportTenant(w http.ResponseWriter, r *http.Request) {
+	tid, err := uuid.Parse(chi.URLParam(r, "tenant_id"))
+	if err != nil {
+		httpx.WriteErr(w, 400, "invalid_id", "malformed identifier")
+		return
+	}
+	data, err := h.svc.ExportTenant(r.Context(), tid, middleware.UserID(r.Context()))
+	if err != nil {
+		platErr(w, err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=oga9-tenant-%s.json", tid))
+	w.WriteHeader(200)
+	_, _ = w.Write(data)
+}
+
 func (h *PlatformHandler) Audit(w http.ResponseWriter, r *http.Request) {
-	tid, _ := uuid.Parse(r.URL.Query().Get("tenant_id"))
+	tid, err := uuid.Parse(r.URL.Query().Get("tenant_id"))
+	if err != nil {
+		httpx.WriteErr(w, 400, "invalid_id", "malformed identifier")
+		return
+	}
 	list, err := h.svc.AuditEvents(r.Context(), tid, r.URL.Query().Get("action"))
 	if err != nil {
 		platErr(w, err)
@@ -253,7 +301,11 @@ func (h *PlatformHandler) Audit(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *PlatformHandler) Usage(w http.ResponseWriter, r *http.Request) {
-	tid, _ := uuid.Parse(r.URL.Query().Get("tenant_id"))
+	tid, err := uuid.Parse(r.URL.Query().Get("tenant_id"))
+	if err != nil {
+		httpx.WriteErr(w, 400, "invalid_id", "malformed identifier")
+		return
+	}
 	list, err := h.svc.Usage(r.Context(), tid)
 	if err != nil {
 		platErr(w, err)
