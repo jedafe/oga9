@@ -79,7 +79,7 @@ func NewService(pool *pgxpool.Pool, vk valkey.Client, jwtSecret string, tokenTTL
 	return &Service{pool: pool, q: db.New(pool), vk: vk, jwtSecret: jwtSecret, tokenTTL: tokenTTL, dataKey: dataKey}
 }
 
-func toPg(u uuid.UUID) pgtype.UUID { return pgtype.UUID{Bytes: u, Valid: true} }
+func toPg(u uuid.UUID) pgtype.UUID { return pgtype.UUID{Bytes: u, Valid: u != uuid.Nil} }
 func fromPg(p pgtype.UUID) uuid.UUID {
 	u, _ := uuid.FromBytes(p.Bytes[:])
 	return u
@@ -204,7 +204,7 @@ func (s *Service) finishLogin(ctx context.Context, userID uuid.UUID, mfaSecret [
 	// §15: a suspended tenant blocks login for its users; platform operators
 	// (platform.tenants.manage) still authenticate to support/reinstate.
 	healthy, err := s.q.UserHasHealthyMembership(ctx, toPg(userID))
-	if err == nil && !healthy {
+	if err == nil && !healthy.Bool {
 		op, e := s.q.UserHasAnyPlatformRole(ctx, toPg(userID))
 		if e != nil || !op {
 			return nil, ErrTenantSuspended // every org they belong to is frozen

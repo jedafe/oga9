@@ -130,7 +130,7 @@ func (q *Queries) JoinVoiceRoom(ctx context.Context, arg JoinVoiceRoomParams) er
 	return err
 }
 
-const leaveVoiceRoom = `-- name: LeaveVoiceRoom :exec
+const leaveVoiceRoom = `-- name: LeaveVoiceRoom :execrows
 UPDATE voice_room_participants SET left_at = now()
 WHERE room_id = $1 AND membership_id = $2 AND left_at IS NULL
 `
@@ -140,9 +140,12 @@ type LeaveVoiceRoomParams struct {
 	MembershipID pgtype.UUID `json:"membership_id"`
 }
 
-func (q *Queries) LeaveVoiceRoom(ctx context.Context, arg LeaveVoiceRoomParams) error {
-	_, err := q.db.Exec(ctx, leaveVoiceRoom, arg.RoomID, arg.MembershipID)
-	return err
+func (q *Queries) LeaveVoiceRoom(ctx context.Context, arg LeaveVoiceRoomParams) (int64, error) {
+	result, err := q.db.Exec(ctx, leaveVoiceRoom, arg.RoomID, arg.MembershipID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const liveVoiceRooms = `-- name: LiveVoiceRooms :many

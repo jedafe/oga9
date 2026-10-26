@@ -99,8 +99,11 @@ func (s *Service) Invalidate(ctx context.Context, tenantID uuid.UUID) {
 // drops the tenant's cached set. Idempotent — DEL is safe to replay.
 func (s *Service) InvalidateConsumer(ctx context.Context, q *db.Queries, e events.Event) error {
 	switch e.Type {
-	case "SubscriptionChanged", "AppActivated", "AppDeactivated", "LicenseIssued":
+	case "SubscriptionChanged", "AppActivated", "AppDeactivated", "LicenseIssued", "LicenseRenewed":
 		s.Invalidate(ctx, e.TenantID)
+		return events.Emit(ctx, q, e.TenantID, uuid.Nil, "EntitlementsRefreshed",
+			"entitlements", e.TenantID, e.ActorID, false,
+			map[string]any{"tenant_id": e.TenantID})
 	}
 	return nil
 }

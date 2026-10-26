@@ -227,6 +227,11 @@ func (s *Service) PatchActivity(ctx context.Context, oc *tenant.OrgCtx, aid uuid
 	if err != nil {
 		return false, err
 	}
+	if cur.Status == "cancelled" {
+		// cancelled is terminal — field edits and status moves both refuse
+		// (the UPDATE's status<>'cancelled' filter would otherwise 404).
+		return false, ErrInvalidTransition
+	}
 	if status != nil && cur.Status != "scheduled" {
 		// completed/cancelled are terminal — no status moves off them.
 		return false, ErrInvalidTransition
@@ -413,8 +418,11 @@ func (s *Service) CreateActionItem(ctx context.Context, oc *tenant.OrgCtx, aid u
 	return fromPg(row.ID), err
 }
 
-func (s *Service) ActionItems(ctx context.Context, oc *tenant.OrgCtx, aid uuid.UUID, state string) ([]db.ActionItems, error) {
-	return s.q.ListActionItems(ctx, db.ListActionItemsParams{ActivityID: toPg(aid), Column2: state, OrganizationID: toPg(oc.OrgID)})
+// ActionItems — assignee=Nil lists the whole sheet (manage holders);
+// a concrete id scopes to that assignee (§13 view_own for non-managers).
+func (s *Service) ActionItems(ctx context.Context, oc *tenant.OrgCtx, aid uuid.UUID, state string, assignee uuid.UUID) ([]db.ActionItems, error) {
+	return s.q.ListActionItems(ctx, db.ListActionItemsParams{
+		ActivityID: toPg(aid), Column2: state, OrganizationID: toPg(oc.OrgID), Column4: toPg(assignee)})
 }
 
 func (s *Service) MyActionItems(ctx context.Context, userID uuid.UUID) ([]db.ActionItems, error) {

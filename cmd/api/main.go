@@ -32,6 +32,7 @@ import (
 	"github.com/jedafe/oga9/internal/events"
 	"github.com/jedafe/oga9/internal/finance"
 	"github.com/jedafe/oga9/internal/handler"
+	"github.com/jedafe/oga9/internal/license"
 	"github.com/jedafe/oga9/internal/mailer"
 	"github.com/jedafe/oga9/internal/middleware"
 	"github.com/jedafe/oga9/internal/obs"
@@ -155,7 +156,7 @@ func main() {
 	chatSvc.SetActivityGate(actSvc.ActivityInOrg)
 	chatSvc.SetVoiceProvider(cfg.LiveKitURL, cfg.LiveKitAPIKey, cfg.LiveKitAPISecret, cfg.VoiceJoinWindowSec)
 	chatH := handler.NewChatHandler(chatSvc, orgSvc)
-	wsGw := realtime.NewGateway(chatSvc, vk, cfg.BaseDomain)
+	wsGw := realtime.NewGateway(chatSvc, vk, cfg.BaseDomain, cfg.Env != "production")
 	// §15 platform control plane — provision pipeline + operator routes.
 	platSvc := platform.NewService(pool)
 	platSvc.SetStore(storage.New(cfg.UploadsDir)) // §13.06 async tenant exports
@@ -172,6 +173,24 @@ func main() {
 	taskDeps.Chat = chatSvc
 	taskDeps.Platform = platSvc
 	taskDeps.VoiceRoomMaxAgeHours = cfg.VoiceRoomMaxAgeHours
+	// §14.03: offline license check (signed file + grace, Rule 29).
+	licV, licErr := license.New(cfg.LicensePublicKey, cfg.LicenseFile, cfg.LicenseOfflineGraceDays)
+	if licErr != nil {
+		log.Fatalf("license: %v", licErr)
+	}
+	if st, f, err := licV.Check(); err != nil {
+		log.Printf("license: %v (status=%s)", err, st)
+	} else {
+		switch st {
+		case license.StatusGrace:
+			log.Printf("license: expired %s — offline grace %dd (deployment_id=%s)", f.ExpiresAt, cfg.LicenseOfflineGraceDays, f.DeploymentID)
+		case license.StatusExpired, license.StatusInvalid:
+			log.Printf("license: %s — deployment degraded per §09 matrix", st)
+		default:
+			log.Printf("license: %s", st)
+		}
+	}
+	taskDeps.License = licV
 	tasks.RegisterSweeps(taskDeps)
 	for taskType, h := range tasks.Handlers(taskDeps) {
 		mux.HandleFunc(taskType, h)
@@ -301,6 +320,7 @@ func main() {
 			r.With(middleware.RequirePlatformNode(pool, "platform.apps.view")).Get("/platform/apps", appsH.Registry)
 			r.With(middleware.RequirePlatformNode(pool, "platform.plans.view")).Get("/platform/plans", billH.Plans)
 			r.With(middleware.RequirePlatformNode(pool, "platform.licenses.issue")).Post("/platform/licenses", billH.IssueLicense)
+			r.With(middleware.RequirePlatformNode(pool, "platform.licenses.issue")).Get("/platform/licenses/{deployment_id}/file", billH.LicenseFile)
 			// §15 control plane
 			r.With(middleware.RequirePlatformNode(pool, "platform.tenants.manage")).Get("/platform/tenants", platH.Tenants)
 			r.With(middleware.RequirePlatformNode(pool, "platform.tenants.manage")).Get("/platform/tenants/{tenant_id}", platH.Tenant)

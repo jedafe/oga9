@@ -11,6 +11,25 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const checkpointProvision = `-- name: CheckpointProvision :exec
+UPDATE tenant_provisions SET tenant_id = $2, owner_user_id = $3
+WHERE request_id = $1
+`
+
+type CheckpointProvisionParams struct {
+	RequestID   string      `json:"request_id"`
+	TenantID    pgtype.UUID `json:"tenant_id"`
+	OwnerUserID pgtype.UUID `json:"owner_user_id"`
+}
+
+// Crash-safety checkpoint: record tenant/user ids the moment the first
+// provision tx commits, so a stale-lease reclaim RESUMES instead of
+// re-running the fresh tx into a slug conflict + orphan tenant.
+func (q *Queries) CheckpointProvision(ctx context.Context, arg CheckpointProvisionParams) error {
+	_, err := q.db.Exec(ctx, checkpointProvision, arg.RequestID, arg.TenantID, arg.OwnerUserID)
+	return err
+}
+
 const claimProvision = `-- name: ClaimProvision :one
 UPDATE tenant_provisions SET status='processing', completed_at=NULL, error=NULL,
   processing_started_at=now()
@@ -356,6 +375,23 @@ SELECT to_jsonb(t)::text FROM tenants t WHERE t.id = $1
 // the tenant-scoped dump; this header anchors the export document.
 func (q *Queries) ExportTenantRow(ctx context.Context, id pgtype.UUID) (string, error) {
 	row := q.db.QueryRow(ctx, exportTenantRow, id)
+	var column_1 string
+	err := row.Scan(&column_1)
+	return column_1, err
+}
+
+const exportTenantUserNotifications = `-- name: ExportTenantUserNotifications :one
+SELECT COALESCE(jsonb_agg(t),'[]'::jsonb)::text FROM notifications t
+WHERE t.organization_id IS NULL AND t.user_id IN (
+  SELECT m.user_id FROM organization_memberships m
+  WHERE m.organization_id = ANY($1::uuid[]))
+`
+
+// Notifications with NULL organization_id (platform/system-scoped rows)
+// still belong to tenant users — the scoped dump keys on the column so
+// they'd be missed without this pass.
+func (q *Queries) ExportTenantUserNotifications(ctx context.Context, orgIds []pgtype.UUID) (string, error) {
+	row := q.db.QueryRow(ctx, exportTenantUserNotifications, orgIds)
 	var column_1 string
 	err := row.Scan(&column_1)
 	return column_1, err

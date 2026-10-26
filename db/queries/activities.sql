@@ -107,9 +107,12 @@ VALUES (sqlc.arg(activity_id), sqlc.arg(assignee_id), sqlc.arg(title), sqlc.narg
 RETURNING *;
 
 -- name: ListActionItems :many
+-- $4 scopes the list to one assignee — §13 view_own: non-manage callers
+-- see only their own items.
 SELECT * FROM action_items WHERE activity_id = $1
   AND EXISTS (SELECT 1 FROM activities a WHERE a.id = action_items.activity_id AND a.organization_id = $3)
-  AND ($2::text = '' OR state = $2) ORDER BY created_at LIMIT 200;
+  AND ($2::text = '' OR state = $2)
+  AND ($4::uuid IS NULL OR assignee_id = $4) ORDER BY created_at LIMIT 200;
 
 -- name: MyActionItems :many
 -- /me/action-items — assigned to the user across orgs.

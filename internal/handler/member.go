@@ -4,6 +4,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/csv"
 	"encoding/json"
 	"errors"
@@ -399,7 +400,7 @@ func (h *MemberHandler) Import(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteErr(w, 500, "internal_error", "task build failed")
 		return
 	}
-	if _, err := h.queue.EnqueueContext(r.Context(), task); err != nil {
+	if _, err := h.queue.EnqueueContext(context.WithoutCancel(r.Context()), task); err != nil {
 		// The durable row exists — fail it visibly rather than stranding it
 		// at 'processing' until the stale-import sweep finds it.
 		_ = h.svc.FailImport(r.Context(), id, err.Error())
@@ -508,7 +509,7 @@ func (h *MemberHandler) ExportAsync(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteErr(w, 500, "internal_error", "task build failed")
 		return
 	}
-	if _, err := h.queue.EnqueueContext(r.Context(), task); err != nil {
+	if _, err := h.queue.EnqueueContext(context.WithoutCancel(r.Context()), task); err != nil {
 		httpx.WriteErr(w, 500, "internal_error", "export enqueue failed")
 		return
 	}

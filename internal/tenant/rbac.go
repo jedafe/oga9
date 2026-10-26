@@ -153,7 +153,7 @@ func (s *Service) CreateTerm(ctx context.Context, oc *OrgCtx, label string, star
 						return err
 					}
 				}
-				if err := events.Emit(ctx, q, oc.TenantID, oc.OrgID, "TermClosed", "term", fromPg(prev), oc.UserID, true,
+				if err := events.Emit(ctx, q, oc.TenantID, oc.OrgID, "TermEnded", "term", fromPg(prev), oc.UserID, true,
 					map[string]any{"term_id": fromPg(prev), "org_id": oc.OrgID, "reason": "superseded"}); err != nil {
 					return err
 				}
@@ -315,7 +315,7 @@ func (s *Service) CloseTerm(ctx context.Context, oc *OrgCtx, termID uuid.UUID) e
 				return err
 			}
 		}
-		return events.Emit(ctx, q, oc.TenantID, oc.OrgID, "TermClosed", "term", termID, oc.UserID, true,
+		return events.Emit(ctx, q, oc.TenantID, oc.OrgID, "TermEnded", "term", termID, oc.UserID, true,
 			map[string]any{"term_id": termID, "org_id": oc.OrgID})
 	})
 	for _, u := range appointees {

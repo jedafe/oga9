@@ -1,0 +1,63 @@
+# Ref: oga9-engineering/sections/09-deployment-editions.md — self-hosted
+# bundle: api+worker (one image) + postgres + valkey + migrate one-shot.
+# Control app excluded (ADR-018). Reverse proxy/TLS terminates upstream
+# (Caddy/nginx — see install.sh notes); license file mounts read-only.
+services:
+  migrate:
+    image: migrate/migrate:v4.18.3
+    command: ["-path", "/migrations", "-database", "postgres://oga9:${OGA9_DB_PASSWORD:?set OGA9_DB_PASSWORD}@postgres:5432/oga9?sslmode=disable", "up"]
+    # the release bundle ships ./migrations alongside this file
+    # (repo checkout: point OGA9_MIGRATIONS_DIR at db/migrations)
+    volumes: ["${OGA9_MIGRATIONS_DIR:-./migrations}:/migrations:ro"]
+    depends_on: { postgres: { condition: service_healthy } }
+    restart: "no"
+
+  api:
+    image: oga9:${OGA9_VERSION:-latest}
+    environment:
+      OGA9_ENV: production
+      OGA9_DATABASE_URL: postgres://oga9:${OGA9_DB_PASSWORD}@postgres:5432/oga9?sslmode=disable
+      OGA9_VALKEY_ADDR: valkey:6379
+      OGA9_JWT_SECRET: ${OGA9_JWT_SECRET:?set OGA9_JWT_SECRET}
+      OGA9_DATA_ENCRYPTION_KEY: ${OGA9_DATA_ENCRYPTION_KEY:-}
+      OGA9_BASE_DOMAIN: ${OGA9_BASE_DOMAIN:-localhost}
+      OGA9_BASE_URL: ${OGA9_BASE_URL:-http://localhost:8080}
+      OGA9_APP_URL: ${OGA9_APP_URL:-http://localhost:8080}
+      OGA9_TRUSTED_PROXIES: ${OGA9_TRUSTED_PROXIES:-}
+      OGA9_API_PORT: "8080"
+      OGA9_UPLOADS_DIR: /data/uploads
+      OGA9_LICENSE_FILE: ${OGA9_LICENSE_FILE:-/run/oga9/license.json}
+      OGA9_LICENSE_PUBLIC_KEY: ${OGA9_LICENSE_PUBLIC_KEY:-}
+      OGA9_LICENSE_OFFLINE_GRACE_DAYS: ${OGA9_LICENSE_OFFLINE_GRACE_DAYS:-30}
+      OGA9_SMTP_HOST: ${OGA9_SMTP_HOST:-localhost}
+      OGA9_SMTP_PORT: ${OGA9_SMTP_PORT:-25}
+      OGA9_MAIL_FROM: ${OGA9_MAIL_FROM:-noreply@localhost}
+    volumes:
+      - data:/data
+      - ${OGA9_LICENSE_FILE_HOST:-./license.json}:/run/oga9/license.json:ro
+    ports: ["${OGA9_BIND:-127.0.0.1:8080}:8080"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      valkey: { condition: service_started }
+      migrate: { condition: service_completed_successfully }
+    restart: unless-stopped
+
+  postgres:
+    image: pgvector/pgvector:pg18
+    environment:
+      POSTGRES_USER: oga9
+      POSTGRES_PASSWORD: ${OGA9_DB_PASSWORD}
+      POSTGRES_DB: oga9
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+    healthcheck: { test: ["CMD-SHELL", "pg_isready -U oga9"], interval: 5s, timeout: 5s, retries: 10 }
+    restart: unless-stopped
+
+  valkey:
+    image: valkey/valkey:8-alpine
+    volumes: ["valkeydata:/data"]
+    restart: unless-stopped
+
+volumes:
+  data:
+  pgdata:
+  valkeydata:

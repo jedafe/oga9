@@ -114,9 +114,15 @@ SELECT EXISTS (
 -- name: UserHasHealthyMembership :one
 -- §15 partial access: a user with a live membership in ANY non-suspended
 -- tenant keeps login; only fully-suspended users are blocked.
-SELECT EXISTS (
-  SELECT 1 FROM organization_memberships m
-  JOIN organizations o ON o.id = m.organization_id
-  JOIN tenants t ON t.id = o.tenant_id
-  WHERE m.user_id = $1 AND t.status <> 'suspended'
-    AND m.lifecycle_state NOT IN ('resigned','expelled','deceased'));
+SELECT NOT EXISTS (
+    -- no live memberships at all: a fresh user isn't a suspended-tenant
+    -- member — login must work.
+    SELECT 1 FROM organization_memberships m
+    WHERE m.user_id = $1
+      AND m.lifecycle_state NOT IN ('resigned','expelled','deceased'))
+  OR EXISTS (
+    SELECT 1 FROM organization_memberships m
+    JOIN organizations o ON o.id = m.organization_id
+    JOIN tenants t ON t.id = o.tenant_id
+    WHERE m.user_id = $1 AND t.status <> 'suspended'
+      AND m.lifecycle_state NOT IN ('resigned','expelled','deceased'));

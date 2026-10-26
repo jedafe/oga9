@@ -13,6 +13,13 @@ ON CONFLICT (request_id) DO NOTHING RETURNING *;
 -- name: GetProvision :one
 SELECT * FROM tenant_provisions WHERE request_id = $1;
 
+-- name: CheckpointProvision :exec
+-- Crash-safety checkpoint: record tenant/user ids the moment the first
+-- provision tx commits, so a stale-lease reclaim RESUMES instead of
+-- re-running the fresh tx into a slug conflict + orphan tenant.
+UPDATE tenant_provisions SET tenant_id = $2, owner_user_id = $3
+WHERE request_id = $1;
+
 -- name: FinishProvision :execrows
 UPDATE tenant_provisions SET status = $2, tenant_id = $3,
   organization_id = $4, owner_user_id = $5, error = $6, completed_at = now()
@@ -225,6 +232,15 @@ WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_schema = 'public'
     SELECT table_name FROM information_schema.columns
     WHERE table_schema = 'public' AND column_name = 'organization_id')
 ORDER BY 1;
+
+-- name: ExportTenantUserNotifications :one
+-- Notifications with NULL organization_id (platform/system-scoped rows)
+-- still belong to tenant users — the scoped dump keys on the column so
+-- they'd be missed without this pass.
+SELECT COALESCE(jsonb_agg(t),'[]'::jsonb)::text FROM notifications t
+WHERE t.organization_id IS NULL AND t.user_id IN (
+  SELECT m.user_id FROM organization_memberships m
+  WHERE m.organization_id = ANY(sqlc.arg(org_ids)::uuid[]));
 
 -- name: ExportOrgNotificationPrefs :one
 -- preferences are user-keyed (no scope column) — join through the org's

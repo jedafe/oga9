@@ -252,6 +252,56 @@ func (q *Queries) GetNotification(ctx context.Context, arg GetNotificationParams
 	return i, err
 }
 
+const getNotificationChannel = `-- name: GetNotificationChannel :one
+SELECT id, delivered_at FROM notifications
+WHERE user_id = $1 AND kind = $2 AND ref_id = $3 AND channel = $4
+`
+
+type GetNotificationChannelParams struct {
+	UserID  pgtype.UUID `json:"user_id"`
+	Kind    string      `json:"kind"`
+	RefID   pgtype.UUID `json:"ref_id"`
+	Channel string      `json:"channel"`
+}
+
+type GetNotificationChannelRow struct {
+	ID          pgtype.UUID        `json:"id"`
+	DeliveredAt pgtype.Timestamptz `json:"delivered_at"`
+}
+
+// email-channel dispatch state: the row's delivered_at decides whether a
+// retried fan-out re-enqueues (NULL = queued never landed → re-enqueue).
+func (q *Queries) GetNotificationChannel(ctx context.Context, arg GetNotificationChannelParams) (GetNotificationChannelRow, error) {
+	row := q.db.QueryRow(ctx, getNotificationChannel,
+		arg.UserID,
+		arg.Kind,
+		arg.RefID,
+		arg.Channel,
+	)
+	var i GetNotificationChannelRow
+	err := row.Scan(&i.ID, &i.DeliveredAt)
+	return i, err
+}
+
+const getNotificationForDelivery = `-- name: GetNotificationForDelivery :one
+SELECT n.id, n.organization_id, o.tenant_id FROM notifications n
+JOIN organizations o ON o.id = n.organization_id WHERE n.id = $1
+`
+
+type GetNotificationForDeliveryRow struct {
+	ID             pgtype.UUID `json:"id"`
+	OrganizationID pgtype.UUID `json:"organization_id"`
+	TenantID       pgtype.UUID `json:"tenant_id"`
+}
+
+// tenant_id joins through organizations — notifications has no tenant col.
+func (q *Queries) GetNotificationForDelivery(ctx context.Context, id pgtype.UUID) (GetNotificationForDeliveryRow, error) {
+	row := q.db.QueryRow(ctx, getNotificationForDelivery, id)
+	var i GetNotificationForDeliveryRow
+	err := row.Scan(&i.ID, &i.OrganizationID, &i.TenantID)
+	return i, err
+}
+
 const listAnnouncements = `-- name: ListAnnouncements :many
 SELECT id, organization_id, author_id, title, body, audience, state, published_at, created_at FROM announcements WHERE organization_id = $1
   AND ($2::text = '' OR state = $2)

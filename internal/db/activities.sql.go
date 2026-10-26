@@ -789,17 +789,26 @@ func (q *Queries) GuestCountByMember(ctx context.Context, arg GuestCountByMember
 const listActionItems = `-- name: ListActionItems :many
 SELECT id, activity_id, assignee_id, title, due_date, state, done_at, created_at FROM action_items WHERE activity_id = $1
   AND EXISTS (SELECT 1 FROM activities a WHERE a.id = action_items.activity_id AND a.organization_id = $3)
-  AND ($2::text = '' OR state = $2) ORDER BY created_at LIMIT 200
+  AND ($2::text = '' OR state = $2)
+  AND ($4::uuid IS NULL OR assignee_id = $4) ORDER BY created_at LIMIT 200
 `
 
 type ListActionItemsParams struct {
 	ActivityID     pgtype.UUID `json:"activity_id"`
 	Column2        string      `json:"column_2"`
 	OrganizationID pgtype.UUID `json:"organization_id"`
+	Column4        pgtype.UUID `json:"column_4"`
 }
 
+// $4 scopes the list to one assignee — §13 view_own: non-manage callers
+// see only their own items.
 func (q *Queries) ListActionItems(ctx context.Context, arg ListActionItemsParams) ([]ActionItems, error) {
-	rows, err := q.db.Query(ctx, listActionItems, arg.ActivityID, arg.Column2, arg.OrganizationID)
+	rows, err := q.db.Query(ctx, listActionItems,
+		arg.ActivityID,
+		arg.Column2,
+		arg.OrganizationID,
+		arg.Column4,
+	)
 	if err != nil {
 		return nil, err
 	}

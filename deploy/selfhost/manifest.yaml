@@ -1,0 +1,21 @@
+# Ref: oga9-engineering/sections/09-deployment-editions.md — bundle manifest:
+# pinned service versions for a release (§09 release discipline).
+bundle: oga9-selfhost
+version: "1.0.0"
+images:
+  oga9:     oga9:1.0.0           # api+worker+scheduler, built from /Dockerfile
+  postgres: pgvector/pgvector:pg18
+  valkey:   valkey/valkey:8-alpine
+  migrate:  migrate/migrate:v4.18.3
+contents:
+  - docker-compose.yml / .env.example / install.sh / upgrade.sh
+  - migrations/   # copied from db/migrations at release time
+  - license.json  # operator-provided signed file (empty {} = community)
+excluded:
+  - control-app                  # cloud-only (ADR-018)
+requires:
+  - OGA9_JWT_SECRET
+  - OGA9_DB_PASSWORD
+optional:
+  - OGA9_LICENSE_FILE_HOST + OGA9_LICENSE_PUBLIC_KEY  # premium license
+  - OGA9_DATA_ENCRYPTION_KEY / OGA9_SMTP_* / OGA9_LIVEKIT_*

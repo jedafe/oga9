@@ -2,6 +2,7 @@ package comms
 
 import (
 	"context"
+	"os"
 	"strings"
 	"testing"
 
@@ -23,7 +24,11 @@ type env struct {
 
 func testEnv(t *testing.T) *env {
 	t.Helper()
-	pool, err := pgxpool.New(context.Background(), "postgres://oga9:oga9@localhost:5434/oga9_test?sslmode=disable")
+	dsn := os.Getenv("OGA9_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("OGA9_TEST_DATABASE_URL not set")
+	}
+	pool, err := pgxpool.New(context.Background(), dsn)
 	if err != nil || pool.Ping(context.Background()) != nil {
 		t.Skip("test db unavailable")
 	}

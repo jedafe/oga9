@@ -84,6 +84,10 @@ type Querier interface {
 	// Guest check-in addresses the registration row directly (guests carry no
 	// membership_id) — still org-scoped through the parent activity.
 	CheckInByID(ctx context.Context, arg CheckInByIDParams) (EventRegistrations, error)
+	// Crash-safety checkpoint: record tenant/user ids the moment the first
+	// provision tx commits, so a stale-lease reclaim RESUMES instead of
+	// re-running the fresh tx into a slug conflict + orphan tenant.
+	CheckpointProvision(ctx context.Context, arg CheckpointProvisionParams) error
 	// atomic retry claim — 'failed' rows reclaim; 'processing' rows whose
 	// lease is older than 10min reclaim too. processing_started_at stamps
 	// each claim so staleness measures from the last claim, not row creation
@@ -270,6 +274,9 @@ type Querier interface {
 	// org must not mint a parallel application (the member applies through
 	// their account, or not at all).
 	ExistsOrgMemberByContact(ctx context.Context, arg ExistsOrgMemberByContactParams) (bool, error)
+	// the daily expiry sweep — rows past expiry not yet evented; each is
+	// marked in the same tx as its LicenseExpired emit (Rule 12).
+	ExpiredLicenses(ctx context.Context) ([]ExpiredLicensesRow, error)
 	ExpiredOpenDrives(ctx context.Context) ([]ExpiredOpenDrivesRow, error)
 	// org-scoped parents' children: rows keyed by FK to an org-scoped table
 	// without carrying the scope column themselves (chat_messages.channel_id,
@@ -287,6 +294,10 @@ type Querier interface {
 	// the tenant row itself + its non-secret control-plane rows come through
 	// the tenant-scoped dump; this header anchors the export document.
 	ExportTenantRow(ctx context.Context, id pgtype.UUID) (string, error)
+	// Notifications with NULL organization_id (platform/system-scoped rows)
+	// still belong to tenant users — the scoped dump keys on the column so
+	// they'd be missed without this pass.
+	ExportTenantUserNotifications(ctx context.Context, orgIds []pgtype.UUID) (string, error)
 	// minimal user projection for the export — never credentials or secrets
 	// (ADR-020 data minimization).
 	ExportTenantUsers(ctx context.Context, tenantID pgtype.UUID) (string, error)
@@ -345,6 +356,11 @@ type Querier interface {
 	GetMessage(ctx context.Context, arg GetMessageParams) (ChatMessages, error)
 	GetMinute(ctx context.Context, id pgtype.UUID) (Minutes, error)
 	GetNotification(ctx context.Context, arg GetNotificationParams) (Notifications, error)
+	// email-channel dispatch state: the row's delivered_at decides whether a
+	// retried fan-out re-enqueues (NULL = queued never landed → re-enqueue).
+	GetNotificationChannel(ctx context.Context, arg GetNotificationChannelParams) (GetNotificationChannelRow, error)
+	// tenant_id joins through organizations — notifications has no tenant col.
+	GetNotificationForDelivery(ctx context.Context, id pgtype.UUID) (GetNotificationForDeliveryRow, error)
 	GetObligation(ctx context.Context, arg GetObligationParams) (Obligations, error)
 	GetOrg(ctx context.Context, id pgtype.UUID) (GetOrgRow, error)
 	GetOrgSetting(ctx context.Context, arg GetOrgSettingParams) ([]byte, error)
@@ -422,12 +438,14 @@ type Querier interface {
 	IssueCard(ctx context.Context, arg IssueCardParams) (IssueCardRow, error)
 	JoinChannel(ctx context.Context, arg JoinChannelParams) error
 	JoinVoiceRoom(ctx context.Context, arg JoinVoiceRoomParams) error
-	LeaveVoiceRoom(ctx context.Context, arg LeaveVoiceRoomParams) error
+	LeaveVoiceRoom(ctx context.Context, arg LeaveVoiceRoomParams) (int64, error)
 	// Binds the applicant's new account — CAS on NULL so a raced bind can't
 	// steal the row; 0 rows = already linked, treat as consumed.
 	LinkApplicationUser(ctx context.Context, arg LinkApplicationUserParams) (int64, error)
 	LinkEntities(ctx context.Context, arg LinkEntitiesParams) error
 	LinkOAuthProvider(ctx context.Context, arg LinkOAuthProviderParams) error
+	// $4 scopes the list to one assignee — §13 view_own: non-manage callers
+	// see only their own items.
 	ListActionItems(ctx context.Context, arg ListActionItemsParams) ([]ActionItems, error)
 	// FOR UPDATE serializes activate/deactivate for a tenant — a sibling tx
 	// re-checks the dependency graph only after our commits (no lost-check race).
@@ -506,6 +524,9 @@ type Querier interface {
 	// session AND the operator identity — user-scoped read, live rows only.
 	LiveSupportSessionsForUser(ctx context.Context, targetUserID pgtype.UUID) ([]LiveSupportSessionsForUserRow, error)
 	LiveVoiceRooms(ctx context.Context, organizationID pgtype.UUID) ([]VoiceRooms, error)
+	// Serialize member-list mutations on the channel row (dm 2-seat cap) —
+	// two concurrent adds must not both pass the headcount.
+	LockChannel(ctx context.Context, id pgtype.UUID) (pgtype.UUID, error)
 	// Inserted FIRST inside the consumer's tx (§05 contract): 0 rows affected
 	// = already logged — the consumer body must be skipped, not replayed.
 	// The insert is the atomic dedupe check; the outer pre-check is a hint.
@@ -515,6 +536,7 @@ type Querier interface {
 	MarkAttendance(ctx context.Context, arg MarkAttendanceParams) error
 	MarkChannelRead(ctx context.Context, arg MarkChannelReadParams) error
 	MarkEventDispatched(ctx context.Context, id pgtype.UUID) error
+	MarkLicenseExpired(ctx context.Context, id pgtype.UUID) error
 	// the notifications:email worker stamps delivery after the send succeeds.
 	MarkNotificationDelivered(ctx context.Context, id pgtype.UUID) error
 	MarkNotificationRead(ctx context.Context, arg MarkNotificationReadParams) (int64, error)
@@ -730,7 +752,7 @@ type Querier interface {
 	UserHasAnyPlatformRole(ctx context.Context, userID pgtype.UUID) (bool, error)
 	// §15 partial access: a user with a live membership in ANY non-suspended
 	// tenant keeps login; only fully-suspended users are blocked.
-	UserHasHealthyMembership(ctx context.Context, userID pgtype.UUID) (bool, error)
+	UserHasHealthyMembership(ctx context.Context, userID pgtype.UUID) (pgtype.Bool, error)
 	// §15 impersonation scope: the target must actually belong to the tenant
 	// the operator is scoped to — the request's tenant_id is advisory only
 	// without a membership join proving it (Rule 24).

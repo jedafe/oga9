@@ -342,14 +342,15 @@ type LedgerEntries struct {
 }
 
 type Licenses struct {
-	ID           pgtype.UUID        `json:"id"`
-	TenantID     pgtype.UUID        `json:"tenant_id"`
-	DeploymentID string             `json:"deployment_id"`
-	Edition      string             `json:"edition"`
-	Entitlements []byte             `json:"entitlements"`
-	IssuedAt     pgtype.Timestamptz `json:"issued_at"`
-	ExpiresAt    pgtype.Timestamptz `json:"expires_at"`
-	Signature    []byte             `json:"signature"`
+	ID              pgtype.UUID        `json:"id"`
+	TenantID        pgtype.UUID        `json:"tenant_id"`
+	DeploymentID    string             `json:"deployment_id"`
+	Edition         string             `json:"edition"`
+	Entitlements    []byte             `json:"entitlements"`
+	IssuedAt        pgtype.Timestamptz `json:"issued_at"`
+	ExpiresAt       pgtype.Timestamptz `json:"expires_at"`
+	Signature       []byte             `json:"signature"`
+	ExpiredNotified bool               `json:"expired_notified"`
 }
 
 type MeetingAgendas struct {

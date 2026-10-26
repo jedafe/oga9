@@ -284,19 +284,30 @@ func (s *Service) DispatchAnnouncement(ctx context.Context, announcementID uuid.
 				// a channel='email' row tracks delivery — delivered_at is
 				// stamped by the notifications:email worker after send.
 				var nid pgtype.UUID
-				if exists, err := q.NotificationExists(ctx, db.NotificationExistsParams{
-					UserID: r.UserID, Kind: "announcement", RefID: a.ID, Channel: "email"}); err == nil && !exists {
-					if row, err := q.CreateNotification(ctx, db.CreateNotificationParams{
+				state, err := q.GetNotificationChannel(ctx, db.GetNotificationChannelParams{
+					UserID: r.UserID, Kind: "announcement", RefID: a.ID, Channel: "email"})
+				switch {
+				case errors.Is(err, pgx.ErrNoRows):
+					// fresh recipient — create the tracking row + enqueue.
+					row, err := q.CreateNotification(ctx, db.CreateNotificationParams{
 						UserID: r.UserID, OrganizationID: a.OrganizationID, Kind: "announcement",
 						Title: a.Title, Body: pgtype.Text{String: a.Body, Valid: true},
 						RefType: pgtype.Text{String: "announcement", Valid: true},
-						RefID:   a.ID, Channel: "email"}); err != nil {
+						RefID:   a.ID, Channel: "email"})
+					if err != nil {
 						return err
-					} else {
-						nid = row.ID
 					}
+					nid = row.ID
+				case err != nil:
+					return err
+				case !state.DeliveredAt.Valid:
+					// row exists but the email task never landed/succeeded —
+					// re-enqueue with the REAL id so delivery still tracks.
+					nid = state.ID
 				}
-				emails = append(emails, EmailTarget{NotificationID: fromPg(nid), To: r.Email})
+				if nid.Valid {
+					emails = append(emails, EmailTarget{NotificationID: fromPg(nid), To: r.Email})
+				}
 			}
 		}
 		return events.Emit(ctx, q, tenantID, fromPg(a.OrganizationID), "BroadcastQueued",
@@ -405,16 +416,18 @@ func (s *Service) notifyOnce(ctx context.Context, q *db.Queries, e events.Event,
 	if exists {
 		return nil
 	}
-	if _, err := q.CreateNotification(ctx, db.CreateNotificationParams{
+	row, err := q.CreateNotification(ctx, db.CreateNotificationParams{
 		UserID: toPg(userID), OrganizationID: toPg(e.OrganizationID), Kind: kind,
 		Title: title, Body: pgtype.Text{String: body, Valid: body != ""},
 		RefType: pgtype.Text{String: refType, Valid: true},
-		RefID:   refID, Channel: "in_app"}); err != nil {
+		RefID:   refID, Channel: "in_app"})
+	if err != nil {
 		return err
 	}
 	return events.Emit(ctx, q, e.TenantID, e.OrganizationID, "NotificationQueued",
-		"notification", fromPg(refID), e.ActorID, false,
-		map[string]any{"kind": kind, "user_id": userID, "source_event": e.Type})
+		"notification", fromPg(row.ID), e.ActorID, false,
+		map[string]any{"notification_id": fromPg(row.ID), "kind": kind,
+			"user_id": userID, "source_event": e.Type})
 }
 
 // memberUser resolves the membership in an event payload key to its user.

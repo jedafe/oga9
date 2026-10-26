@@ -3,6 +3,95 @@
 All notable changes to the OGA9 platform. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 entries reference engineering phases in `.oos/roadmaps/ROADMAP-BACKEND.md`.
 
+## Phase 14 — Self-Hosted Packaging (§09)
+
+- `Dockerfile`: multi-stage build → one `oga9:{version}` image serving
+  api+worker+scheduler; migrations + scripts baked in.
+- `deploy/selfhost/` bundle: compose (postgres+valkey+migrate one-shot
+  + api), `.env.example`, `manifest.yaml` (pinned image versions, §09
+  release discipline), `install.sh` + `upgrade.sh` (migrate-first,
+  then api restart) with reverse-proxy/TLS guidance in comments.
+- `internal/license`: deployment-side validator — signed file verifies
+  OFFLINE via ed25519 public key (`OGA9_LICENSE_PUBLIC_KEY` +
+  `OGA9_LICENSE_FILE`, Rule 29); statuses community|valid|grace|expired|
+  invalid with `license.offline_grace_days` (30d) warn window per the
+  §09 degradation matrix; `File.Entitlement` mirrors limits offline.
+- Startup check logs license posture; `license:renewal_reminder` handler
+  implemented (was a stub) — re-checks + warns in grace, errors degraded.
+- Config: `OGA9_LICENSE_FILE`, `OGA9_LICENSE_PUBLIC_KEY`,
+  `OGA9_LICENSE_OFFLINE_GRACE_DAYS` (Rule 3).
+- CI `selfhost-upgrade-test`: golang-migrate install + idempotent
+  re-upgrade on a scratch pg18 + image build (§14.04 one-release check).
+- Review-round corrections: `canonicalJSON` uses UseNumber so the
+  verify-side payload matches billing's signed bytes (float re-encode
+  would have broken signatures on literal numbers); `license:renewal_reminder`
+  is now enqueued daily by the tick (handler existed, nothing fired it);
+  `GET /platform/licenses/{deployment_id}/file` added — spec'd in §15 +
+  routes catalog — the signed-file distribution path IssueLicense lacked;
+  Dockerfile drops the pg15 client (can't dump pg18 — backups run via the
+  postgres service); compose reads migrations from `./migrations`
+  (`OGA9_MIGRATIONS_DIR` override) so the distributed bundle is
+  self-contained.
+- `internal/license` round-trip tests: valid/grace/expired/tampered/
+  community statuses + entitlement reads.
+- Deep event-catalog audit (213 catalogued events vs every `events.Emit`
+  call site): `DeploymentRegistered` now emits on deployment create;
+  `SupportSessionStarted`/`Ended` emit on impersonate start/end (sourced);
+  `LicenseRenewed` emits when re-issuing an existing deployment_id;
+  `EntitlementsRefreshed` emits after cache invalidation — and the
+  invalidate consumer now reacts to `LicenseRenewed` too (a renewal would
+  otherwise keep serving stale entitlements); `NotificationDelivered`
+  emits in the same tx as the `delivered_at` stamp (Rule 12).
+- Event-name reconciliation: `TermClosed` → `TermEnded` — §16 spec'd
+  `TermEnded` for term close ("all grants revoked, cache flushed,
+  TermEnded"); `TermClosed` existed only in the catalog (row merged into
+  `TermEnded` with the `{term_id,org_id}` payload).
+- `LicenseExpired` now emits: `licenses.expired_notified` flag (000165) +
+  `LicenseExpirySweep` on the daily tick — mark + emit in one tx (Rule
+  12); renewal resets the flag so the next expiry re-emits.
+- Catalog annotated: rows whose producer section isn't implemented are
+  RESERVED names (`DocumentRetired`, `MessageSent`, and the rest of the
+  post-MVP domains emit when their phase lands).
+
+### Fixed — Phase 10–13 review, round 2
+- Test suite used a hardcoded `localhost:5434/oga9_test` DSN — switched
+  to `OGA9_TEST_DATABASE_URL` (skip-if-unset), so the isolation suite and
+  the phase 10–13 module tests actually run in CI (Rule 15/13.01).
+- `tenant:provision` checkpoints `tenant_id`/`owner_user_id` to the
+  durable row right after the first tx — a crash can no longer strand a
+  'processing' row into a slug-conflict + orphan tenant on reclaim.
+- `notifications:dispatch` retry: email-channel dedupe now checks the
+  row's `delivered_at` — a retried fan-out re-enqueues only
+  never-delivered rows with their real id (was: duplicate emails with a
+  nil notification id).
+- WS gateway serialized conn writes (subscribe-goroutine error frames
+  raced the pub/sub fan-out writer) and localhost origins are dev-only.
+- `voice:room_sweep` handler now uses `OGA9_VOICE_ROOM_MAX_AGE_HOURS`
+  (was hardcoded 12, drifting from the tick path).
+- `VoiceNotePosted` emitted on kind=voice posts (was catalogued, never
+  produced); `NotificationQueued` now carries the notification id as
+  aggregate + payload (catalog shape).
+- `CreateChannel` validates unit-in-org and only accepts `unit_id` on
+  unit|committee kinds; dm seat cap serialized via FOR UPDATE inside the
+  join tx.
+- Fan-out enqueues use `context.WithoutCancel` (dispatch, upload process,
+  provision, tenant export, member import/export) — a client disconnect
+  can't drop the enqueue.
+- Daily sweep gate releases its `oga9:sweep:daily:*` key on failure so a
+  failed sweep retries next tick instead of waiting out the window.
+- `GET action-items` honors §13 view_own: non-manage callers see only
+  their own items; PATCH on a cancelled activity is
+  `invalid_state_transition` (was 404); `LeaveRoom` emits
+  `VoiceParticipantLeft` only when an open participant row existed;
+  fine assess/revoke failures log instead of vanishing.
+- Login: `UserHasHealthyMembership` no longer treats users with ZERO
+  memberships as tenant-suspended (fresh users couldn't log in), and
+  auth's `toPg` maps uuid.Nil → NULL (was inserting an all-zeros
+  support_session_id → FK violation on every login).
+- Tenant export adds NULL-org notifications of tenant users; the 15min
+  stuck-export lease is a named const; `platform.plans.view` added to
+  the permission catalog.
+
 ### Fixed — Phase 08–11 review
 - Registered `notifications:dispatch`, `notifications:email`, and
   `documents:process_upload` in the task registry — the handlers existed

@@ -19,7 +19,7 @@ INSERT INTO voice_room_participants (room_id, membership_id)
 VALUES ($1, $2)
 ON CONFLICT (room_id, membership_id, joined_at) DO NOTHING;
 
--- name: LeaveVoiceRoom :exec
+-- name: LeaveVoiceRoom :execrows
 UPDATE voice_room_participants SET left_at = now()
 WHERE room_id = $1 AND membership_id = $2 AND left_at IS NULL;
 

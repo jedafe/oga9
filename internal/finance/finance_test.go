@@ -16,7 +16,11 @@ import (
 
 func testSvc(t *testing.T) (*Service, *tenant.Service, *pgxpool.Pool) {
 	t.Helper()
-	pool, err := pgxpool.New(context.Background(), "postgres://oga9:oga9@localhost:5434/oga9_test?sslmode=disable")
+	dsn := os.Getenv("OGA9_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("OGA9_TEST_DATABASE_URL not set")
+	}
+	pool, err := pgxpool.New(context.Background(), dsn)
 	if err != nil {
 		t.Skip("test db unavailable")
 	}

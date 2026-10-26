@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"testing"
 	"time"
 
@@ -28,7 +29,11 @@ func injectUser(uid uuid.UUID, h http.HandlerFunc) http.HandlerFunc {
 
 func TestGatewaySubscribeFlow(t *testing.T) {
 	ctx := context.Background()
-	pool, err := pgxpool.New(ctx, "postgres://oga9:oga9@localhost:5434/oga9_test?sslmode=disable")
+	dsn := os.Getenv("OGA9_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("OGA9_TEST_DATABASE_URL not set")
+	}
+	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil || pool.Ping(ctx) != nil {
 		t.Skip("test db unavailable")
 	}
@@ -55,7 +60,7 @@ func TestGatewaySubscribeFlow(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	gw := NewGateway(chatSvc, vk, "oga9.com")
+	gw := NewGateway(chatSvc, vk, "oga9.com", true)
 	srv := httptest.NewServer(http.HandlerFunc(injectUser(uid, gw.ServeWS)))
 	defer srv.Close()
 

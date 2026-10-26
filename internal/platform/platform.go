@@ -206,6 +206,18 @@ func (s *Service) Provision(ctx context.Context, in ProvisionRequest, actor uuid
 			RequestID: in.RequestID, Status: "failed", Error: pgText(err.Error())})
 		return uuid.Nil, uuid.Nil, "failed", err
 	}
+	if resumed == nil {
+		// Checkpoint the committed ids NOW — a crash before FinishProvision
+		// must let the stale-lease reclaim RESUME from these, not re-run
+		// the fresh tx into a slug conflict + orphan tenant.
+		if err := s.q.CheckpointProvision(ctx, db.CheckpointProvisionParams{
+			RequestID: in.RequestID, TenantID: toPg(tenantID), OwnerUserID: toPg(userID)}); err != nil {
+			_, _ = s.q.FinishProvision(ctx, db.FinishProvisionParams{
+				RequestID: in.RequestID, Status: "failed",
+				TenantID: toPg(tenantID), OwnerUserID: toPg(userID), Error: pgText(err.Error())})
+			return tenantID, uuid.Nil, "failed", err
+		}
+	}
 
 	if resumed != nil && resumed.OrganizationID.Valid {
 		orgID = fromPg(resumed.OrganizationID) // org committed last run too
@@ -399,6 +411,12 @@ func (s *Service) CreateDeployment(ctx context.Context, tenantID uuid.UUID, kind
 			return err
 		}
 		row = r
+		if err := events.Emit(ctx, q, tenantID, uuid.Nil, "DeploymentRegistered",
+			"deployment", fromPg(r.ID), actor, true,
+			map[string]any{"deployment_id": fromPg(r.ID), "tenant_id": tenantID,
+				"kind": kind, "edition": edition}); err != nil {
+			return err
+		}
 		return s.audit(ctx, q, tenantID, actor, "deployment.create", "deployment", fromPg(r.ID), nil)
 	})
 	if err != nil {
@@ -445,7 +463,10 @@ func (s *Service) Impersonate(ctx context.Context, operatorID, tenantID uuid.UUI
 			return err
 		}
 		sid = fromPg(ss.ID)
-		return nil
+		return events.Emit(ctx, q, tenantID, uuid.Nil, "SupportSessionStarted",
+			"support_session", sid, operatorID, true,
+			map[string]any{"session_id": sid, "tenant_id": tenantID,
+				"agent_id": operatorID})
 	})
 	if err != nil {
 		return uuid.Nil, "", time.Time{}, err
@@ -470,6 +491,11 @@ func (s *Service) ResolveImpersonation(ctx context.Context, sid uuid.UUID) (*db.
 
 func (s *Service) EndImpersonation(ctx context.Context, sid, actor uuid.UUID) error {
 	return s.withTx(ctx, func(q *db.Queries) error {
+		// fetch the session's tenant for the event row before ending it.
+		ss, err := q.GetSupportSession(ctx, toPg(sid))
+		if err != nil {
+			return ErrSessionExpired
+		}
 		n, err := q.EndSupportSession(ctx, toPg(sid))
 		if err != nil {
 			return err
@@ -480,6 +506,11 @@ func (s *Service) EndImpersonation(ctx context.Context, sid, actor uuid.UUID) er
 		// explicit end must cut access NOW — revoke the minted session row
 		// rather than waiting out its TTL.
 		if _, err := q.RevokeSessionsForSupport(ctx, toPg(sid)); err != nil {
+			return err
+		}
+		if err := events.Emit(ctx, q, fromPg(ss.TenantID), uuid.Nil, "SupportSessionEnded",
+			"support_session", sid, actor, true,
+			map[string]any{"session_id": sid}); err != nil {
 			return err
 		}
 		return s.audit(ctx, q, uuid.Nil, actor, "impersonation.end", "support_session", sid, nil)
@@ -661,6 +692,10 @@ func (s *Service) buildExport(ctx context.Context, tenantID uuid.UUID) ([]byte, 
 	if err != nil {
 		return nil, err
 	}
+	userNotifs, err := s.q.ExportTenantUserNotifications(ctx, orgArr)
+	if err != nil {
+		return nil, err
+	}
 	tnRow, err := s.q.ExportTenantRow(ctx, toPg(tenantID))
 	if err != nil {
 		return nil, err
@@ -673,10 +708,15 @@ func (s *Service) buildExport(ctx context.Context, tenantID uuid.UUID) ([]byte, 
 		"org_tables":               orgTables,
 		"users":                    json.RawMessage(users),
 		"notification_preferences": json.RawMessage(prefs),
+		"user_notifications":       json.RawMessage(userNotifs),
 	})
 }
 
 // ---------- async tenant export (tenant:export worker — §13.06) ----------
+
+// exportStaleAfter is the worker lease for a 'processing' export — past it,
+// DownloadTenantExport marks the row failed instead of 202-ing forever.
+const exportStaleAfter = 15 * time.Minute
 
 // RequestTenantExport audits + creates the durable row; the handler
 // enqueues tenant:export {export_id} (Rule 8 — the request never blocks
@@ -755,7 +795,7 @@ func (s *Service) DownloadTenantExport(ctx context.Context, tenantID, exportID u
 	// self-heal: a row stuck 'processing' past the worker lease means the
 	// enqueue failed after commit — mark it failed so the client sees a
 	// terminal state, not an eternal 202.
-	if e.Status == "processing" && time.Since(e.CreatedAt.Time) > 15*time.Minute {
+	if e.Status == "processing" && time.Since(e.CreatedAt.Time) > exportStaleAfter {
 		_ = s.q.MarkTenantExportFailed(ctx, db.MarkTenantExportFailedParams{
 			ID: e.ID, Error: pgText("export never completed — worker never ran")})
 		return nil, "failed", nil

@@ -278,6 +278,21 @@ func (h *BillingHandler) ValidateLicense(w http.ResponseWriter, r *http.Request)
 	}
 }
 
+// LicenseFile — GET /platform/licenses/{deployment_id}/file: the signed
+// document a deployment mounts at OGA9_LICENSE_FILE (§14/§15 catalog).
+func (h *BillingHandler) LicenseFile(w http.ResponseWriter, r *http.Request) {
+	b, err := h.svc.LicenseFile(r.Context(), chi.URLParam(r, "deployment_id"))
+	switch {
+	case err == nil:
+		var doc json.RawMessage = b
+		httpx.WriteData(w, 200, doc)
+	case errors.Is(err, billing.ErrLicenseNotFound):
+		httpx.WriteErr(w, 404, "license_not_found", "unknown deployment")
+	default:
+		httpx.WriteErr(w, 500, "internal_error", "license file failed")
+	}
+}
+
 // Webhook — Rule 9: verify signature → durable record → enqueue → return
 // fast. Provider signature is HMAC-SHA256 (hex) over the raw body in the
 // X-Webhook-Signature header.

@@ -2,6 +2,7 @@
 package handler
 
 import (
+	"context"
 	"errors"
 	"io"
 	"log"
@@ -73,7 +74,7 @@ func (h *CommsHandler) CreateAnnouncement(w http.ResponseWriter, r *http.Request
 	if !req.Draft {
 		// Rule 8: fan-out is fire-and-forget — enqueue, never block.
 		if t, err := tasks.NewDispatchTask(id); err == nil {
-			_, _ = h.queue.EnqueueContext(r.Context(), t)
+			_, _ = h.queue.EnqueueContext(context.WithoutCancel(r.Context()), t)
 		}
 	}
 	httpx.WriteData(w, 201, map[string]any{"id": id, "state": map[bool]string{true: "draft", false: "published"}[req.Draft]})
@@ -94,7 +95,7 @@ func (h *CommsHandler) PublishAnnouncement(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	if t, err := tasks.NewDispatchTask(aid); err == nil {
-		_, _ = h.queue.EnqueueContext(r.Context(), t)
+		_, _ = h.queue.EnqueueContext(context.WithoutCancel(r.Context()), t)
 	}
 	httpx.WriteData(w, 200, map[string]any{"id": aid, "state": "published"})
 }
@@ -193,7 +194,7 @@ func (h *CommsHandler) UploadDocument(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if t, err := tasks.NewDocProcessTask(id); err == nil {
-		_, _ = h.queue.EnqueueContext(r.Context(), t)
+		_, _ = h.queue.EnqueueContext(context.WithoutCancel(r.Context()), t)
 	}
 	httpx.WriteData(w, 201, map[string]any{"id": id})
 }
@@ -295,7 +296,7 @@ func (h *CommsHandler) NewVersion(w http.ResponseWriter, r *http.Request) {
 	}
 	// new blobs go through the same upload pipeline (MIME/executable sniff)
 	if t, err := tasks.NewDocProcessTask(did); err == nil {
-		_, _ = h.queue.EnqueueContext(r.Context(), t)
+		_, _ = h.queue.EnqueueContext(context.WithoutCancel(r.Context()), t)
 	}
 	httpx.WriteData(w, 201, map[string]any{"document_id": did, "version": ver})
 }

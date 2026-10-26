@@ -94,3 +94,31 @@ jobs:
         run: |
           psql "$OGA9_DATABASE_URL" -v ON_ERROR_STOP=1 -tAc \
             "SELECT count(*) FROM users WHERE email='restore-test@oga9.local'" | grep -qx 1
+
+  # §14.04 self-host packaging validation: the bundle's golang-migrate path
+  # (not raw psql) must apply cleanly on install AND no-op on re-upgrade,
+  # and the oga9 image must build.
+  selfhost-upgrade-test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg18
+        env:
+          POSTGRES_USER: oga9
+          POSTGRES_PASSWORD: oga9
+          POSTGRES_DB: oga9
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U oga9"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+        with: { submodules: false }
+      - name: install (golang-migrate up — self-host path)
+        run: |
+          docker run --rm --network host             -v "$PWD/db/migrations:/migrations:ro"             migrate/migrate:v4.18.3             -path /migrations             -database "postgres://oga9:oga9@localhost:5432/oga9?sslmode=disable"             up
+      - name: upgrade (re-run migrate — must no-op, not fail)
+        run: |
+          docker run --rm --network host             -v "$PWD/db/migrations:/migrations:ro"             migrate/migrate:v4.18.3             -path /migrations             -database "postgres://oga9:oga9@localhost:5432/oga9?sslmode=disable"             up
+      - name: image builds (oga9:{version})
+        run: docker build -t oga9:ci-test .

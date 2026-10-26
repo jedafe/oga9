@@ -471,21 +471,27 @@ func (q *Queries) UpdateUserPassword(ctx context.Context, arg UpdateUserPassword
 }
 
 const userHasHealthyMembership = `-- name: UserHasHealthyMembership :one
-SELECT EXISTS (
-  SELECT 1 FROM organization_memberships m
-  JOIN organizations o ON o.id = m.organization_id
-  JOIN tenants t ON t.id = o.tenant_id
-  WHERE m.user_id = $1 AND t.status <> 'suspended'
-    AND m.lifecycle_state NOT IN ('resigned','expelled','deceased'))
+SELECT NOT EXISTS (
+    -- no live memberships at all: a fresh user isn't a suspended-tenant
+    -- member — login must work.
+    SELECT 1 FROM organization_memberships m
+    WHERE m.user_id = $1
+      AND m.lifecycle_state NOT IN ('resigned','expelled','deceased'))
+  OR EXISTS (
+    SELECT 1 FROM organization_memberships m
+    JOIN organizations o ON o.id = m.organization_id
+    JOIN tenants t ON t.id = o.tenant_id
+    WHERE m.user_id = $1 AND t.status <> 'suspended'
+      AND m.lifecycle_state NOT IN ('resigned','expelled','deceased'))
 `
 
 // §15 partial access: a user with a live membership in ANY non-suspended
 // tenant keeps login; only fully-suspended users are blocked.
-func (q *Queries) UserHasHealthyMembership(ctx context.Context, userID pgtype.UUID) (bool, error) {
+func (q *Queries) UserHasHealthyMembership(ctx context.Context, userID pgtype.UUID) (pgtype.Bool, error) {
 	row := q.db.QueryRow(ctx, userHasHealthyMembership, userID)
-	var exists bool
-	err := row.Scan(&exists)
-	return exists, err
+	var column_1 pgtype.Bool
+	err := row.Scan(&column_1)
+	return column_1, err
 }
 
 const userRequiresMFA = `-- name: UserRequiresMFA :one

@@ -69,6 +69,17 @@ SELECT * FROM notifications WHERE id = $1 AND user_id = $2;
 SELECT EXISTS (SELECT 1 FROM notifications
   WHERE user_id = $1 AND kind = $2 AND ref_id = $3 AND channel = $4);
 
+-- name: GetNotificationChannel :one
+-- email-channel dispatch state: the row's delivered_at decides whether a
+-- retried fan-out re-enqueues (NULL = queued never landed → re-enqueue).
+SELECT id, delivered_at FROM notifications
+WHERE user_id = $1 AND kind = $2 AND ref_id = $3 AND channel = $4;
+
+-- name: GetNotificationForDelivery :one
+-- tenant_id joins through organizations — notifications has no tenant col.
+SELECT n.id, n.organization_id, o.tenant_id FROM notifications n
+JOIN organizations o ON o.id = n.organization_id WHERE n.id = $1;
+
 -- name: MarkNotificationDelivered :exec
 -- the notifications:email worker stamps delivery after the send succeeds.
 UPDATE notifications SET delivered_at = now() WHERE id = $1;

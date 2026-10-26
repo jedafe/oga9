@@ -89,6 +89,39 @@ func (q *Queries) CreateSubscription(ctx context.Context, arg CreateSubscription
 	return id, err
 }
 
+const expiredLicenses = `-- name: ExpiredLicenses :many
+SELECT id, tenant_id, deployment_id FROM licenses
+WHERE expires_at <= now() AND NOT expired_notified LIMIT 200
+`
+
+type ExpiredLicensesRow struct {
+	ID           pgtype.UUID `json:"id"`
+	TenantID     pgtype.UUID `json:"tenant_id"`
+	DeploymentID string      `json:"deployment_id"`
+}
+
+// the daily expiry sweep — rows past expiry not yet evented; each is
+// marked in the same tx as its LicenseExpired emit (Rule 12).
+func (q *Queries) ExpiredLicenses(ctx context.Context) ([]ExpiredLicensesRow, error) {
+	rows, err := q.db.Query(ctx, expiredLicenses)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ExpiredLicensesRow
+	for rows.Next() {
+		var i ExpiredLicensesRow
+		if err := rows.Scan(&i.ID, &i.TenantID, &i.DeploymentID); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const getLatestLicense = `-- name: GetLatestLicense :one
 SELECT id, entitlements, expires_at FROM licenses
 WHERE tenant_id = $1::uuid AND expires_at > now()
@@ -110,13 +143,15 @@ func (q *Queries) GetLatestLicense(ctx context.Context, tenantID pgtype.UUID) (G
 }
 
 const getLicenseByDeployment = `-- name: GetLicenseByDeployment :one
-SELECT id, tenant_id, entitlements, expires_at, signature FROM licenses
+SELECT id, tenant_id, deployment_id, edition, entitlements, expires_at, signature FROM licenses
 WHERE deployment_id = $1 ORDER BY issued_at DESC LIMIT 1
 `
 
 type GetLicenseByDeploymentRow struct {
 	ID           pgtype.UUID        `json:"id"`
 	TenantID     pgtype.UUID        `json:"tenant_id"`
+	DeploymentID string             `json:"deployment_id"`
+	Edition      string             `json:"edition"`
 	Entitlements []byte             `json:"entitlements"`
 	ExpiresAt    pgtype.Timestamptz `json:"expires_at"`
 	Signature    []byte             `json:"signature"`
@@ -128,6 +163,8 @@ func (q *Queries) GetLicenseByDeployment(ctx context.Context, deploymentID strin
 	err := row.Scan(
 		&i.ID,
 		&i.TenantID,
+		&i.DeploymentID,
+		&i.Edition,
 		&i.Entitlements,
 		&i.ExpiresAt,
 		&i.Signature,
@@ -346,7 +383,7 @@ VALUES ($1::uuid, $2, $3,
 ON CONFLICT (deployment_id) DO UPDATE SET
   tenant_id = EXCLUDED.tenant_id, edition = EXCLUDED.edition,
   entitlements = EXCLUDED.entitlements, expires_at = EXCLUDED.expires_at,
-  signature = EXCLUDED.signature, issued_at = now()
+  signature = EXCLUDED.signature, issued_at = now(), expired_notified = false
 RETURNING id
 `
 
@@ -565,6 +602,15 @@ func (q *Queries) ListTenantsWithNode(ctx context.Context, arg ListTenantsWithNo
 		return nil, err
 	}
 	return items, nil
+}
+
+const markLicenseExpired = `-- name: MarkLicenseExpired :exec
+UPDATE licenses SET expired_notified = true WHERE id = $1
+`
+
+func (q *Queries) MarkLicenseExpired(ctx context.Context, id pgtype.UUID) error {
+	_, err := q.db.Exec(ctx, markLicenseExpired, id)
+	return err
 }
 
 const markWebhookProcessed = `-- name: MarkWebhookProcessed :execrows

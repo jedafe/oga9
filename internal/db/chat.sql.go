@@ -451,6 +451,19 @@ func (q *Queries) JoinChannel(ctx context.Context, arg JoinChannelParams) error 
 	return err
 }
 
+const lockChannel = `-- name: LockChannel :one
+SELECT id FROM chat_channels WHERE id = $1 FOR UPDATE
+`
+
+// Serialize member-list mutations on the channel row (dm 2-seat cap) —
+// two concurrent adds must not both pass the headcount.
+func (q *Queries) LockChannel(ctx context.Context, id pgtype.UUID) (pgtype.UUID, error) {
+	row := q.db.QueryRow(ctx, lockChannel, id)
+	var id_2 pgtype.UUID
+	err := row.Scan(&id_2)
+	return id_2, err
+}
+
 const markChannelRead = `-- name: MarkChannelRead :exec
 INSERT INTO chat_read_states (channel_id, membership_id, last_read_message_id, updated_at)
 VALUES ($1, $2, $3, now())

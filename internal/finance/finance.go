@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/google/uuid"
@@ -1105,7 +1106,7 @@ func (s *Service) orgSettingBool(ctx context.Context, orgID uuid.UUID, key strin
 // same period ("attendance:{activity}" scopes per meeting; "YYYY-MM"
 // scopes the monthly defaulter fine).
 func (s *Service) assessFine(ctx context.Context, tid, orgID, mid uuid.UUID, amount int64, currency, period string) {
-	_ = s.withTx(ctx, func(q *db.Queries) error {
+	if err := s.withTx(ctx, func(q *db.Queries) error {
 		ct, err := q.EnsureContributionType(ctx, db.EnsureContributionTypeParams{
 			OrganizationID: toPg(orgID), Key: "fine", Label: "Defaulter fine", Kind: "penalty"})
 		if err != nil {
@@ -1131,7 +1132,12 @@ func (s *Service) assessFine(ctx context.Context, tid, orgID, mid uuid.UUID, amo
 		return events.Emit(ctx, q, tid, orgID, "FineAssessed", "obligation",
 			fromPg(ob.ID), uuid.Nil, true,
 			map[string]any{"obligation_id": fromPg(ob.ID), "member_id": mid, "kind": "penalty"})
-	})
+	}); err != nil {
+		// post-commit seam: a failed fine write must not be silent — the
+		// attendance sheet already committed, so log loudly for the sweep
+		// of durable AttendanceRecorded events to reconcile.
+		slog.Error("assess_fine_failed", "org", orgID, "member", mid, "period", period, "err", err)
+	}
 }
 
 // RefreshDuesStanding derives good/poor from live overdue obligations —
@@ -1442,7 +1448,7 @@ func (s *Service) AssessFine(ctx context.Context, orgID, memberID uuid.UUID, amo
 // the fine). Waives open 'fine' obligations for the member+period —
 // already-paid fines stay (a refund is a separate decision).
 func (s *Service) RevokeFine(ctx context.Context, orgID, memberID uuid.UUID, period string) {
-	_ = s.withTx(ctx, func(q *db.Queries) error {
+	if err := s.withTx(ctx, func(q *db.Queries) error {
 		ids, err := q.WaiveFineForPeriod(ctx, db.WaiveFineForPeriodParams{
 			MembershipID: toPg(memberID), OrganizationID: toPg(orgID),
 			PeriodLabel: pgtype.Text{String: period, Valid: true}})
@@ -1457,5 +1463,7 @@ func (s *Service) RevokeFine(ctx context.Context, orgID, memberID uuid.UUID, per
 			}
 		}
 		return nil
-	})
+	}); err != nil {
+		slog.Error("revoke_fine_failed", "org", orgID, "member", memberID, "period", period, "err", err)
+	}
 }

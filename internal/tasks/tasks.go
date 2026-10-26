@@ -25,6 +25,7 @@ import (
 	"github.com/jedafe/oga9/internal/db"
 	"github.com/jedafe/oga9/internal/events"
 	"github.com/jedafe/oga9/internal/finance"
+	"github.com/jedafe/oga9/internal/license"
 	"github.com/jedafe/oga9/internal/mailer"
 	"github.com/jedafe/oga9/internal/platform"
 	"github.com/jedafe/oga9/internal/tenant"
@@ -153,6 +154,7 @@ type Deps struct {
 	Chat                 *chat.Service
 	Platform             *platform.Service
 	VoiceRoomMaxAgeHours int
+	License              *license.Validator
 }
 
 // tickSweeps run inside each scheduler:tick — later phases append their
@@ -179,7 +181,13 @@ func dailyGate(vk valkey.Client, name string, fn func(context.Context) error) fu
 		if !claimed {
 			return nil // another tick already ran this window
 		}
-		return fn(ctx)
+		if err := fn(ctx); err != nil {
+			// release the gate so the next tick retries — a failed sweep
+			// must not wait out the whole 24h window.
+			_ = vk.Do(ctx, vk.B().Del().Key("oga9:sweep:daily:"+name).Build()).Error()
+			return err
+		}
+		return nil
 	}
 }
 
@@ -232,6 +240,24 @@ func RegisterSweeps(d Deps) {
 			return nil
 		}
 		_, err := d.Activities.GenerateRecurrences(ctx, 35)
+		return err
+	}))
+	// §14.03 daily license posture check — enqueue the catalogued task so
+	// it lands in queue metrics and retries like every other job.
+	OnTick(dailyGate(d.Valkey, "license_reminder", func(ctx context.Context) error {
+		if d.Queue == nil {
+			return nil
+		}
+		_, err := d.Queue.EnqueueContext(ctx, asynq.NewTask(TypeLicenseReminder, nil))
+		return err
+	}))
+	// License expiry — emits LicenseExpired once per past-due license
+	// (sourced §15 degrade signal; renewal resets the marker).
+	OnTick(dailyGate(d.Valkey, "license_expiry", func(ctx context.Context) error {
+		if d.Billing == nil {
+			return nil
+		}
+		_, err := d.Billing.LicenseExpirySweep(ctx)
 		return err
 	}))
 	// §24 chat & voice periodic jobs. Retention is daily per the catalog
@@ -322,11 +348,11 @@ func Handlers(d Deps) map[string]asynq.HandlerFunc {
 		// §24 chat & voice sweeps.
 		TypePresenceSweep:  presenceSweep(d.Valkey),
 		TypeRetentionSweep: chatRetention(d.Chat),
-		TypeRoomSweep:      roomSweep(d.Chat),
+		TypeRoomSweep:      roomSweep(d.Chat, d.VoiceRoomMaxAgeHours),
 		// Stubs — registered now (catalog-reserved), implemented when their
 		// sections land: license 14; provision 12; provider webhooks when
 		// gateways land (ADR-012 deferred surface).
-		TypeLicenseReminder:         stub(TypeLicenseReminder, "Phase 14"),
+		TypeLicenseReminder:         licenseReminder(d.License),
 		TypeTenantProvision:         tenantProvision(d.Platform),
 		TypeTenantExport:            tenantExport(d.Platform),
 		TypePaymentsProviderWebhook: stub(TypePaymentsProviderWebhook, "payment gateways (ADR-012)"),
@@ -671,7 +697,22 @@ func notifEmail(m *mailer.Mailer, pool *pgxpool.Pool) asynq.HandlerFunc {
 			return err // asynq retries — delivered_at stays unset until success
 		}
 		if id, err := uuid.Parse(p.NotificationID); err == nil {
-			_ = q.MarkNotificationDelivered(ctx, pgtype.UUID{Bytes: id, Valid: true})
+			// stamp + NotificationDelivered in one tx (Rule 12). A stamp
+			// failure logs but does NOT retry — the mail already went out
+			// and a retry would double-send.
+			if tx, err := pool.Begin(ctx); err == nil {
+				tq := q.WithTx(tx)
+				if err := tq.MarkNotificationDelivered(ctx, pgtype.UUID{Bytes: id, Valid: true}); err == nil {
+					if n, err := tq.GetNotificationForDelivery(ctx, pgtype.UUID{Bytes: id, Valid: true}); err == nil {
+						_ = events.Emit(ctx, tq, uuid.UUID(n.TenantID.Bytes), uuid.UUID(n.OrganizationID.Bytes),
+							"NotificationDelivered", "notification", id, uuid.Nil, false,
+							map[string]any{"notification_id": id})
+					}
+				}
+				if err := tx.Commit(ctx); err != nil {
+					slog.Warn("notif_delivery_stamp", "id", id, "err", err)
+				}
+			}
 		}
 		return nil
 	}
@@ -749,12 +790,13 @@ func chatRetention(svc *chat.Service) asynq.HandlerFunc {
 
 // roomSweep — voice:room_sweep {}: orphaned 'live' rooms (crash, never
 // ended) close past the age cap; emits VoiceRoomEnded per room.
-func roomSweep(svc *chat.Service) asynq.HandlerFunc {
+// maxAgeHours comes from OGA9_VOICE_ROOM_MAX_AGE_HOURS (Rule 3).
+func roomSweep(svc *chat.Service, maxAgeHours int) asynq.HandlerFunc {
 	return func(ctx context.Context, t *asynq.Task) error {
 		if svc == nil {
 			return nil
 		}
-		return svc.RoomSweep(ctx, 12)
+		return svc.RoomSweep(ctx, maxAgeHours)
 	}
 }
 
@@ -766,6 +808,27 @@ func NewProvisionTask(in platform.ProvisionRequest) (*asynq.Task, error) {
 		return nil, err
 	}
 	return asynq.NewTask(TypeTenantProvision, b, asynq.Queue("critical"), asynq.MaxRetry(3)), nil
+}
+
+// licenseReminder — license:renewal_reminder (daily via tick + task):
+// re-checks the signed file offline and warns inside the grace window
+// (§09 degradation matrix — refresh when reachable, warn when not).
+func licenseReminder(v *license.Validator) asynq.HandlerFunc {
+	return func(ctx context.Context, t *asynq.Task) error {
+		if v == nil {
+			return nil
+		}
+		st, f, err := v.Check()
+		switch {
+		case err != nil:
+			slog.Warn("license_check", "status", st, "err", err)
+		case st == license.StatusGrace:
+			slog.Warn("license_grace", "expires_at", f.ExpiresAt, "deployment_id", f.DeploymentID)
+		case st == license.StatusExpired || st == license.StatusInvalid:
+			slog.Error("license_degraded", "status", st, "deployment_id", f.DeploymentID)
+		}
+		return nil
+	}
 }
 
 // tenantProvision runs the §15 pipeline; a conflict means another worker

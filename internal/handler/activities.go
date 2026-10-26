@@ -256,7 +256,13 @@ func (h *ActivitiesHandler) Items(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteErr(w, 400, "validation_failed", "activity_id must be a uuid")
 		return
 	}
-	list, err := h.svc.ActionItems(r.Context(), oc, aid, r.URL.Query().Get("state"))
+	// §13: org.action_items.manage sees the whole sheet; everyone else
+	// sees only their own items (view_own).
+	var assignee uuid.UUID
+	if !h.org.HasPermission(r.Context(), oc.UserID, oc.OrgID, "org.action_items.manage") {
+		assignee = oc.MembershipID
+	}
+	list, err := h.svc.ActionItems(r.Context(), oc, aid, r.URL.Query().Get("state"), assignee)
 	if err != nil {
 		actErr(w, err)
 		return

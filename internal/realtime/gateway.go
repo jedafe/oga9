@@ -28,9 +28,13 @@ type Gateway struct {
 
 // NewGateway — origins are the allowed WS Origin patterns (base domain +
 // subdomains); without them any site could ride a member's session.
-func NewGateway(c *chat.Service, vk valkey.Client, baseDomain string) *Gateway {
-	return &Gateway{chat: c, vk: vk,
-		origins: []string{baseDomain, "*." + baseDomain, "localhost", "localhost:*", "127.0.0.1", "127.0.0.1:*"}}
+// devOrigins adds localhost/127.0.0.1 — only for non-prod deployments.
+func NewGateway(c *chat.Service, vk valkey.Client, baseDomain string, devOrigins bool) *Gateway {
+	origins := []string{baseDomain, "*." + baseDomain}
+	if devOrigins {
+		origins = append(origins, "localhost", "localhost:*", "127.0.0.1", "127.0.0.1:*")
+	}
+	return &Gateway{chat: c, vk: vk, origins: origins}
 }
 
 // ServeWS — GET /ws: upgrade, then accept {"subscribe":"<channel_uuid>",
@@ -46,10 +50,20 @@ func (g *Gateway) ServeWS(w http.ResponseWriter, r *http.Request) {
 	defer c.Close(websocket.StatusNormalClosure, "")
 
 	userID := middleware.UserID(ctx) // session middleware ran before upgrade
-	_ = userID
 
 	subs := map[uuid.UUID]uuid.UUID{} // channel → membership the client proved
 	var subsMu sync.Mutex
+	// websocket.Conn is NOT safe for concurrent writers — the subscribe
+	// goroutine (error frames) and the pub/sub callback (fan-out) both
+	// write, so serialize every write through one mutex.
+	var writeMu sync.Mutex
+	writeMsg := func(msg []byte) error {
+		wctx, wc := context.WithTimeout(ctx, 5*time.Second)
+		defer wc()
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		return c.Write(wctx, websocket.MessageText, msg)
+	}
 
 	// presence heartbeat: refresh every subscribed membership's TTL key
 	// while the socket lives; keys die ~90s after disconnect (§24).
@@ -131,7 +145,7 @@ func (g *Gateway) ServeWS(w http.ResponseWriter, r *http.Request) {
 						Value("1").Ex(90*time.Second).Build())
 				}
 			} else {
-				c.Write(ctx, websocket.MessageText, []byte(`{"error":"not_a_channel_member","channel":"`+m.Subscribe+`"}`))
+				_ = writeMsg([]byte(`{"error":"not_a_channel_member","channel":"` + m.Subscribe + `"}`))
 			}
 		}
 	}()
@@ -155,9 +169,7 @@ func (g *Gateway) ServeWS(w http.ResponseWriter, r *http.Request) {
 		if !ok {
 			return
 		}
-		wctx, wc := context.WithTimeout(ctx, 5*time.Second)
-		defer wc()
-		if err := c.Write(wctx, websocket.MessageText, []byte(m.Message)); err != nil {
+		if err := writeMsg([]byte(m.Message)); err != nil {
 			cancelDed()
 		}
 	})

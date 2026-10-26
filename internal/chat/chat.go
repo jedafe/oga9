@@ -96,6 +96,19 @@ func (s *Service) CreateChannel(ctx context.Context, oc *tenant.OrgCtx, kind, na
 	if kind != "general" && name == "" {
 		return uuid.Nil, ErrBadValue
 	}
+	// unit_id is meaningful only on unit|committee channels (§24 schema);
+	// it must name a unit IN this org — the FK only proves existence.
+	if kind == "unit" || kind == "committee" {
+		if unitID == uuid.Nil {
+			return uuid.Nil, ErrBadValue
+		}
+		if _, err := s.q.GetOrgUnit(ctx, db.GetOrgUnitParams{
+			ID: toPg(unitID), OrganizationID: toPg(oc.OrgID)}); err != nil {
+			return uuid.Nil, ErrNotFound
+		}
+	} else if unitID != uuid.Nil {
+		return uuid.Nil, ErrBadValue
+	}
 	var row db.ChatChannels
 	created := true
 	err := s.withTx(ctx, func(q *db.Queries) error {
@@ -267,9 +280,19 @@ func (s *Service) PostMessage(ctx context.Context, oc *tenant.OrgCtx, cid uuid.U
 		if err := q.TouchChannel(ctx, toPg(cid)); err != nil {
 			return err
 		}
-		return events.Emit(ctx, q, oc.TenantID, oc.OrgID, "MessagePosted",
+		if err := events.Emit(ctx, q, oc.TenantID, oc.OrgID, "MessagePosted",
 			"chat_message", fromPg(row.ID), oc.UserID, false,
-			map[string]any{"message_id": fromPg(row.ID), "channel_id": cid, "kind": kind})
+			map[string]any{"message_id": fromPg(row.ID), "channel_id": cid, "kind": kind}); err != nil {
+			return err
+		}
+		if kind == "voice" {
+			// §24 catalogs a voice-specific event alongside MessagePosted.
+			return events.Emit(ctx, q, oc.TenantID, oc.OrgID, "VoiceNotePosted",
+				"chat_message", fromPg(row.ID), oc.UserID, false,
+				map[string]any{"message_id": fromPg(row.ID), "channel_id": cid,
+					"duration_ms": voiceMs})
+		}
+		return nil
 	})
 	if err != nil {
 		return uuid.Nil, err
@@ -396,11 +419,7 @@ func (s *Service) AddMember(ctx context.Context, oc *tenant.OrgCtx, cid, memberI
 	if ch.Kind == "general" || ch.Kind == "unit" || ch.Kind == "exco" {
 		return ErrBadValue // derived channels reject explicit rows
 	}
-	if ch.Kind == "dm" {
-		if ids, err := s.q.ChannelMemberIDs(ctx, toPg(cid)); err == nil && len(ids) >= 2 {
-			return ErrBadValue // a dm is two members, no more
-		}
-	}
+	dm := ch.Kind == "dm"
 	if role != "owner" && role != "moderator" && role != "member" {
 		role = "member"
 	}
@@ -409,6 +428,16 @@ func (s *Service) AddMember(ctx context.Context, oc *tenant.OrgCtx, cid, memberI
 		return ErrNotFound
 	}
 	return s.withTx(ctx, func(q *db.Queries) error {
+		if dm {
+			// lock the channel row so two concurrent adds can't both pass
+			// the 2-seat headcount — FOR UPDATE must live inside the tx.
+			if _, err := q.LockChannel(ctx, toPg(cid)); err != nil {
+				return err
+			}
+			if ids, err := q.ChannelMemberIDs(ctx, toPg(cid)); err == nil && len(ids) >= 2 {
+				return ErrBadValue // a dm is two members, no more
+			}
+		}
 		if err := q.JoinChannel(ctx, db.JoinChannelParams{
 			ChannelID: toPg(cid), MembershipID: toPg(memberID), Column3: role}); err != nil {
 			return err

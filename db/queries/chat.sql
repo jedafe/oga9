@@ -147,6 +147,11 @@ WHERE id = $1 AND organization_id = $2 AND state = 'active';
 -- name: RemoveChannelMember :execrows
 DELETE FROM chat_channel_members WHERE channel_id = $1 AND membership_id = $2;
 
+-- name: LockChannel :one
+-- Serialize member-list mutations on the channel row (dm 2-seat cap) —
+-- two concurrent adds must not both pass the headcount.
+SELECT id FROM chat_channels WHERE id = $1 FOR UPDATE;
+
 -- name: RetentionSweepChat :many
 -- chat:retention_sweep — org.chat.retention_days > 0 → messages past the
 -- window soft-delete (Rule 11; hard erase stays with the erasure task).

@@ -413,6 +413,12 @@ func (s *Service) IssueLicense(ctx context.Context, tenantID uuid.UUID, deployme
 	sig := s.sign(s.licensePayload(deploymentID, expiresAt, entitlements))
 	var id uuid.UUID
 	err := s.withTx(ctx, func(q *db.Queries) error {
+		// §07: re-issue on the same deployment_id renews in place — the
+		// event distinguishes first-issue from renewal (both sourced).
+		ev := "LicenseIssued"
+		if _, err := q.GetLicenseByDeployment(ctx, deploymentID); err == nil {
+			ev = "LicenseRenewed"
+		}
 		lid, err := q.InsertLicense(ctx, db.InsertLicenseParams{
 			TenantID: toPg(tenantID), DeploymentID: deploymentID, Edition: edition,
 			Entitlements: entitlements, ExpiresAt: pgTime(expiresAt), Signature: sig,
@@ -421,10 +427,58 @@ func (s *Service) IssueLicense(ctx context.Context, tenantID uuid.UUID, deployme
 			return err
 		}
 		id = uuid.UUID(lid.Bytes)
-		return events.Emit(ctx, q, tenantID, uuid.Nil, "LicenseIssued", "license", id, actor, true,
+		return events.Emit(ctx, q, tenantID, uuid.Nil, ev, "license", id, actor, true,
 			map[string]any{"license_id": id, "deployment_id": deploymentID})
 	})
 	return id, err
+}
+
+// LicenseExpirySweep — daily (license:renewal_reminder cadence): each
+// license past expires_at gets LicenseExpired emitted ONCE — the
+// expired_notified flag marks in the same tx (Rule 12); a renewal resets
+// it so the next expiry window re-emits (§09 degrade signal).
+func (s *Service) LicenseExpirySweep(ctx context.Context) (int, error) {
+	rows, err := s.q.ExpiredLicenses(ctx)
+	if err != nil {
+		return 0, err
+	}
+	emitted := 0
+	for _, l := range rows {
+		err := s.withTx(ctx, func(q *db.Queries) error {
+			if err := q.MarkLicenseExpired(ctx, l.ID); err != nil {
+				return err
+			}
+			return events.Emit(ctx, q, uuid.UUID(l.TenantID.Bytes), uuid.Nil, "LicenseExpired",
+				"license", uuid.UUID(l.ID.Bytes), uuid.Nil, true,
+				map[string]any{"license_id": uuid.UUID(l.ID.Bytes), "deployment_id": l.DeploymentID})
+		})
+		if err != nil {
+			return emitted, err
+		}
+		emitted++
+	}
+	return emitted, nil
+}
+
+// LicenseFile renders the signed license document a self-hosted deployment
+// mounts at OGA9_LICENSE_FILE — the deliverable of IssueLicense; operators
+// download it via GET /platform/licenses/{deployment_id}/file and ship it
+// with the install. The doc verifies offline (license.Validator, Rule 29).
+func (s *Service) LicenseFile(ctx context.Context, deploymentID string) ([]byte, error) {
+	row, err := s.q.GetLicenseByDeployment(ctx, deploymentID)
+	if err == pgx.ErrNoRows {
+		return nil, ErrLicenseNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(map[string]any{
+		"deployment_id": row.DeploymentID,
+		"edition":       row.Edition,
+		"entitlements":  json.RawMessage(canonicalJSON(row.Entitlements)),
+		"expires_at":    row.ExpiresAt.Time.UTC().Format(time.RFC3339),
+		"signature":     hex.EncodeToString(row.Signature),
+	})
 }
 
 // ValidateLicense is the self-hosted callback: the deployment presents its

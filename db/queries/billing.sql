@@ -83,11 +83,20 @@ VALUES (sqlc.arg(tenant_id)::uuid, sqlc.arg(deployment_id), sqlc.arg(edition),
 ON CONFLICT (deployment_id) DO UPDATE SET
   tenant_id = EXCLUDED.tenant_id, edition = EXCLUDED.edition,
   entitlements = EXCLUDED.entitlements, expires_at = EXCLUDED.expires_at,
-  signature = EXCLUDED.signature, issued_at = now()
+  signature = EXCLUDED.signature, issued_at = now(), expired_notified = false
 RETURNING id;
 
+-- name: ExpiredLicenses :many
+-- the daily expiry sweep — rows past expiry not yet evented; each is
+-- marked in the same tx as its LicenseExpired emit (Rule 12).
+SELECT id, tenant_id, deployment_id FROM licenses
+WHERE expires_at <= now() AND NOT expired_notified LIMIT 200;
+
+-- name: MarkLicenseExpired :exec
+UPDATE licenses SET expired_notified = true WHERE id = $1;
+
 -- name: GetLicenseByDeployment :one
-SELECT id, tenant_id, entitlements, expires_at, signature FROM licenses
+SELECT id, tenant_id, deployment_id, edition, entitlements, expires_at, signature FROM licenses
 WHERE deployment_id = sqlc.arg(deployment_id) ORDER BY issued_at DESC LIMIT 1;
 
 -- name: GetLatestLicense :one

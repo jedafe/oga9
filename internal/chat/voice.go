@@ -182,9 +182,13 @@ func (s *Service) LeaveRoom(ctx context.Context, oc *tenant.OrgCtx, rid uuid.UUI
 		return ErrNotFound
 	}
 	return s.withTx(ctx, func(q *db.Queries) error {
-		if err := q.LeaveVoiceRoom(ctx, db.LeaveVoiceRoomParams{
-			RoomID: toPg(rid), MembershipID: toPg(oc.MembershipID)}); err != nil {
+		n, err := q.LeaveVoiceRoom(ctx, db.LeaveVoiceRoomParams{
+			RoomID: toPg(rid), MembershipID: toPg(oc.MembershipID)})
+		if err != nil {
 			return err
+		}
+		if n == 0 {
+			return nil // not an open participant — nothing left to emit
 		}
 		return events.Emit(ctx, q, oc.TenantID, oc.OrgID, "VoiceParticipantLeft",
 			"voice_room", rid, oc.UserID, false,

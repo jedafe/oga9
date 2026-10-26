@@ -3,6 +3,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -73,7 +74,7 @@ func (h *PlatformHandler) CreateTenant(w http.ResponseWriter, r *http.Request) {
 		platErr(w, platform.ErrBadValue)
 		return
 	}
-	if _, err := h.queue.EnqueueContext(r.Context(), t); err != nil {
+	if _, err := h.queue.EnqueueContext(context.WithoutCancel(r.Context()), t); err != nil {
 		platErr(w, err)
 		return
 	}
@@ -304,7 +305,7 @@ func (h *PlatformHandler) StartTenantExport(w http.ResponseWriter, r *http.Reque
 		platErr(w, err)
 		return
 	}
-	if _, err := h.queue.EnqueueContext(r.Context(), t); err != nil {
+	if _, err := h.queue.EnqueueContext(context.WithoutCancel(r.Context()), t); err != nil {
 		platErr(w, err)
 		return
 	}
