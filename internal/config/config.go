@@ -16,16 +16,24 @@ import (
 )
 
 type Config struct {
-	Env            string
-	DatabaseURL    string
-	ValkeyAddr     string
-	JWTSecret      string
-	DataKey        []byte // 32B AES key for secrets at rest (mfa_secret etc.)
-	BaseDomain     string
-	ControlHost    string
-	APIPort        int
-	SessionTTL     time.Duration
-	OutboxInterval time.Duration // events:dispatch_outbox cadence (§05)
+	Env                  string
+	DatabaseURL          string
+	ValkeyAddr           string
+	JWTSecret            string
+	DataKey              []byte // 32B AES key for secrets at rest (mfa_secret etc.)
+	BaseDomain           string
+	ControlHost          string
+	APIPort              int
+	UploadsDir           string
+	UploadMaxMB          int64
+	LiveKitURL           string
+	LiveKitAPIKey        string
+	LiveKitAPISecret     string
+	VoiceJoinWindowSec   int
+	VoiceRoomMaxAgeHours int
+	TrialDays            int // §15 default provision trial length (operator may override per request)
+	SessionTTL           time.Duration
+	OutboxInterval       time.Duration // events:dispatch_outbox cadence (§05)
 	// §08 job queue cadences
 	SchedulerTickInterval time.Duration // scheduler:tick cron driver
 	RetryDeadInterval     time.Duration // events:retry_dead DLQ re-drive
@@ -68,6 +76,14 @@ func Load() (*Config, error) {
 		APIPort:               envInt(&errs, "OGA9_API_PORT", 8080),
 		SessionTTL:            envDur(&errs, "OGA9_SESSION_TTL", 24*time.Hour),
 		OutboxInterval:        envDur(&errs, "OGA9_OUTBOX_DISPATCH_INTERVAL", 10*time.Second),
+		UploadsDir:            env("OGA9_UPLOADS_DIR", "./data/uploads"),
+		UploadMaxMB:           int64(envInt(&errs, "OGA9_UPLOAD_MAX_MB", 0)),
+		LiveKitURL:            env("OGA9_LIVEKIT_URL", ""),
+		LiveKitAPIKey:         env("OGA9_LIVEKIT_API_KEY", ""),
+		LiveKitAPISecret:      env("OGA9_LIVEKIT_API_SECRET", ""),
+		VoiceJoinWindowSec:    envInt(&errs, "OGA9_VOICE_JOIN_WINDOW_SEC", 300),
+		VoiceRoomMaxAgeHours:  envInt(&errs, "OGA9_VOICE_ROOM_MAX_AGE_HOURS", 12),
+		TrialDays:             envInt(&errs, "OGA9_TRIAL_DAYS", 14),
 		SchedulerTickInterval: envDur(&errs, "OGA9_SCHEDULER_TICK_INTERVAL", 5*time.Minute),
 		RetryDeadInterval:     envDur(&errs, "OGA9_EVENTS_RETRY_DEAD_INTERVAL", time.Minute),
 		BillingSweepInterval:  envDur(&errs, "OGA9_BILLING_SWEEP_INTERVAL", time.Hour),

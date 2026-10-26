@@ -1,0 +1,1 @@
+ALTER TABLE membership_renewals DROP CONSTRAINT membership_renewals_payment_fk;

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
 	"github.com/hibiken/asynq"
 	"github.com/jedafe/oga9/internal/auth"
 	"github.com/jedafe/oga9/internal/httpx"
@@ -27,10 +28,11 @@ type OAuthHandler struct {
 	appURL    string
 	queue     *asynq.Client
 	secret    string
+	mat       MemberMaterializer
 }
 
-func NewOAuthHandler(svc *auth.Service, vk valkey.Client, providers map[string]auth.ProviderConfig, baseURL, appURL string, queue *asynq.Client, secret string) *OAuthHandler {
-	return &OAuthHandler{svc: svc, vk: vk, providers: providers, baseURL: baseURL, appURL: appURL, queue: queue, secret: secret}
+func NewOAuthHandler(svc *auth.Service, vk valkey.Client, providers map[string]auth.ProviderConfig, baseURL, appURL string, queue *asynq.Client, secret string, mat MemberMaterializer) *OAuthHandler {
+	return &OAuthHandler{svc: svc, vk: vk, providers: providers, baseURL: baseURL, appURL: appURL, queue: queue, secret: secret, mat: mat}
 }
 
 func (h *OAuthHandler) provider(w http.ResponseWriter, r *http.Request) (auth.ProviderConfig, string, bool) {
@@ -108,6 +110,13 @@ func (h *OAuthHandler) Callback(w http.ResponseWriter, r *http.Request) {
 			httpx.WriteErr(w, 401, "oauth_failed", "provider authentication failed")
 		}
 		return
+	}
+	// §11 hook: an OAuth-bound account materializes approved pre-signup
+	// applications — best-effort, never fails the login response.
+	if h.mat != nil && res.UserID != uuid.Nil {
+		if err := h.mat.MaterializeApprovedApplications(r.Context(), res.UserID); err != nil {
+			log.Printf("materialize applications for user %s: %v", res.UserID, err)
+		}
 	}
 	// A real app deployment redirects the browser back to the frontend with
 	// the session; pure-API installs (AppURL unset/same as base) get JSON.

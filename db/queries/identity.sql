@@ -35,19 +35,20 @@ UPDATE users SET mfa_secret = $1 WHERE id = $2;
 SELECT mfa_secret FROM users WHERE id = $1;
 
 -- name: CreateSession :one
-INSERT INTO user_sessions (user_id, jti, device_label, ip, user_agent, expires_at)
+INSERT INTO user_sessions (user_id, jti, device_label, ip, user_agent, expires_at, support_session_id)
 VALUES (sqlc.arg(user_id), sqlc.arg(jti), sqlc.arg(device_label),
-        NULLIF(sqlc.arg(ip)::text, '')::inet, sqlc.arg(user_agent), sqlc.arg(expires_at))
+        NULLIF(sqlc.arg(ip)::text, '')::inet, sqlc.arg(user_agent), sqlc.arg(expires_at),
+        sqlc.narg(support_session_id)::uuid)
 RETURNING id;
 
 -- name: GetSessionByJTI :one
-SELECT s.id, s.user_id, s.revoked_at, s.expires_at, u.status AS user_status
+SELECT s.id, s.user_id, s.revoked_at, s.expires_at, s.support_session_id, u.status AS user_status
 FROM user_sessions s
 JOIN users u ON u.id = s.user_id
 WHERE s.jti = $1;
 
 -- name: ListUserSessions :many
-SELECT id, jti, device_label, ip::text AS ip, user_agent, created_at, expires_at
+SELECT id, jti, device_label, ip::text AS ip, user_agent, created_at, expires_at, support_session_id
 FROM user_sessions
 WHERE user_id = $1 AND revoked_at IS NULL AND expires_at > now()
 ORDER BY created_at DESC;
@@ -109,3 +110,13 @@ SELECT EXISTS (
   WHERE ura.user_id = sqlc.arg(user_id)
     AND (r.slug = 'org_admin' OR p.node LIKE 'platform.%')
 ) AS requires_mfa;
+
+-- name: UserHasHealthyMembership :one
+-- §15 partial access: a user with a live membership in ANY non-suspended
+-- tenant keeps login; only fully-suspended users are blocked.
+SELECT EXISTS (
+  SELECT 1 FROM organization_memberships m
+  JOIN organizations o ON o.id = m.organization_id
+  JOIN tenants t ON t.id = o.tenant_id
+  WHERE m.user_id = $1 AND t.status <> 'suspended'
+    AND m.lifecycle_state NOT IN ('resigned','expelled','deceased'));

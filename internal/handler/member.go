@@ -41,8 +41,24 @@ func memberErr(w http.ResponseWriter, err error) {
 		httpx.WriteErr(w, 404, "application_not_found", "no application with that id in this org")
 	case errors.Is(err, tenant.ErrAlreadyApplied):
 		httpx.WriteErr(w, 409, "application_exists", "an open application already exists for this user")
+	case errors.Is(err, tenant.ErrAlreadyMember):
+		httpx.WriteErr(w, 409, "already_a_member", "this person already holds a membership in the organization")
+	case errors.Is(err, tenant.ErrBadScopeUnit):
+		httpx.WriteErr(w, 400, "invalid_scope_unit", "unit must belong to this organization")
+	case errors.Is(err, tenant.ErrBadValue):
+		httpx.WriteErr(w, 400, "invalid_value", "invalid field value")
+	case errors.Is(err, tenant.ErrForbidden):
+		httpx.WriteErr(w, 403, "forbidden", "action not permitted")
+	case errors.Is(err, tenant.ErrMemberNotActive):
+		httpx.WriteErr(w, 409, "member_not_active", "member is not active")
+	case errors.Is(err, tenant.ErrImportNotFound):
+		httpx.WriteErr(w, 404, "import_not_found", "no import with that id")
 	case errors.Is(err, tenant.ErrDuplicateRenewal):
 		httpx.WriteErr(w, 409, "renewal_exists", "this membership already has a renewal for that period")
+	case errors.Is(err, tenant.ErrRegistrationPending):
+		httpx.WriteErr(w, 409, "registration_unpaid", "registration dues must be settled before registration")
+	case errors.Is(err, tenant.ErrMemberLimitExceeded):
+		httpx.WriteErr(w, 402, "limit_exceeded", "plan member limit reached — upgrade to activate more members")
 	case errors.Is(err, tenant.ErrNotMember):
 		httpx.WriteErr(w, 404, "not_a_member", "membership not found in this organization")
 	case errors.Is(err, tenant.ErrBadCategory):
@@ -59,8 +75,10 @@ func (h *MemberHandler) Members(w http.ResponseWriter, r *http.Request) {
 	oc := middleware.OrgCtx(r.Context())
 	var unitID uuid.UUID
 	if u := r.URL.Query().Get("unit"); u != "" {
-		if p, err := uuid.Parse(u); err == nil {
-			unitID = p
+		var err error
+		if unitID, err = uuid.Parse(u); err != nil {
+			httpx.WriteErr(w, 400, "validation_failed", "unit must be a uuid")
+			return
 		}
 	}
 	rows, err := h.svc.Members(r.Context(), oc, r.URL.Query().Get("category"), r.URL.Query().Get("state"), unitID)
@@ -87,9 +105,12 @@ func (h *MemberHandler) Member(w http.ResponseWriter, r *http.Request) {
 	httpx.WriteData(w, 200, m)
 }
 
-// PatchMember — PATCH /orgs/{id}/members/{mid} (manage): category +
-// home-unit scope only; lifecycle never changes here.
+// PatchMember — PATCH /orgs/{id}/members/{mid}: manage edits category +
+// home-unit scope; a member may self-edit their home unit only (§11:
+// limited fields for view_own). Category stays admin-level — it prices
+// privileges, a member can't reclassify themselves.
 func (h *MemberHandler) PatchMember(w http.ResponseWriter, r *http.Request) {
+	oc := middleware.OrgCtx(r.Context())
 	mid, _ := uuid.Parse(chi.URLParam(r, "member_id"))
 	var req struct {
 		Category string    `json:"category"`
@@ -99,7 +120,16 @@ func (h *MemberHandler) PatchMember(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteErr(w, 400, "validation_failed", "category or unit_id required")
 		return
 	}
-	if err := h.svc.PatchMember(r.Context(), middleware.OrgCtx(r.Context()), mid, req.Category, req.UnitID); err != nil {
+	self := mid == oc.MembershipID
+	if !self && !h.svc.HasPermission(r.Context(), oc.UserID, oc.OrgID, "org.members.manage") {
+		httpx.WriteErr(w, 403, "forbidden", "insufficient permission")
+		return
+	}
+	if self && req.Category != "" {
+		httpx.WriteErr(w, 403, "forbidden", "members cannot change their own category")
+		return
+	}
+	if err := h.svc.PatchMember(r.Context(), oc, mid, req.Category, req.UnitID); err != nil {
 		memberErr(w, err)
 		return
 	}
@@ -118,8 +148,12 @@ func (h *MemberHandler) Transition(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	oc := middleware.OrgCtx(r.Context())
-	selfResign := mid == oc.MembershipID && req.To == "resign"
-	if !selfResign && !h.svc.HasPermission(r.Context(), oc.UserID, oc.OrgID, "org.members.manage") {
+	// Self-service exits: resign (active|suspended→resigned — suspended
+	// members use /orgs/{id}/resign since they carry no OrgCtx) and
+	// withdraw (applied|screened→withdrawn, per ADR-014 any→withdrawn
+	// while pre-active).
+	selfExit := mid == oc.MembershipID && (req.To == "resign" || req.To == "withdraw")
+	if !selfExit && !h.svc.HasPermission(r.Context(), oc.UserID, oc.OrgID, "org.members.manage") {
 		httpx.WriteErr(w, 403, "forbidden", "insufficient permission")
 		return
 	}
@@ -130,22 +164,45 @@ func (h *MemberHandler) Transition(w http.ResponseWriter, r *http.Request) {
 	httpx.WriteData(w, 200, map[string]any{"id": mid, "action": req.To})
 }
 
-// Renew — POST /orgs/{id}/members/{mid}/renew: manage, or the member themself.
+// Resign — POST /orgs/{id}/resign: self-service exit for members whose
+// state blocks OrgCtx (suspended members may still resign, §11). Sits
+// outside the OrgCtx group on purpose — the service resolves the
+// caller's own membership server-side.
+func (h *MemberHandler) Resign(w http.ResponseWriter, r *http.Request) {
+	orgID, err := uuid.Parse(chi.URLParam(r, "org_id"))
+	if err != nil {
+		httpx.WriteErr(w, 400, "validation_failed", "org_id must be a uuid")
+		return
+	}
+	if err := h.svc.ResignSelf(r.Context(), middleware.UserID(r.Context()), orgID); err != nil {
+		memberErr(w, err)
+		return
+	}
+	httpx.WriteData(w, 200, map[string]any{"status": "resigned"})
+}
+
+// Renew — POST /orgs/{id}/members/{mid}/renew: manage, or the member
+// themselves when a confirmed payment_id settles it (§11: manage or
+// member+payment). Self-renew without payment stays blocked — it would
+// mint free good-standing.
 func (h *MemberHandler) Renew(w http.ResponseWriter, r *http.Request) {
 	oc := middleware.OrgCtx(r.Context())
 	mid, _ := uuid.Parse(chi.URLParam(r, "member_id"))
-	if mid != oc.MembershipID && !h.svc.HasPermission(r.Context(), oc.UserID, oc.OrgID, "org.members.manage") {
-		httpx.WriteErr(w, 403, "forbidden", "insufficient permission")
-		return
-	}
 	var req struct {
-		Period   string `json:"period_label"`
-		StartsAt string `json:"starts_at"`
-		EndsAt   string `json:"ends_at"`
+		Period    string    `json:"period_label"`
+		StartsAt  string    `json:"starts_at"`
+		EndsAt    string    `json:"ends_at"`
+		PaymentID uuid.UUID `json:"payment_id"` // §12 link — required for self-renew
 	}
 	if err := httpx.Decode(w, r, &req); err != nil || req.Period == "" {
 		httpx.WriteErr(w, 400, "validation_failed", "period_label required")
 		return
+	}
+	if !h.svc.HasPermission(r.Context(), oc.UserID, oc.OrgID, "org.members.manage") {
+		if mid != oc.MembershipID || req.PaymentID == uuid.Nil {
+			httpx.WriteErr(w, 403, "forbidden", "self-renewal requires a confirmed payment")
+			return
+		}
 	}
 	starts, err := time.Parse("2006-01-02", req.StartsAt)
 	ends, err2 := time.Parse("2006-01-02", req.EndsAt)
@@ -153,7 +210,7 @@ func (h *MemberHandler) Renew(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteErr(w, 400, "validation_failed", "starts_at/ends_at must be YYYY-MM-DD")
 		return
 	}
-	id, err := h.svc.RenewMember(r.Context(), oc, mid, req.Period, starts, ends)
+	id, err := h.svc.RenewMember(r.Context(), oc, mid, req.Period, starts, ends, req.PaymentID)
 	if err != nil {
 		memberErr(w, err)
 		return
@@ -307,6 +364,9 @@ func (h *MemberHandler) Import(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if _, err := h.queue.EnqueueContext(r.Context(), task); err != nil {
+		// The durable row exists — fail it visibly rather than stranding it
+		// at 'processing' until the stale-import sweep finds it.
+		_ = h.svc.FailImport(r.Context(), id, err.Error())
 		httpx.WriteErr(w, 500, "internal_error", "import enqueue failed")
 		return
 	}
@@ -336,13 +396,25 @@ func (h *MemberHandler) Export(w http.ResponseWriter, r *http.Request) {
 }
 
 // MyMemberships — GET /me/memberships (auth): all orgs for the caller.
+// Each row carries the computed eligibility flag (§11: active/life_member
+// + good dues standing) — never a stored column.
 func (h *MemberHandler) MyMemberships(w http.ResponseWriter, r *http.Request) {
 	rows, err := h.svc.MyMemberships(r.Context(), middleware.UserID(r.Context()))
 	if err != nil {
 		memberErr(w, err)
 		return
 	}
-	httpx.WriteData(w, 200, rows)
+	out := make([]map[string]any, 0, len(rows))
+	for _, m := range rows {
+		out = append(out, map[string]any{
+			"id": m.ID, "organization_id": m.OrganizationID, "org_name": m.OrgName,
+			"org_slug": m.OrgSlug, "member_no": m.MemberNo, "category": m.Category,
+			"lifecycle_state": m.LifecycleState, "dues_standing": m.DuesStanding,
+			"joined_at": m.JoinedAt,
+			"eligible":  tenant.Eligible(m.LifecycleState, m.DuesStanding),
+		})
+	}
+	httpx.WriteData(w, 200, out)
 }
 
 // ApplyForm — GET /directory/orgs/{slug}/apply (public): the org's
@@ -380,4 +452,60 @@ func csvRows(text string) (json.RawMessage, error) {
 		rows = append(rows, row)
 	}
 	return json.Marshal(rows)
+}
+
+// ExportAsync — POST /orgs/{id}/members/export {filename}: durable row +
+// membership:export fan-out; GET /members/exports/{eid} downloads it.
+func (h *MemberHandler) ExportAsync(w http.ResponseWriter, r *http.Request) {
+	oc := middleware.OrgCtx(r.Context())
+	var req struct {
+		Filename string `json:"filename"`
+	}
+	_ = httpx.Decode(w, r, &req)
+	id, err := h.svc.RequestExport(r.Context(), oc, req.Filename)
+	if err != nil {
+		memberErr(w, err)
+		return
+	}
+	task, err := tasks.NewMemberExportTask(id)
+	if err != nil {
+		httpx.WriteErr(w, 500, "internal_error", "task build failed")
+		return
+	}
+	if _, err := h.queue.EnqueueContext(r.Context(), task); err != nil {
+		httpx.WriteErr(w, 500, "internal_error", "export enqueue failed")
+		return
+	}
+	httpx.WriteData(w, 202, map[string]any{"id": id, "status": "processing"})
+}
+
+// ExportDownload — GET /orgs/{id}/members/exports/{eid}: the stored CSV.
+func (h *MemberHandler) ExportDownload(w http.ResponseWriter, r *http.Request) {
+	oc := middleware.OrgCtx(r.Context())
+	eid, _ := uuid.Parse(chi.URLParam(r, "export_id"))
+	e, err := h.svc.ExportDownload(r.Context(), oc, eid)
+	if err != nil {
+		memberErr(w, err)
+		return
+	}
+	if e.Status != "done" {
+		httpx.WriteData(w, 200, map[string]any{"id": eid, "status": e.Status})
+		return
+	}
+	w.Header().Set("Content-Type", "text/csv")
+	fname := sanitizeHeaderValue(e.Filename)
+	w.Header().Set("Content-Disposition", `attachment; filename="`+fname+`"`)
+	w.Write(e.Content)
+}
+
+// sanitizeHeaderValue strips quote/CR/LF — a filename or title must
+// never inject a second header through Content-Disposition.
+func sanitizeHeaderValue(v string) string {
+	return strings.Map(func(r rune) rune {
+		switch r {
+		case '"', '\\', '\r', '\n':
+			return -1
+		}
+		return r
+	}, v)
 }

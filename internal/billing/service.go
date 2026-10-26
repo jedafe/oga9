@@ -5,6 +5,7 @@
 package billing
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/hmac"
@@ -258,8 +259,14 @@ func (s *Service) ChangePlan(ctx context.Context, tenantID uuid.UUID, plan strin
 		return ErrPaymentRequired
 	}
 	return s.withTx(ctx, func(q *db.Queries) error {
-		if err := q.SetSubscriptionPlan(ctx, db.SetSubscriptionPlanParams{ID: sub.ID, PlanSlug: plan}); err != nil {
+		n, err := q.SetSubscriptionPlan(ctx, db.SetSubscriptionPlanParams{
+			ID: sub.ID, PlanSlug: plan, ExpectedSlug: sub.PlanSlug,
+		})
+		if err != nil {
 			return err
+		}
+		if n == 0 {
+			return ErrBadTransition // raced with another plan change or a cancel
 		}
 		return events.Emit(ctx, q, tenantID, uuid.Nil, "SubscriptionChanged", "subscription",
 			uuid.UUID(sub.ID.Bytes), actor, true,
@@ -348,10 +355,13 @@ func (s *Service) SweepStates(ctx context.Context) error {
 
 // canonicalJSON normalizes a JSON blob for signing — jsonb storage reorders
 // keys and rewrites whitespace, so signatures must cover the semantic form
-// (decode → re-encode with sorted keys), not the wire bytes.
+// (decode → re-encode with sorted keys), not the wire bytes. UseNumber
+// keeps integers exact — float64 decode would corrupt limit values >2^53.
 func canonicalJSON(b []byte) []byte {
 	var v any
-	if json.Unmarshal(b, &v) != nil {
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.UseNumber()
+	if err := dec.Decode(&v); err != nil {
 		return b
 	}
 	out, err := json.Marshal(v)
@@ -556,4 +566,31 @@ func (s *Service) StaleWebhookEvents(ctx context.Context) ([]uuid.UUID, error) {
 		out = append(out, uuid.UUID(r.Bytes))
 	}
 	return out, nil
+}
+
+// UsageRecomputeConsumer — §15: subscription changes (and provisioning)
+// recompute countable usage meters for the tenant's current period
+// (period_start = first of month). SetUsage semantics keep replays clean
+// (Rule 27 — at-least-once safe).
+func (s *Service) UsageRecomputeConsumer(ctx context.Context, q *db.Queries, e events.Event) error {
+	if e.Type != "SubscriptionChanged" && e.Type != "TenantProvisioned" {
+		return nil
+	}
+	if e.TenantID == uuid.Nil {
+		return nil
+	}
+	rows, err := q.TenantUsageCounts(ctx, toPg(e.TenantID))
+	if err != nil {
+		return err
+	}
+	period := time.Date(time.Now().Year(), time.Now().Month(), 1, 0, 0, 0, 0, time.UTC)
+	for _, r := range rows {
+		if _, err := q.SetUsage(ctx, db.SetUsageParams{
+			TenantID: toPg(e.TenantID), LimitKey: r.LimitKey,
+			Used:        r.Used,
+			PeriodStart: pgtype.Date{Time: period, Valid: true}}); err != nil {
+			return err
+		}
+	}
+	return nil
 }

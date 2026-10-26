@@ -100,6 +100,7 @@ WHERE dispatched_at IS NULL AND attempts < $1::int
   AND (next_attempt_at IS NULL OR next_attempt_at <= now())
 ORDER BY occurred_at
 LIMIT $2::int
+FOR NO KEY UPDATE SKIP LOCKED
 `
 
 type FetchPendingEventsParams struct {
@@ -121,7 +122,10 @@ type FetchPendingEventsRow struct {
 }
 
 // Outbox claim set: undelivered events under the attempt cap whose backoff
-// has elapsed (next_attempt_at), oldest first.
+// has elapsed (next_attempt_at), oldest first. FOR NO KEY UPDATE SKIP
+// LOCKED — serializes the batch between overlapping dispatchers WITHOUT
+// blocking event_consumer_log's FOR KEY SHARE FK check (FOR UPDATE would
+// self-deadlock the claim tx against its own consumers).
 func (q *Queries) FetchPendingEvents(ctx context.Context, arg FetchPendingEventsParams) ([]FetchPendingEventsRow, error) {
 	rows, err := q.db.Query(ctx, fetchPendingEvents, arg.MaxAttempts, arg.BatchSize)
 	if err != nil {
@@ -212,7 +216,7 @@ func (q *Queries) LinkEntities(ctx context.Context, arg LinkEntitiesParams) erro
 	return err
 }
 
-const logConsumerProcessed = `-- name: LogConsumerProcessed :exec
+const logConsumerProcessed = `-- name: LogConsumerProcessed :execrows
 INSERT INTO event_consumer_log (consumer, event_id) VALUES ($1, $2)
 ON CONFLICT (consumer, event_id) DO NOTHING
 `
@@ -222,10 +226,15 @@ type LogConsumerProcessedParams struct {
 	EventID  pgtype.UUID `json:"event_id"`
 }
 
-// Inserted in the SAME tx as the consumer's own writes (§05 contract).
-func (q *Queries) LogConsumerProcessed(ctx context.Context, arg LogConsumerProcessedParams) error {
-	_, err := q.db.Exec(ctx, logConsumerProcessed, arg.Consumer, arg.EventID)
-	return err
+// Inserted FIRST inside the consumer's tx (§05 contract): 0 rows affected
+// = already logged — the consumer body must be skipped, not replayed.
+// The insert is the atomic dedupe check; the outer pre-check is a hint.
+func (q *Queries) LogConsumerProcessed(ctx context.Context, arg LogConsumerProcessedParams) (int64, error) {
+	result, err := q.db.Exec(ctx, logConsumerProcessed, arg.Consumer, arg.EventID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const markEventDispatched = `-- name: MarkEventDispatched :exec

@@ -121,7 +121,7 @@ func verifiedUser(t *testing.T, s *Service, prefix string) (*User, string) {
 	if err != nil {
 		t.Fatalf("register: %v", err)
 	}
-	if err := s.VerifyEmail(context.Background(), vt); err != nil {
+	if _, err := s.VerifyEmail(context.Background(), vt); err != nil {
 		t.Fatalf("verify: %v", err)
 	}
 	return u, email

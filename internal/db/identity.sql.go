@@ -57,19 +57,21 @@ func (q *Queries) CreateOAuthUser(ctx context.Context, arg CreateOAuthUserParams
 }
 
 const createSession = `-- name: CreateSession :one
-INSERT INTO user_sessions (user_id, jti, device_label, ip, user_agent, expires_at)
+INSERT INTO user_sessions (user_id, jti, device_label, ip, user_agent, expires_at, support_session_id)
 VALUES ($1, $2, $3,
-        NULLIF($4::text, '')::inet, $5, $6)
+        NULLIF($4::text, '')::inet, $5, $6,
+        $7::uuid)
 RETURNING id
 `
 
 type CreateSessionParams struct {
-	UserID      pgtype.UUID        `json:"user_id"`
-	Jti         pgtype.UUID        `json:"jti"`
-	DeviceLabel pgtype.Text        `json:"device_label"`
-	Ip          string             `json:"ip"`
-	UserAgent   pgtype.Text        `json:"user_agent"`
-	ExpiresAt   pgtype.Timestamptz `json:"expires_at"`
+	UserID           pgtype.UUID        `json:"user_id"`
+	Jti              pgtype.UUID        `json:"jti"`
+	DeviceLabel      pgtype.Text        `json:"device_label"`
+	Ip               string             `json:"ip"`
+	UserAgent        pgtype.Text        `json:"user_agent"`
+	ExpiresAt        pgtype.Timestamptz `json:"expires_at"`
+	SupportSessionID pgtype.UUID        `json:"support_session_id"`
 }
 
 func (q *Queries) CreateSession(ctx context.Context, arg CreateSessionParams) (pgtype.UUID, error) {
@@ -80,6 +82,7 @@ func (q *Queries) CreateSession(ctx context.Context, arg CreateSessionParams) (p
 		arg.Ip,
 		arg.UserAgent,
 		arg.ExpiresAt,
+		arg.SupportSessionID,
 	)
 	var id pgtype.UUID
 	err := row.Scan(&id)
@@ -145,18 +148,19 @@ func (q *Queries) GetRecoveryCodes(ctx context.Context, id pgtype.UUID) ([]byte,
 }
 
 const getSessionByJTI = `-- name: GetSessionByJTI :one
-SELECT s.id, s.user_id, s.revoked_at, s.expires_at, u.status AS user_status
+SELECT s.id, s.user_id, s.revoked_at, s.expires_at, s.support_session_id, u.status AS user_status
 FROM user_sessions s
 JOIN users u ON u.id = s.user_id
 WHERE s.jti = $1
 `
 
 type GetSessionByJTIRow struct {
-	ID         pgtype.UUID        `json:"id"`
-	UserID     pgtype.UUID        `json:"user_id"`
-	RevokedAt  pgtype.Timestamptz `json:"revoked_at"`
-	ExpiresAt  pgtype.Timestamptz `json:"expires_at"`
-	UserStatus string             `json:"user_status"`
+	ID               pgtype.UUID        `json:"id"`
+	UserID           pgtype.UUID        `json:"user_id"`
+	RevokedAt        pgtype.Timestamptz `json:"revoked_at"`
+	ExpiresAt        pgtype.Timestamptz `json:"expires_at"`
+	SupportSessionID pgtype.UUID        `json:"support_session_id"`
+	UserStatus       string             `json:"user_status"`
 }
 
 func (q *Queries) GetSessionByJTI(ctx context.Context, jti pgtype.UUID) (GetSessionByJTIRow, error) {
@@ -167,6 +171,7 @@ func (q *Queries) GetSessionByJTI(ctx context.Context, jti pgtype.UUID) (GetSess
 		&i.UserID,
 		&i.RevokedAt,
 		&i.ExpiresAt,
+		&i.SupportSessionID,
 		&i.UserStatus,
 	)
 	return i, err
@@ -299,20 +304,21 @@ func (q *Queries) LinkOAuthProvider(ctx context.Context, arg LinkOAuthProviderPa
 }
 
 const listUserSessions = `-- name: ListUserSessions :many
-SELECT id, jti, device_label, ip::text AS ip, user_agent, created_at, expires_at
+SELECT id, jti, device_label, ip::text AS ip, user_agent, created_at, expires_at, support_session_id
 FROM user_sessions
 WHERE user_id = $1 AND revoked_at IS NULL AND expires_at > now()
 ORDER BY created_at DESC
 `
 
 type ListUserSessionsRow struct {
-	ID          pgtype.UUID        `json:"id"`
-	Jti         pgtype.UUID        `json:"jti"`
-	DeviceLabel pgtype.Text        `json:"device_label"`
-	Ip          string             `json:"ip"`
-	UserAgent   pgtype.Text        `json:"user_agent"`
-	CreatedAt   pgtype.Timestamptz `json:"created_at"`
-	ExpiresAt   pgtype.Timestamptz `json:"expires_at"`
+	ID               pgtype.UUID        `json:"id"`
+	Jti              pgtype.UUID        `json:"jti"`
+	DeviceLabel      pgtype.Text        `json:"device_label"`
+	Ip               string             `json:"ip"`
+	UserAgent        pgtype.Text        `json:"user_agent"`
+	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+	ExpiresAt        pgtype.Timestamptz `json:"expires_at"`
+	SupportSessionID pgtype.UUID        `json:"support_session_id"`
 }
 
 func (q *Queries) ListUserSessions(ctx context.Context, userID pgtype.UUID) ([]ListUserSessionsRow, error) {
@@ -332,6 +338,7 @@ func (q *Queries) ListUserSessions(ctx context.Context, userID pgtype.UUID) ([]L
 			&i.UserAgent,
 			&i.CreatedAt,
 			&i.ExpiresAt,
+			&i.SupportSessionID,
 		); err != nil {
 			return nil, err
 		}
@@ -461,6 +468,24 @@ type UpdateUserPasswordParams struct {
 func (q *Queries) UpdateUserPassword(ctx context.Context, arg UpdateUserPasswordParams) error {
 	_, err := q.db.Exec(ctx, updateUserPassword, arg.PasswordHash, arg.ID)
 	return err
+}
+
+const userHasHealthyMembership = `-- name: UserHasHealthyMembership :one
+SELECT EXISTS (
+  SELECT 1 FROM organization_memberships m
+  JOIN organizations o ON o.id = m.organization_id
+  JOIN tenants t ON t.id = o.tenant_id
+  WHERE m.user_id = $1 AND t.status <> 'suspended'
+    AND m.lifecycle_state NOT IN ('resigned','expelled','deceased'))
+`
+
+// §15 partial access: a user with a live membership in ANY non-suspended
+// tenant keeps login; only fully-suspended users are blocked.
+func (q *Queries) UserHasHealthyMembership(ctx context.Context, userID pgtype.UUID) (bool, error) {
+	row := q.db.QueryRow(ctx, userHasHealthyMembership, userID)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
 }
 
 const userRequiresMFA = `-- name: UserRequiresMFA :one

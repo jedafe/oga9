@@ -1,0 +1,1 @@
+DROP INDEX membership_apps_approved_email;

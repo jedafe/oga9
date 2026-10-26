@@ -3,7 +3,443 @@
 All notable changes to the OGA9 platform. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 entries reference engineering phases in `.oos/roadmaps/ROADMAP-BACKEND.md`.
 
+### Fixed — Phase 08–11 review
+- Registered `notifications:dispatch`, `notifications:email`, and
+  `documents:process_upload` in the task registry — the handlers existed
+  but were never wired, so announcement fan-out, email delivery, and
+  upload validation silently retried into the DLQ.
+- `handler/chat.go`: `HasPermission` called with `(orgID, membershipID)`
+  instead of `(userID, orgID)` — `org.chat.moderate` never resolved, so
+  moderators could not delete others' messages or end others' rooms.
+- Announcement drafts were dead-ends: new
+  `POST /announcements/{aid}/publish` (org.comms.announce) fires the same
+  event + dispatch fan-out as an immediate publish.
+- Document visibility now enforced on reads: `exco` needs an active
+  appointment, `committee` needs a seat on the doc's unit, `private` is
+  uploader-only; `org.documents.publish` reads all. Hidden docs 404.
+- `StartRoom` validates `activity_id` belongs to the org through the
+  activities seam (Rule 26) — cross-org links refused.
+- Missing channel events emitted (Rule 12): `ChannelCreated`,
+  `ChannelMemberAdded`, `ChannelArchived`, `ChannelMemberRemoved`; new
+  routes `POST /channels/{cid}/archive` and
+  `DELETE /channels/{cid}/members/{mid}` (custom/dm only).
+- 11.08 sweeps landed: `chat:retention_sweep` (per-org
+  `org.chat.retention_days` soft-deletes past-window messages),
+  `voice:room_sweep` (orphaned live rooms end + participants stamped),
+  `chat:presence_sweep` (presence-depth scan; TTL stays the mechanism).
+- `MinutesApproved` consumer archives the body as a `minutes` document +
+  emits `MinutesArchived`; entity_links gains `minutes_of`/`archived_as`
+  edges. Meeting→minutes→document chain is now traversable.
+- Member-targeted events (`ActionItemOverdue`, `DuesDefaulterFlagged`)
+  now create in_app notifications (preference-gated, deduped) and emit
+  `NotificationQueued`.
+- Notification mark-read is idempotent (already-read → 200, not 404).
+- `AgendaPublished` emits when a meeting is created with an agenda.
+- Recurrence generation scans forward from `after` — past occurrences
+  are never minted retroactively.
+- Attendance re-mark (late/absent → present/excused) revokes the
+  assessed fine via the finance seam (`RevokeFine` → waived obligation
+  + `ObligationWaived`).
+- Room end stamps all open participant rows (`left_at`).
+- Spec drift reconciled: routes catalog (async export, publish, archive,
+  member-remove), `membership:export` payload `{export_id}`,
+  `payments.drive_id` in §12 DDL, roadmap 11.08.
+
+## Phase 12 — Subscription Admin / Control Plane (§15)
+
+- `tenant:provision` is now real: `POST /platform/tenants` creates a
+  durable `tenant_provisions` row (idempotency on `request_id`), then the
+  critical-queue task provisions tenant + owner user + trial subscription
+  (billing seam) + owner org from template (tenant bootstrap seam) and
+  emits `TenantProvisioned`. Replays return the recorded ids.
+- Operator routes (platform.* nodes): tenants list/get/suspend/reinstate,
+  subscriptions list + audited `/{sid}/override` (SubscriptionChanged →
+  entitlement flush), plans upsert, deployments list/create,
+  `support/impersonate` + `/{sid}/end`, audit query, usage meters,
+  feature-flags list/set.
+- Suspended tenants block login for non-platform users (auth gate);
+  platform operators still authenticate to reinstate.
+- Impersonation is audit-first (Rule 10 — failed audit aborts), 30min TTL
+  enforced on read; `GET /me/support-sessions` is the tenant-visible
+  banner surface (`{impersonated, sessions}`).
+- `deployments`, `support_sessions`, `feature_flags`, `tenant_provisions`
+  tables (000160); flag seeds incl. `platform.ai_assistant.enabled`.
+- Suspension is scoped access, not blanket lockout: login is blocked only
+  when the user has no live membership in ANY non-suspended tenant, and
+  `ResolveOrgCtx` refuses suspended-tenant orgs on both cached and fresh
+  paths (write-through `oga9:tenant_status:{tid}` makes it immediate).
+- `user_sessions.support_session_id` (000161) links impersonation
+  sessions to their audit record; session listings expose it.
+- Voice-room sweep age cap is `OGA9_VOICE_ROOM_MAX_AGE_HOURS`
+  (default 12) — no hardcoded sweep constants.
+- Usage meters recompute on `SubscriptionChanged`/`TenantProvisioned` via
+  the `usage_recompute` consumer (orgs, active members, branch-counted
+  units; absolute `SetUsage` write — replay-safe). `limit.storage.mb`
+  joins when documents carry a byte-size column.
+- Welcome mail lands: auth mints a 48h `password_reset` action token for
+  the provisioned owner; `platform.SetWelcomeMail` wires mailer+token and
+  stays fire-and-forget so mail failure never fails the pipeline.
+
 ## [Unreleased]
+
+### Added — Phase 11: Comms & Documents (§14), part 1
+- Migrations 000150–000153: `member_exports` (§11 durable export row),
+  `announcements`, `notifications`, `notification_preferences`,
+  `documents` + `document_versions` (soft-delete, Rule 11), and the
+  deferred `payment_claims.receipt_media_id` FK (`NOT VALID` — existing
+  claim rows predate documents). g11 renumbered past the applied max —
+  golang-migrate silently skips versions below it; MIGRATION-ORDER's
+  reserved 000090–000099 is now documented-dead.
+- `membership:export` is a real async path: `POST /members/export` →
+  durable row + task → `GET /members/exports/{eid}` streams the CSV.
+  Synchronous `GET` stays for small exports.
+- `internal/comms` + `comms_documents` app group: announcements
+  (draft|published|retracted, audience = all|categories|unit_ids),
+  `AnnouncementPublished`/`AnnouncementRetracted`/`BroadcastQueued` in-tx,
+  `notifications:dispatch` resolves the audience snapshot → per-user
+  `notification_preferences` gate → `in_app` rows; `/me/notifications`,
+  `/me/notifications/{id}/read`, `/me/preferences` GET|PATCH.
+- `notifications:email` reuses the sendMail body.
+
+### Added — Phase 11: Comms & Documents (§14/§24), part 2
+- `internal/storage`: disk-backed blob store under `OGA9_UPLOADS_DIR`
+  (Rule 29 — no external service needed; S3-compatible backends plug in
+  behind the same interface later).
+- Documents: multipart upload → `documents` row + `DocumentUploaded` +
+  `documents:process_upload` (validates the blob landed, soft-deletes
+  poisoned uploads), PATCH title/visibility/`clear_unit` (visibility
+  changes emit `DocumentAccessChanged`), soft delete (Rule 11), versioned
+  re-upload (`DocumentVersioned`, version rows), org download, public
+  `/directory/orgs/{slug}/docs` (visibility=public only).
+- `comms_documents` manifest fix (000154): all §14 + §24 nodes declared.
+- §24 chat (000155): `chat_channels`/`chat_channel_members`/
+  `chat_messages`/`chat_read_states`; channels with derived membership
+  (general = all active, unit = home unit, explicit rows for
+  exco/custom/dm/committee); messages CRUD with soft delete + mutes +
+  read states; `MessagePosted`/`MessageDeleted` in-tx.
+- `internal/realtime`: `/ws` gateway (coder/websocket) — session-authed
+  upgrade, per-channel subscribe gated through `chat.CanSubscribe`
+  (Rule 26), Valkey pub/sub `oga9:realtime:chat` fans messages out to
+  connected members across instances.
+- Catalogs synced: routes (§14 download/versions + `/ws`), cache keys
+  (`oga9:realtime:chat`), settings (`org.chat.voice_max_seconds`,
+  `org.chat.edit_window_minutes`).
+- Seeded notification kinds are emitted inline by producers
+  (announcement today; others land with their consumer domains).
+
+### Added — Phase 11 closeout (§14/§24 hardening)
+- `notifications:email` fan-out: `AudienceRecipients` joins emails, the
+  email channel has its own preference gate, and the dispatch worker
+  enqueues one `notifications:email` per opted-in address (in_app and
+  email are independently gated).
+- Voice rooms per §24 (000158): `voice_rooms`/`voice_room_participants`,
+  start → join (short-lived LiveKit JWT signed with
+  `OGA9_LIVEKIT_API_KEY/SECRET`, video grant scoped to the room) → leave →
+  end (starter or `org.chat.moderate`), with `VoiceRoomStarted`/
+  `VoiceRoomEnded`/`VoiceParticipantJoined`/`VoiceParticipantLeft` in-tx.
+  Unconfigured provider returns 503 (Rule 29).
+- `oga9:presence:{member}` heartbeat every 30s while subscribed
+  (90s TTL); `{"unsubscribe": "<cid>"}` releases the seat.
+- Chat hardening: functional unique on `(org,kind,COALESCE(unit_id,…))`
+  stops duplicate general channels (NULLs aren't equal in plain UNIQUE);
+  `CreateChannel` falls back to `GetChannelByKind` on conflict;
+  exco/committee channel derivation; `IsChannelMemberForUser` binds WS
+  subscriptions to the session user; voice duration cap; dispatch dedupe;
+  `Content-Disposition` sanitization.
+- Review fixes: `/directory/orgs/{slug}/docs` routed, WS OriginPatterns
+  enforced, anonymous guest rows refused, guest-contact dedupe (000156),
+  `NotificationRead` + `delivered_at`, executable magic-byte sniff.
+- Tests: `internal/comms` (announce→dispatch→prefs→retract, document
+  lifecycle, chat flow) and `internal/realtime` (subscribe→presence→
+  fan-out→spoof rejection, end-to-end over live valkey+postgres).
+
+### Added — Phase 10: Events & Meetings (§13)
+- Schema g10 (000140–000145): `activities` spine (kind=meeting|event,
+  unit-scoped, quorum/capacity columns), `meeting_agendas`, `minutes`
+  (versioned, draft|approved|archived), `action_items`, `attendances`
+  (composite mark sheet), `event_registrations` (member-partial-unique,
+  guests carry name/contact), `activity_recurrences` (RRULE templates),
+  and the `payments.activity_id` FK backfill (stub → ALTER pattern).
+  Numbering per the renumbered MIGRATION-ORDER (000140–000149).
+- `internal/activities` service + `handler/activities.go` + routes behind
+  `RequireAppActive("events_meetings")`: meetings/events CRUD with
+  notice-window warnings and quorum/capacity resolved from org_settings
+  (Rule 23); agenda upsert → `AgendaPublished`; versioned minutes with
+  draft→approved CAS + older-version archival → `MinutesApproved`;
+  action items (assignee self-complete vs `org.action_items.manage`),
+  daily overdue sweep → `ActionItemOverdue`; bulk attendance sheet →
+  `AttendanceRecorded` per mark + late/absent fines posted through the
+  finance `AssessFine` seam (Rule 26 — deduped per `attendance:{id}`
+  period); `EvaluateQuorum` → `QuorumEvaluated`; event register
+  (member dedupe + `event_full` capacity) → `EventRegistrationConfirmed`,
+  check-in → `CheckedIn`; org + `/me` calendars and `/me/action-items`;
+  `activities:generate_recurrences` (minimal FREQ/INTERVAL/COUNT/UNTIL
+  RRULE, 35-day horizon, `rec:`-tag dedupe), `remind_upcoming` →
+  `MeetingReminderDue`, `overdue_action_items` — all three task types
+  registered; the daily pair ride the `oga9:sweep:daily:*` gate.
+- `finance.AssessFine` exported as the cross-module penalty seam;
+  `assessFine` generalised with a caller-scoped period label.
+
+### Fixed — Phase 10 review, round 1
+- `CheckedIn` emitted the activity id as `registration_id` — now `r.ID`.
+- `remind_upcoming` re-emitted `MeetingReminderDue` every tick for every
+  activity in its 48h window (~576 dupes per meeting): new
+  `activities.reminder_sent` flag (000146) + `ClaimReminders` emit-once CAS.
+- `PATCH /meetings/{aid}` now applies `agenda` (meeting-only →
+  `AgendaPublished`) and validates `status` ∈ scheduled|completed|cancelled.
+- Register path serializes per event via `FOR UPDATE` — two concurrent
+  registrations can no longer both pass the capacity headcount.
+- Unit-scoped meetings evaluate quorum against the unit roster
+  (`committee_memberships`), not the whole org.
+- Action-item complete route corrected to spec-literal
+  `PATCH /meetings/{aid}/action-items/{iid}` (`{"state":"done"}` self or
+  `org.action_items.manage`; field edits manage-only).
+- `actErr` default was a 400 — internal errors now 500 with server-side
+  logging; malformed `?unit=` is a 400 instead of a silent no-filter.
+- Recurrence instances now carry `activities.recurrence_id` (000147) with
+  an atomic `UNIQUE(recurrence_id, starts_at)` dedupe — replaces the
+  `rec:`-in-description tag and its LIKE existence check.
+- RRULE grammar expanded: FREQ=DAILY|WEEKLY|MONTHLY|YEARLY, INTERVAL,
+  COUNT, UNTIL (inclusive), BYDAY (WEEKLY), BYMONTHDAY (MONTHLY) — a
+  day-scan matcher replaces the fixed stepper; unknown tokens fail
+  closed rather than generating wrong instances.
+- Rescheduling an activity (`starts_at` PATCH) re-arms its reminder —
+  `reminder_sent` clears when the start moves, not on field-only edits.
+- `ClaimReminders` scoped to meetings only (§13 notice rules are
+  meeting-scoped; events have no catalogued reminder event).
+- `/me/calendar` excludes pending states positively
+  (`active|suspended|life_member`) — an applicant's pending membership no
+  longer leaks the org calendar.
+- Attendance fines resolve `org.dues.currency` from org_settings instead
+  of hardcoded NGN.
+- Action-item PATCH: `{"state":"cancelled"}` (manage-only) via
+  `CancelActionItem`; unknown state values and empty PATCH bodies now
+  400 instead of silent no-ops.
+- `actSweep` handler closures nil-guard `d.Activities` (the comment
+  claimed the adapter guarded; a nil service would have panic-retried
+  forever in the worker).
+- **Cross-org scoping (Rule 24).** `ApproveMinutes`, `CheckIn`,
+  `Complete/Patch/CancelActionItem`, `ListMinutes`, `ListActionItems`
+  addressed rows by id without verifying `organization_id` — a caller's
+  OrgCtx did not stop org A's IDs being mutated/read by org B. All are
+  now EXISTS/`IN`-scoped through the parent activity; regression-tested.
+- Claim-then-emit sweeps (`overdue_action_items`, `remind_upcoming`)
+  claimed rows outside a tx then emitted separately — a failed emit
+  permanently dropped the event. Both now claim + emit in one tx.
+- `DraftMinutes` maps the `UNIQUE(activity_id,version)` collision from
+  concurrent drafts to `invalid_state_transition` instead of a 500.
+- `MarkAttendance` refuses marks on cancelled meetings.
+
+### Fixed — Phase 08–10 review, final
+- **§13 route surface wired.** Meetings/events CRUD, attendance (POST +
+  GET sheet), minutes (draft/list/approve), agenda, quorum, action-items,
+  register/check-in/registrations, org calendar, and recurrences now sit
+  behind `RequireAppActive("events_meetings")` with their §13 permission
+  nodes — the whole org surface was previously unreachable (only
+  `/me/calendar` + `/me/action-items` existed).
+- **Recurrence dedupe actually dedupes.** `GenerateRecurrences` used
+  `CreateActivity` without `recurrence_id` — the
+  `UNIQUE(recurrence_id, starts_at)` index could never fire, so every
+  daily sweep re-minted the full horizon. Now uses the purpose-built
+  `CreateRecurrenceInstance` (ON CONFLICT DO NOTHING → replay mints 0),
+  drops the `rec:` description tag, and COUNT caps the series total via
+  `CountRecurrenceInstances` instead of per-window.
+- **Recurrence time-of-day.** Templates carry required `time_of_day`
+  ("HH:MM"); instances no longer inherit the cron run's timestamp.
+  `POST/GET /orgs/{id}/recurrences` registers and lists series.
+- **`ActionItemCompleted` emits** on both self and manage-complete paths
+  (was catalogued but never produced).
+- **`EventCompleted` only fires for events** — meetings closing emit
+  nothing (was kind-agnostic).
+- **`events_meetings` manifest drift** (000148): declares all 7 §13 nodes
+  — `org.meetings.manage`, `org.meetings.attendance.record`,
+  `org.action_items.manage` were missing.
+- **Guest check-in** via `registration_id` (CheckInByID); `registered_by`
+  on event_registrations (000149) backs `org.events.guest_cap` — a member
+  can no longer stuff a roster with unbounded guests.
+- **Quorum denominator** counts committee roster AND members whose home
+  unit is the activity's unit — branch-scoped meetings (no committee
+  rows) can now pass quorum. Emit failure propagates instead of dropping
+  `QuorumEvaluated`.
+- **PATCH semantics**: `clear_unit` strips unit scope; reschedule
+  re-evaluates `notice_warning`; unit-filtered calendar includes
+  org-wide activities.
+- **ADR-014 `invited → withdrawn`** added (any → withdrawn while
+  pre-active); `Eligible` surfaced on `/me/memberships` rows; malformed
+  `?unit=` on members list is a 400.
+- **`PatchDrive` nil-deref** — `*closesAt` was evaluated unconditionally;
+  a title-only PATCH panicked → 500.
+- **`finance:issue_receipt` can succeed** — `EnsureReceipt` queried the
+  payment without org scope and always 404'd; new `GetPaymentAny`
+  (task-context lookup) fixes it.
+- **`DuesDefaulterFlagged` can't be lost** — standing read, recompute and
+  the flag emit now share one tx; a failed emit rolls the standing back
+  so the next tick retries (same class fixed in the P10 sweeps).
+- **`once`-schedule collision** — period_label for one-off schedules is
+  now `once:{schedule}` so a second one-off of the same contribution type
+  still generates obligations.
+- **`payments.activity_id` write path** — `PaymentIn.activity_id` +
+  `finSvc.SetActivityGate(actSvc.ActivityInOrg)` (Rule 26 seam); event
+  donations view is no longer read-only-empty.
+- **`OpenDrive` org-validates** `benefit_member_id` +
+  `contribution_type_id` (cross-org FK linkage was insertable).
+- **Life-member rule** — `applies_to.include_life_members` opts life
+  members into a schedule's payee set ("dues-exempt per org rule" is now
+  actually an org rule).
+- **Overdue stays overdue** — `refreshObligation` no longer flips
+  `overdue` back to `open`/`partially_paid` on a reversal; only full
+  settlement clears it.
+- **Ad-hoc claim allocation** — `confirm` accepts `drive_id` /
+  `obligation_id` overrides (§12 "officer assigns on confirm").
+- **`/finance/statement` is a real statement** — purse balance +
+  month/year inflow-outflow + per-account breakdown (was bare
+  account×direction totals).
+- **`/finance/contributions` attribution** — drive payments use the
+  drive's contribution type; member-directed donations bucket as
+  `donation` (was all `general`).
+- Spec synced: api-routes (§13 read surface + recurrences),
+  system-settings (`org.events.guest_cap`), §13 schema/API/rules.
+
+### Fixed — Phase 05–09 review, round 5
+- **Claim dedupe 500 → 409.** `payment_claims` insert conflict now maps to
+  `ErrAlreadyClaimed` (was dead code: `ON CONFLICT DO NOTHING` returns
+  `pgx.ErrNoRows`, which escaped as an internal error). Rejected claims no
+  longer burn the member's `external_ref` — the dedupe index is now
+  `WHERE state <> 'rejected'` so corrected proof can resubmit (000108).
+- **Disbursed drives refuse late confirms.** A payment initiated while a
+  drive was open can't confirm after `disbursed`/`cancelled` — the credit
+  would land outside the disbursed total. `closed` still confirms
+  (money sent before the deadline).
+- **Idempotency-key payload binding.** Replays compare amount/currency/
+  channel/payee/obligation/drive/benefit — key reuse with a different
+  payment returns `idempotency_key_in_use` instead of silently replaying.
+- **Obligation ownership.** `record_payment` with `obligation_id` requires
+  the payer to own the obligation (on-behalf payments go through ad-hoc
+  claims — keeps the who's-paid roll call honest).
+- **Renewal↔payment is 1:1.** `membership_renewals_payment_uq` partial
+  unique + a `NOT EXISTS` guard — one confirmed payment settles at most
+  one renewal (000108).
+- **ADR-014 `any → withdrawn` while pre-active.** `approved`/`registered`
+  members can now withdraw; emits the newly-catalogued `MemberWithdrawn`
+  (sourced — joins the membership-history stream).
+- **MFA-complete materializes applications.** The §11 verified-bind hook
+  now also runs after `mfa/complete` (was login/verify/OAuth only).
+- **Schedule PATCH can clear `ends_on`** (`{"ends_on":null}` →
+  `clear_ends_on`), `applies_to` defaults `{}` on create, drive PATCH is
+  a real partial update (was all-or-nothing requiring `title`).
+- **`DuesSchedulePublished` consumer** enqueues
+  `finance:generate_obligations` for the new schedule — no more waiting
+  for the daily sweep (catalog's obligations-gen consumer, now real).
+- **Sweep cadence.** Obligation generation + overdue sweep are daily per
+  the §12 table, gated by `oga9:sweep:daily:{name}` SET NX EX — was
+  every 5-min tick. Drive auto-close stays per-tick.
+- **Error hygiene.** `finErr` no longer leaks internal error text;
+  malformed UUID path params are 400s, not 404s/409s;
+  `ConfirmClaim`/`RejectClaim` only mask `ErrNoRows` as
+  `invalid_state_transition` (real DB errors surface).
+- **finance_lite manifest** declares the full §12 node surface (000108 —
+  same drift class 000107 fixed for the other manifests).
+- Sweep/task events resolve the org's tenant (`GetOrgTenantID`) — no more
+  NULL-tenant `ReceiptIssued`/`ContributionDriveClosed` on the retry path.
+- `/me/finance` feed interleaves obligations (due_date) and payments
+  (created_at) chronologically instead of obligations-last.
+- Spec synced: MIGRATION-ORDER (g10 renumber to 000140–000149 — lower
+  versions are silently skipped), api-routes (`/orgs/{id}/resign`,
+  self-withdraw, decision `withdraw`), domain-events (`MemberWithdrawn`,
+  `PaymentReceived` payload), cache-keys (`oga9:sweep:daily:*`), §11/§12.
+
+### Added — Phase 09: Finance-lite (§12)
+- Schema g12 (000100–000106): `contribution_types`, `dues_schedules`,
+  `obligations`, `contribution_drives`, `payments` (+`claim_id` FK in
+  000104), `payment_claims`, `ledger_entries` (append-only, Rule 19),
+  `receipts` (org-scoped `RCP-YYYY-NNNNN` via `organizations.receipt_no_seq`),
+  `reconciliation_records`, and `membership_renewals.payment_id` FK.
+  `payments.activity_id`/`receipt_media_id` are untyped FKs until groups
+  10/11 land (MIGRATION-ORDER).
+- Obligation generation (`finance:generate_obligations`): active schedules
+  fan out to matching active members per `applies_to` category/unit filter;
+  period labels derive from recurrence (Rule 23); the
+  `(membership,type,period)` unique makes every pass idempotent.
+- Verified-provenance payments: `POST /finance/payments` requires
+  `Idempotency-Key` (Rule 9 — replays return the original); officer path
+  is record→approve with recorder≠approver enforced in the confirm CAS
+  (`separation_of_duties`); member path is claim→confirm, the claim row
+  carrying provenance (`receipt_media_id` gated by
+  `org.finance.claims.require_receipt` for non-cash).
+- Confirm posts ledger credit + receipt + obligation refresh + sourced
+  events in one tx (Rule 12). Reversals append `reversal_of` debit
+  entries — ledger rows are never updated. Reconcile marks
+  confirmed→reconciled with a reconciliation_record.
+- Contribution drives: open (voluntary|fixed_amount) → close (manual or
+  `finance:drive_closing_sweep` at `closes_at`) → disburse (debit ledger
+  entry + `ContributionDisbursed`).
+- `finance:overdue_sweep` marks grace-expired obligations overdue and
+  re-derives `dues_standing` (good|poor); a `dues_standing` outbox consumer
+  recomputes on payment/obligation events.
+- `billing:retry_payment` activated — failed payments re-enter `initiated`
+  for re-approval.
+- Renewal → payment link: `POST .../renew` accepts `payment_id`;
+  `membership_renewals.payment_id` FK wired (000106).
+- Routes: the §12 surface under `RequireAppActive("finance_lite")` +
+  per-node gates; `/me/finance` + `/me/claims` are cross-org member views.
+  Catalog updated with the previously unlisted drives/claims/ledger/
+  statement/confirm rows.
+- Tests: `TestFinanceFlow` covers generation + idempotent replay, SoD
+  confirm, partial→paid, reversal, claim provenance, drive disburse, and
+  cross-org isolation.
+
+### Fixed — Phase 05–08 deep review
+- **Intake dead-ends closed.** Invited members land `applied` with no
+  application row — `TransitionMember` now runs the intake verbs
+  (screen/approve/reject/withdraw) on memberships, and membership-level
+  approve mints `member_no` when absent (`SetMemberNo` is live). Re-invite
+  resets resigned/withdrawn/rejected members to `applied`; expelled stays
+  barred (`forbidden`).
+- **Pre-signup applications materialize.** `MaterializeApprovedApplications`
+  links `user_id` (CAS on NULL) and creates the `approved` membership +
+  member_no + migrated sponsors; wired into verify-email, login, and OAuth
+  callback via a nil-safe `MemberMaterializer` seam — best-effort, never
+  fails the auth response.
+- `app_installations` backfill for pre-Phase-07 tenants (000077) —
+  `RequireAppActive` no longer 403s legacy orgs; `member_no` unique index
+  (000078) + approved-application email index (000079).
+- `Apply` rejects existing members (`already_a_member`) instead of a 500
+  on the org+user unique at approve; public apply dedupes member emails;
+  open-application checks only count undecided statuses — decided rows no
+  longer block re-application.
+- `MemberHistory` now matches the `membership_history` view contract —
+  sourced, membership-family aggregates (identity events no longer leak).
+- Sponsor fixes: screener extras deduped against the primary + each other
+  (one person can't satisfy `sponsor_required=2`), and restricted to
+  screen/approve actions.
+- `rejected`/`withdrawn` added to `lifecycleBlocked` and the permission
+  resolver's lifecycle filter — intake exits confer no org context/grants.
+- Self-service exits: `POST /orgs/{id}/resign` (suspended members carry no
+  OrgCtx but may still resign); self `withdraw` on pre-active memberships;
+  self-PATCH limited to `org_unit_id` (category stays admin-only);
+  `/renew` restricted to `manage` until Phase 09 wires payment (self-renew
+  would mint free good-standing); renewals restore `dues_standing='good'`.
+- Outbox dispatcher: `FOR NO KEY UPDATE SKIP LOCKED` batch claim inside
+  the lease (FOR UPDATE would self-deadlock on `event_consumer_log`'s
+  FK check), and `LogConsumerProcessed` inserts FIRST inside the consumer
+  tx — the atomic dedupe, so an overlapping dispatcher skips rather than
+  replays.
+- Billing: `ChangePlan` CAS on `plan_slug` (raced writes surface a
+  conflict, never silently overwrite); `canonicalJSON` uses `UseNumber`
+  so >2^53 license limits survive signing; license limit merge treats
+  `-1` (unlimited) as absorbing.
+- Imports: stale 'processing' rows re-driven by a `scheduler:tick` sweep
+  (webhook redrive parity); enqueue failure fails the row visibly;
+  `IssueCard` returns the live card on a unique-race instead of 500;
+  `memberImport` archives on a missing durable row.
+- `entity_links` targets resolve only per-rule keys — a missing payload
+  key skips the edge instead of linking a wrong-typed id; webhook rate
+  limit raised to 300/min for provider bursts.
+- Catalog: `CardIssued`, `LifeMemberAwarded` flagged sourced per the §11
+  history-view contract.
+- Tests: `TestIntakeDeadEnds` covers invite→screen→approve→register→
+  activate, pre-signup materialize + idempotent replay, and the
+  sponsor double-count guard.
 
 ### Fixed — Phase 08 review, round 3
 - `membership_cards` partial index is now UNIQUE (000076) — one live card

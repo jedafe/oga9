@@ -3,6 +3,7 @@ module github.com/jedafe/oga9
 go 1.26.4
 
 require (
+	github.com/coder/websocket v1.8.12
 	github.com/getsentry/sentry-go v0.50.0
 	github.com/go-chi/chi/v5 v5.5.0
 	github.com/golang-jwt/jwt/v5 v5.3.1

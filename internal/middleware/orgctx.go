@@ -32,6 +32,8 @@ func RequireOrgCtx(svc *tenant.Service) func(http.Handler) http.Handler {
 					httpx.WriteErr(w, 404, "org_not_found", "organization not found")
 				case tenant.ErrNotMember:
 					httpx.WriteErr(w, 403, "not_a_member", "not a member of this organization")
+				case tenant.ErrTenantSuspended:
+					httpx.WriteErr(w, 403, "tenant_suspended", "organization account is suspended")
 				default:
 					httpx.WriteErr(w, 500, "internal_error", "org resolution failed")
 				}

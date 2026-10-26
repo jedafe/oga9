@@ -9,6 +9,7 @@ package events
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"sort"
@@ -58,6 +59,11 @@ func (d *Dispatcher) names() []string {
 	return n
 }
 
+// errAlreadyLogged marks a consumer whose log insert found the row already
+// present — a second dispatcher overlapping on lease lapse hit the atomic
+// dedupe and must skip the body, not replay it.
+var errAlreadyLogged = errors.New("consumer_already_logged")
+
 // ProcessTask is the asynq handler for events:dispatch_outbox. One
 // dispatcher runs at a time via the Valkey lease; a second tick while the
 // lease is held is a no-op.
@@ -77,18 +83,30 @@ func (d *Dispatcher) ProcessTask(ctx context.Context, t *asynq.Task) error {
 		Script(`if redis.call("get", KEYS[1]) == ARGV[1] then return redis.call("del", KEYS[1]) else return 0 end`).
 		Numkeys(1).Key(LockKey).Arg(token).Build())
 
-	rows, err := d.q.FetchPendingEvents(ctx, db.FetchPendingEventsParams{
+	// The claim tx holds FOR UPDATE SKIP LOCKED on the batch for the whole
+	// pass: a second dispatcher whose lease lapped ours skips these rows
+	// entirely. Event-row bookkeeping (dispatched/attempt/dead marks) runs
+	// inside this same tx — the locks are already ours, so no self-block.
+	// Consumer work stays in per-consumer txs: their writes + log insert
+	// commit independently of this batch bookkeeping.
+	claimTx, err := d.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer claimTx.Rollback(ctx)
+	q := d.q.WithTx(claimTx)
+	rows, err := q.FetchPendingEvents(ctx, db.FetchPendingEventsParams{
 		MaxAttempts: MaxAttempts, BatchSize: batchSize,
 	})
 	if err != nil {
 		return err
 	}
 	for _, r := range rows {
-		if err := d.dispatch(ctx, r); err != nil {
+		if err := d.dispatch(ctx, q, r); err != nil {
 			log.Printf("outbox: event %s (%s) failed: %v", r.ID.String(), r.EventType, err)
 		}
 	}
-	return nil
+	return claimTx.Commit(ctx)
 }
 
 func toEvent(r db.FetchPendingEventsRow) (Event, error) {
@@ -111,15 +129,16 @@ func toEvent(r db.FetchPendingEventsRow) (Event, error) {
 // dispatch runs every registered consumer over one event: each logs into
 // event_consumer_log inside its own tx. When all consumers have logged,
 // dispatched_at is set; otherwise attempts++ and the event is retried on
-// the next tick (or dead-lettered at the cap).
-func (d *Dispatcher) dispatch(ctx context.Context, r db.FetchPendingEventsRow) error {
+// the next tick (or dead-lettered at the cap). Event-row writes go
+// through the claim tx q — the row lock is already held there.
+func (d *Dispatcher) dispatch(ctx context.Context, q *db.Queries, r db.FetchPendingEventsRow) error {
 	e, err := toEvent(r)
 	if err != nil {
-		return d.q.DeadLetterEvent(ctx, db.DeadLetterEventParams{ID: r.ID, LastError: pgtype.Text{String: "payload unmarshal: " + err.Error(), Valid: true}})
+		return q.DeadLetterEvent(ctx, db.DeadLetterEventParams{ID: r.ID, LastError: pgtype.Text{String: "payload unmarshal: " + err.Error(), Valid: true}})
 	}
 	var failures []string
 	for _, name := range d.names() {
-		logged, err := d.q.ConsumerLogged(ctx, db.ConsumerLoggedParams{Consumer: name, EventID: r.ID})
+		logged, err := q.ConsumerLogged(ctx, db.ConsumerLoggedParams{Consumer: name, EventID: r.ID})
 		if err != nil {
 			return err
 		}
@@ -127,24 +146,31 @@ func (d *Dispatcher) dispatch(ctx context.Context, r db.FetchPendingEventsRow) e
 			continue
 		}
 		if err := d.runConsumer(ctx, name, e); err != nil {
+			if errors.Is(err, errAlreadyLogged) {
+				continue // overlapping dispatcher logged it first — done, not failed
+			}
 			failures = append(failures, fmt.Sprintf("%s: %v", name, err))
 			log.Printf("outbox: consumer %s on %s failed: %v", name, e.Type, err)
 		}
 	}
 	if len(failures) == 0 {
-		return d.q.MarkEventDispatched(ctx, r.ID)
+		return q.MarkEventDispatched(ctx, r.ID)
 	}
 	failed := strings.Join(failures, "; ")
 	if e.Attempts+1 >= MaxAttempts {
-		return d.q.DeadLetterEvent(ctx, db.DeadLetterEventParams{
+		return q.DeadLetterEvent(ctx, db.DeadLetterEventParams{
 			ID: r.ID, LastError: pgtype.Text{String: "dead: " + failed, Valid: true},
 		})
 	}
-	return d.q.RecordEventAttempt(ctx, db.RecordEventAttemptParams{
+	return q.RecordEventAttempt(ctx, db.RecordEventAttemptParams{
 		ID: r.ID, LastError: pgtype.Text{String: failed, Valid: true},
 	})
 }
 
+// runConsumer claims the consumer_log row BEFORE running the body — the
+// insert is the atomic dedupe (0 rows = someone else logged it). A body
+// failure rolls the log row back with the consumer's writes, so the pair
+// always retries together (§05 contract).
 func (d *Dispatcher) runConsumer(ctx context.Context, name string, e Event) error {
 	tx, err := d.pool.Begin(ctx)
 	if err != nil {
@@ -152,10 +178,14 @@ func (d *Dispatcher) runConsumer(ctx context.Context, name string, e Event) erro
 	}
 	defer tx.Rollback(ctx)
 	q := d.q.WithTx(tx)
-	if err := d.consumers[name](ctx, q, e); err != nil {
+	n, err := q.LogConsumerProcessed(ctx, db.LogConsumerProcessedParams{Consumer: name, EventID: pgtype.UUID{Bytes: e.ID, Valid: true}})
+	if err != nil {
 		return err
 	}
-	if err := q.LogConsumerProcessed(ctx, db.LogConsumerProcessedParams{Consumer: name, EventID: pgtype.UUID{Bytes: e.ID, Valid: true}}); err != nil {
+	if n == 0 {
+		return errAlreadyLogged
+	}
+	if err := d.consumers[name](ctx, q, e); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)

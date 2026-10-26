@@ -1,0 +1,533 @@
+// Package platform implements §15 subscription & platform admin — the
+// control-plane surface: tenant provisioning, plan/subscription overrides,
+// deployments, support impersonation, audit + usage reads, feature flags.
+//
+// Ref: oga9-engineering/sections/15-subscription-admin.md
+package platform
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/jedafe/oga9/internal/billing"
+	"github.com/jedafe/oga9/internal/db"
+	"github.com/jedafe/oga9/internal/events"
+)
+
+var (
+	ErrNotFound          = errors.New("not found")
+	ErrBadValue          = errors.New("bad value")
+	ErrProvisionConflict = errors.New("provision_in_progress")
+	ErrProvisionMismatch = errors.New("provision_intent_mismatch")
+	ErrSessionExpired    = errors.New("support_session_expired")
+)
+
+func toPg(u uuid.UUID) pgtype.UUID   { return pgtype.UUID{Bytes: u, Valid: u != uuid.Nil} }
+func fromPg(u pgtype.UUID) uuid.UUID { return uuid.UUID(u.Bytes) }
+func pgText(s string) pgtype.Text    { return pgtype.Text{String: s, Valid: s != ""} }
+
+// intentPayload serializes the client-supplied fields — RequestedBy is
+// server-set and excluded from the intent comparison.
+func intentPayload(in ProvisionRequest) []byte {
+	in.RequestedBy = uuid.Nil
+	b, _ := json.Marshal(in)
+	return b
+}
+
+// sameIntent compares a stored payload against the incoming request.
+// jsonb normalizes key order, so compare via unmarshal, not bytes.
+func sameIntent(stored []byte, in ProvisionRequest) bool {
+	if len(stored) == 0 {
+		return true // rows created before the payload column — allow
+	}
+	var prior ProvisionRequest
+	if err := json.Unmarshal(stored, &prior); err != nil {
+		return false
+	}
+	prior.RequestedBy = uuid.Nil
+	want := in
+	want.RequestedBy = uuid.Nil
+	return prior == want
+}
+
+// OrgBootstrap creates the owner org from a template inside the provision
+// pipeline — wired to tenant.CreateOrg (Rule 26: platform never writes org
+// tables itself).
+type OrgBootstrap func(ctx context.Context, userID uuid.UUID, name, slug, templateSlug, orgType, country, city, billingEmail string, requestedTenant uuid.UUID) (uuid.UUID, error)
+
+type Service struct {
+	pool      *pgxpool.Pool
+	q         *db.Queries
+	boot      OrgBootstrap
+	welcomeFn WelcomeMail
+	// sessionMinter mints the impersonation JWT — wired to
+	// auth.CreateSupportSession (Rule 26: platform never writes
+	// user_sessions itself).
+	sessionFn func(ctx context.Context, supportSessionID, targetUserID uuid.UUID, ttl time.Duration, ip, ua string) (token string, sessionID uuid.UUID, err error)
+	trial     int64 // default trial days — operator may override per request
+}
+
+func NewService(pool *pgxpool.Pool) *Service {
+	return &Service{pool: pool, q: db.New(pool), trial: 14}
+}
+
+func (s *Service) SetOrgBootstrap(fn OrgBootstrap) { s.boot = fn }
+func (s *Service) SetTrialDays(d int64)            { s.trial = d }
+
+func (s *Service) withTx(ctx context.Context, fn func(*db.Queries) error) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if err := fn(db.New(tx)); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// ProvisionRequest is the operator's POST /platform/tenants body.
+type ProvisionRequest struct {
+	RequestID    string    `json:"request_id"`
+	RequestedBy  uuid.UUID `json:"requested_by"` // operator user (server-set)
+	TenantName   string    `json:"tenant_name"`
+	TenantSlug   string    `json:"tenant_slug"`
+	Edition      string    `json:"edition"`
+	BillingEmail string    `json:"billing_email"`
+	OwnerEmail   string    `json:"owner_email"`
+	OwnerName    string    `json:"owner_name"`
+	OrgName      string    `json:"org_name"`
+	OrgSlug      string    `json:"org_slug"`
+	Template     string    `json:"template"`
+	OrgType      string    `json:"org_type"`
+	Country      string    `json:"country"`
+	City         string    `json:"city"`
+	TrialDays    *int64    `json:"trial_days"`
+}
+
+// Provision — §15 pipeline: durable request row (idempotency key) →
+// tenant + owner user + trial subscription (billing seam) → owner org via
+// the tenant bootstrap → TenantProvisioned. Replays return recorded ids;
+// a failed run reclaims its row for retry.
+func (s *Service) Provision(ctx context.Context, in ProvisionRequest, actor uuid.UUID) (tenantID, orgID uuid.UUID, status string, err error) {
+	if in.RequestID == "" || in.TenantName == "" || in.TenantSlug == "" || in.OrgSlug == "" || in.OwnerName == "" || in.OwnerEmail == "" {
+		return uuid.Nil, uuid.Nil, "", ErrBadValue
+	}
+	if in.Edition == "" {
+		in.Edition = "cloud"
+	}
+	if in.Template == "" {
+		in.Template = "association"
+	}
+	if in.OrgName == "" {
+		in.OrgName = in.TenantName
+	}
+	row, err := s.q.CreateProvision(ctx, db.CreateProvisionParams{RequestID: in.RequestID, Payload: intentPayload(in)})
+	var resumed *db.TenantProvisions
+	// ON CONFLICT DO NOTHING RETURNING emits no row → ErrNoRows is the
+	// conflict (claim) path, not a real error.
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return uuid.Nil, uuid.Nil, "", err
+	}
+	if !row.ID.Valid {
+		existing, e := s.q.GetProvision(ctx, in.RequestID)
+		if e != nil {
+			return uuid.Nil, uuid.Nil, "", fmt.Errorf("get_provision: %w", e)
+		}
+		if !sameIntent(existing.Payload, in) {
+			return uuid.Nil, uuid.Nil, "", ErrProvisionMismatch
+		}
+		if existing.Status == "done" {
+			return fromPg(existing.TenantID), fromPg(existing.OrganizationID), "done", nil
+		}
+		// failed or stale-processing → atomically reclaim; a live worker
+		// (or concurrent reclaimer) makes the claim fail → conflict.
+		claimed, e := s.q.ClaimProvision(ctx, in.RequestID)
+		if e == nil && claimed.ID.Valid && !sameIntent(claimed.Payload, in) {
+			return uuid.Nil, uuid.Nil, "", ErrProvisionMismatch
+		}
+		if e != nil || !claimed.ID.Valid {
+			if e != nil {
+				return uuid.Nil, uuid.Nil, "", fmt.Errorf("claim: %w", e)
+			}
+			return uuid.Nil, uuid.Nil, "processing", ErrProvisionConflict
+		}
+		if claimed.TenantID.Valid {
+			resumed = &claimed // tenant+user+sub committed last run — resume
+		}
+		err = nil // conflict resolved via claim — clear the stale ErrNoRows
+	}
+
+	var userID uuid.UUID
+	if resumed != nil {
+		tenantID = fromPg(resumed.TenantID)
+		userID = fromPg(resumed.OwnerUserID)
+	} else {
+		err = s.withTx(ctx, func(q *db.Queries) error {
+			t, err := q.CreateTenantRow(ctx, db.CreateTenantRowParams{
+				Name: in.TenantName, Slug: in.TenantSlug,
+				BillingEmail: in.BillingEmail, Edition: in.Edition})
+			if err != nil {
+				return err
+			}
+			tenantID = fromPg(t.ID)
+			u, err := q.ProvisionUser(ctx, db.ProvisionUserParams{
+				Email: in.OwnerEmail, DisplayName: in.OwnerName})
+			if err != nil {
+				return err
+			}
+			userID = fromPg(u.ID)
+			days := s.trial
+			if in.TrialDays != nil {
+				days = *in.TrialDays
+			}
+			return billing.ProvisionTrial(ctx, q, tenantID, actor, days)
+		})
+	} // end fresh-provision tx
+	if err != nil {
+		_, _ = s.q.FinishProvision(ctx, db.FinishProvisionParams{
+			RequestID: in.RequestID, Status: "failed", Error: pgText(err.Error())})
+		return uuid.Nil, uuid.Nil, "failed", err
+	}
+
+	if resumed != nil && resumed.OrganizationID.Valid {
+		orgID = fromPg(resumed.OrganizationID) // org committed last run too
+	} else if s.boot != nil {
+		orgID, err = s.boot(ctx, userID, in.OrgName, in.OrgSlug, in.Template,
+			in.OrgType, in.Country, in.City, in.BillingEmail, tenantID)
+		if err != nil {
+			_, _ = s.q.FinishProvision(ctx, db.FinishProvisionParams{
+				RequestID: in.RequestID, Status: "failed",
+				TenantID: toPg(tenantID), OwnerUserID: toPg(userID), Error: pgText(err.Error())})
+			return tenantID, uuid.Nil, "failed", err
+		}
+	}
+	err = s.withTx(ctx, func(q *db.Queries) error {
+		if _, err := q.FinishProvision(ctx, db.FinishProvisionParams{
+			RequestID: in.RequestID, Status: "done", TenantID: toPg(tenantID),
+			OrganizationID: toPg(orgID), OwnerUserID: toPg(userID)}); err != nil {
+			return err
+		}
+		// §15 ordering: org + subscription exist before TenantProvisioned.
+		return events.Emit(ctx, q, tenantID, orgID, "TenantProvisioned",
+			"tenant", tenantID, actor, true,
+			map[string]any{"tenant_id": tenantID, "organization_id": orgID,
+				"owner_user_id": userID, "plan_slug": "trial"})
+	})
+	if err != nil {
+		_, _ = s.q.FinishProvision(ctx, db.FinishProvisionParams{
+			RequestID: in.RequestID, Status: "failed",
+			TenantID: toPg(tenantID), OrganizationID: toPg(orgID),
+			OwnerUserID: toPg(userID), Error: pgText(err.Error())})
+		return tenantID, orgID, "failed", err
+	}
+	// §15 tail: welcome email (fire-and-forget — never fails the pipeline)
+	if s.welcomeFn != nil {
+		_ = s.welcomeFn(ctx, in.OwnerEmail, in.OwnerName, userID)
+	}
+	return tenantID, orgID, "done", nil
+}
+
+// ---------- tenants ----------
+
+func (s *Service) ListTenants(ctx context.Context, status string) ([]db.ListTenantsRow, error) {
+	return s.q.ListTenants(ctx, status)
+}
+
+func (s *Service) GetTenant(ctx context.Context, id uuid.UUID) (*db.Tenants, error) {
+	t, err := s.q.GetTenantRow(ctx, toPg(id))
+	if err != nil {
+		return nil, ErrNotFound
+	}
+	return &t, nil
+}
+
+// Suspend — §15: suspended tenants block login for non-platform users
+// (auth layer enforces), data preserved. Emits TenantSuspended (catalogued).
+func (s *Service) SuspendTenant(ctx context.Context, tenantID uuid.UUID, reason string, actor uuid.UUID) error {
+	if reason == "" {
+		reason = "operator_suspend"
+	}
+	return s.withTx(ctx, func(q *db.Queries) error {
+		n, err := q.SetTenantStatus(ctx, db.SetTenantStatusParams{ID: toPg(tenantID), Status: "suspended"})
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return ErrNotFound
+		}
+		if err := s.audit(ctx, q, tenantID, actor, "tenant.suspend", "tenant", tenantID,
+			map[string]any{"reason": reason}); err != nil {
+			return err // Rule 10: failed audit aborts
+		}
+		return events.Emit(ctx, q, tenantID, uuid.Nil, "TenantSuspended",
+			"tenant", tenantID, actor, true,
+			map[string]any{"tenant_id": tenantID, "reason": reason})
+	})
+}
+
+// Reinstate reverses a suspension back to active.
+func (s *Service) ReinstateTenant(ctx context.Context, tenantID uuid.UUID, actor uuid.UUID) error {
+	return s.withTx(ctx, func(q *db.Queries) error {
+		n, err := q.SetTenantStatus(ctx, db.SetTenantStatusParams{ID: toPg(tenantID), Status: "active"})
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return ErrNotFound
+		}
+		if err := s.audit(ctx, q, tenantID, actor, "tenant.reinstate", "tenant", tenantID, nil); err != nil {
+			return err
+		}
+		return events.Emit(ctx, q, tenantID, uuid.Nil, "TenantReinstated",
+			"tenant", tenantID, actor, true, map[string]any{"tenant_id": tenantID})
+	})
+}
+
+// ---------- subscriptions / plans ----------
+
+func (s *Service) ListSubscriptions(ctx context.Context, state string) ([]db.ListSubscriptionsRow, error) {
+	return s.q.ListSubscriptions(ctx, state)
+}
+
+// OverrideSubscription is the audited operator path: plan/state changes
+// emit SubscriptionChanged so the entitlement cache flushes (Rule 25).
+var subscriptionStates = map[string]bool{
+	"trial": true, "active": true, "past_due": true,
+	"grace": true, "restricted": true, "cancelled": true,
+}
+
+func (s *Service) OverrideSubscription(ctx context.Context, tenantID, subID uuid.UUID, plan, state string, graceEnd *time.Time, actor uuid.UUID) error {
+	if plan == "" && state == "" {
+		return ErrBadValue
+	}
+	if state != "" && !subscriptionStates[state] {
+		return ErrBadValue
+	}
+	return s.withTx(ctx, func(q *db.Queries) error {
+		prev, err := q.GetSubscription(ctx, toPg(tenantID))
+		if err != nil {
+			return ErrNotFound
+		}
+		var ge pgtype.Timestamptz
+		if graceEnd != nil {
+			ge = pgtype.Timestamptz{Time: *graceEnd, Valid: true}
+		}
+		newPlan := prev.PlanSlug
+		if plan != "" {
+			newPlan = plan
+		}
+		newState := prev.State
+		if state != "" {
+			newState = state
+		}
+		n, err := q.OverrideSubscription(ctx, db.OverrideSubscriptionParams{
+			ID: toPg(subID), TenantID: toPg(tenantID), PlanSlug: newPlan,
+			State: newState, GraceEndsAt: ge})
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return ErrNotFound
+		}
+		if err := s.audit(ctx, q, tenantID, actor, "subscription.override", "subscription", subID,
+			map[string]any{"from_plan": prev.PlanSlug, "to_plan": newPlan, "to_state": state}); err != nil {
+			return err
+		}
+		return events.Emit(ctx, q, tenantID, uuid.Nil, "SubscriptionChanged",
+			"subscription", subID, actor, true,
+			map[string]any{"tenant_id": tenantID, "from": prev.PlanSlug,
+				"to": newPlan, "plan_slug": newPlan})
+	})
+}
+
+func (s *Service) UpsertPlan(ctx context.Context, p db.UpsertPlanParams, actor uuid.UUID) (*db.Plans, error) {
+	var row db.Plans
+	err := s.withTx(ctx, func(q *db.Queries) error {
+		r, err := q.UpsertPlan(ctx, p)
+		if err != nil {
+			return err
+		}
+		row = r
+		return s.audit(ctx, q, uuid.Nil, actor, "plan.upsert", "plan", uuid.Nil,
+			map[string]any{"slug": p.Slug})
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &row, nil
+}
+
+// ---------- deployments ----------
+
+func (s *Service) ListDeployments(ctx context.Context, tenantID uuid.UUID) ([]db.ListDeploymentsRow, error) {
+	return s.q.ListDeployments(ctx, toPg(tenantID))
+}
+
+func (s *Service) CreateDeployment(ctx context.Context, tenantID uuid.UUID, kind, edition, key string, actor uuid.UUID) (*db.Deployments, error) {
+	if kind == "" {
+		kind = "self_hosted"
+	}
+	if edition == "" {
+		edition = "community"
+	}
+	var row db.Deployments
+	err := s.withTx(ctx, func(q *db.Queries) error {
+		if _, err := q.GetTenantRow(ctx, toPg(tenantID)); err != nil {
+			return ErrNotFound
+		}
+		r, err := q.CreateDeployment(ctx, db.CreateDeploymentParams{
+			TenantID: toPg(tenantID), Kind: kind, Edition: edition, DeploymentKey: key})
+		if err != nil {
+			return err
+		}
+		row = r
+		return s.audit(ctx, q, tenantID, actor, "deployment.create", "deployment", fromPg(r.ID), nil)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &row, nil
+}
+
+// ---------- support impersonation (§15, Rule 10) ----------
+
+const impersonationTTL = 30 * time.Minute
+
+// Impersonate — audit row commits BEFORE the session row (Rule 10: a
+// failed audit write aborts). TTL is fixed at 30min per §15; the returned
+// session id is what the token layer embeds for the banner.
+func (s *Service) Impersonate(ctx context.Context, operatorID, tenantID uuid.UUID, targetEmail, reason, ip, ua string) (uuid.UUID, string, time.Time, error) {
+	if _, err := s.q.GetTenantRow(ctx, toPg(tenantID)); err != nil {
+		return uuid.Nil, "", time.Time{}, ErrNotFound
+	}
+	u, err := s.q.GetUserByEmail(ctx, targetEmail)
+	if err != nil || u.Status != "active" {
+		return uuid.Nil, "", time.Time{}, ErrNotFound
+	}
+	// the target must actually belong to the tenant — request-supplied
+	// tenant_id alone is not proof (Rule 24).
+	ok, err := s.q.UserInTenant(ctx, db.UserInTenantParams{
+		UserID: u.ID, TenantID: toPg(tenantID)})
+	if err != nil || !ok {
+		return uuid.Nil, "", time.Time{}, ErrNotFound
+	}
+	expires := time.Now().Add(impersonationTTL)
+	var sid uuid.UUID
+	err = s.withTx(ctx, func(q *db.Queries) error {
+		if err := s.audit(ctx, q, tenantID, operatorID, "impersonation.start",
+			"user", fromPg(u.ID),
+			map[string]any{"target_email": targetEmail, "reason": reason}); err != nil {
+			return err
+		}
+		ss, err := q.CreateSupportSession(ctx, db.CreateSupportSessionParams{
+			OperatorUserID: toPg(operatorID), TargetUserID: u.ID,
+			TenantID: toPg(tenantID), Reason: pgText(reason),
+			ExpiresAt: pgtype.Timestamptz{Time: expires, Valid: true}})
+		if err != nil {
+			return err
+		}
+		sid = fromPg(ss.ID)
+		return nil
+	})
+	if err != nil {
+		return uuid.Nil, "", time.Time{}, err
+	}
+	// audit+session row committed — mint the operator's support token.
+	if s.sessionFn == nil {
+		return uuid.Nil, "", time.Time{}, errors.New("session minter not wired")
+	}
+	token, _, err := s.sessionFn(ctx, sid, fromPg(u.ID), impersonationTTL, ip, ua)
+	return sid, token, expires, err
+}
+
+// ResolveImpersonation returns the live session — expired/ended rows
+// resolve to ErrSessionExpired so the 30min TTL is enforced at read time.
+func (s *Service) ResolveImpersonation(ctx context.Context, sid uuid.UUID) (*db.SupportSessions, error) {
+	ss, err := s.q.GetSupportSession(ctx, toPg(sid))
+	if err != nil {
+		return nil, ErrSessionExpired
+	}
+	return &ss, nil
+}
+
+func (s *Service) EndImpersonation(ctx context.Context, sid, actor uuid.UUID) error {
+	return s.withTx(ctx, func(q *db.Queries) error {
+		n, err := q.EndSupportSession(ctx, toPg(sid))
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return ErrSessionExpired
+		}
+		// explicit end must cut access NOW — revoke the minted session row
+		// rather than waiting out its TTL.
+		if _, err := q.RevokeSessionsForSupport(ctx, toPg(sid)); err != nil {
+			return err
+		}
+		return s.audit(ctx, q, uuid.Nil, actor, "impersonation.end", "support_session", sid, nil)
+	})
+}
+
+// ---------- flags / audit / usage ----------
+
+func (s *Service) ListFlags(ctx context.Context) ([]db.FeatureFlags, error) {
+	return s.q.ListFeatureFlags(ctx)
+}
+
+func (s *Service) SetFlag(ctx context.Context, key string, enabled bool, rollout json.RawMessage, actor uuid.UUID) error {
+	return s.withTx(ctx, func(q *db.Queries) error {
+		if err := q.UpsertFeatureFlag(ctx, db.UpsertFeatureFlagParams{
+			Key: key, Enabled: enabled, Rollout: rollout}); err != nil {
+			return err
+		}
+		return s.audit(ctx, q, uuid.Nil, actor, "flag.set", "feature_flag", uuid.Nil,
+			map[string]any{"key": key, "enabled": enabled})
+	})
+}
+
+func (s *Service) AuditEvents(ctx context.Context, tenantID uuid.UUID, action string) ([]db.AuditEvents, error) {
+	return s.q.ListAuditEvents(ctx, db.ListAuditEventsParams{
+		TenantID: toPg(tenantID), Action: action})
+}
+
+func (s *Service) Usage(ctx context.Context, tenantID uuid.UUID) ([]db.UsageMeters, error) {
+	return s.q.ListUsage(ctx, toPg(tenantID))
+}
+
+// audit writes the append-only row (Rule 10) — callers run it inside their
+// own tx so a failure rolls back the audited operation too.
+func (s *Service) audit(ctx context.Context, q *db.Queries, tenantID, actor uuid.UUID, action, targetType string, targetID uuid.UUID, payload map[string]any) error {
+	var ctxb []byte
+	if payload != nil {
+		ctxb, _ = json.Marshal(payload)
+	}
+	return q.InsertAuditEvent(ctx, db.InsertAuditEventParams{
+		TenantID: toPg(tenantID), ActorID: toPg(actor), Action: action,
+		TargetType: pgText(targetType), TargetID: toPg(targetID),
+		Context: ctxb})
+}
+
+// LiveSupportSessions feeds the §15 banner — sessions targeting the caller.
+func (s *Service) LiveSupportSessions(ctx context.Context, userID uuid.UUID) ([]db.LiveSupportSessionsForUserRow, error) {
+	return s.q.LiveSupportSessionsForUser(ctx, toPg(userID))
+}
+
+// WelcomeMail sends the provisioned owner's credential link — wired in
+// main (auth mints the action token, mailer sends). Fire-and-forget: mail
+// failure never fails the provision (Rule 8 fan-out semantics).
+type WelcomeMail func(ctx context.Context, email, displayName string, userID uuid.UUID) error
+
+func (s *Service) SetWelcomeMail(fn WelcomeMail) { s.welcomeFn = fn }
+
+func (s *Service) SetSessionMinter(fn func(ctx context.Context, supportSessionID, targetUserID uuid.UUID, ttl time.Duration, ip, ua string) (string, uuid.UUID, error)) {
+	s.sessionFn = fn
+}

@@ -14,14 +14,18 @@ VALUES (sqlc.arg(tenant_id), sqlc.arg(organization_id), sqlc.arg(actor_id),
 
 -- name: FetchPendingEvents :many
 -- Outbox claim set: undelivered events under the attempt cap whose backoff
--- has elapsed (next_attempt_at), oldest first.
+-- has elapsed (next_attempt_at), oldest first. FOR NO KEY UPDATE SKIP
+-- LOCKED — serializes the batch between overlapping dispatchers WITHOUT
+-- blocking event_consumer_log's FOR KEY SHARE FK check (FOR UPDATE would
+-- self-deadlock the claim tx against its own consumers).
 SELECT id, event_type, aggregate_type, aggregate_id, tenant_id, organization_id,
        actor_id, payload, occurred_at, attempts
 FROM domain_events
 WHERE dispatched_at IS NULL AND attempts < sqlc.arg(max_attempts)::int
   AND (next_attempt_at IS NULL OR next_attempt_at <= now())
 ORDER BY occurred_at
-LIMIT sqlc.arg(batch_size)::int;
+LIMIT sqlc.arg(batch_size)::int
+FOR NO KEY UPDATE SKIP LOCKED;
 
 -- name: MarkEventDispatched :exec
 UPDATE domain_events SET dispatched_at = now() WHERE id = $1;
@@ -62,8 +66,10 @@ WHERE dispatched_at IS NOT NULL AND attempts >= sqlc.arg(max_attempts)::int;
 -- name: ConsumerLogged :one
 SELECT EXISTS(SELECT 1 FROM event_consumer_log WHERE consumer = $1 AND event_id = $2) AS processed;
 
--- name: LogConsumerProcessed :exec
--- Inserted in the SAME tx as the consumer's own writes (§05 contract).
+-- name: LogConsumerProcessed :execrows
+-- Inserted FIRST inside the consumer's tx (§05 contract): 0 rows affected
+-- = already logged — the consumer body must be skipped, not replayed.
+-- The insert is the atomic dedupe check; the outer pre-check is a hint.
 INSERT INTO event_consumer_log (consumer, event_id) VALUES ($1, $2)
 ON CONFLICT (consumer, event_id) DO NOTHING;
 

@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 
@@ -28,8 +29,11 @@ var (
 	ErrSponsorRequired     = errors.New("sponsor_required")
 	ErrApplicationNotFound = errors.New("application_not_found")
 	ErrAlreadyApplied      = errors.New("application_exists")
+	ErrAlreadyMember       = errors.New("already_a_member")
 	ErrDuplicateRenewal    = errors.New("renewal_exists")
 	ErrImportNotFound      = errors.New("import_not_found")
+	ErrRegistrationPending = errors.New("registration_unpaid")
+	ErrMemberLimitExceeded = errors.New("limit_exceeded")
 )
 
 // ADR-014 state machine: forward pipeline, suspension, terminal states,
@@ -37,11 +41,11 @@ var (
 // intake decisions (screen/approve/reject/withdraw) move the APPLICATION
 // row; approved applications materialize a membership at 'approved'.
 var memberTransitions = map[string][]string{
-	"invited":    {"applied"},
+	"invited":    {"applied", "withdrawn"}, // ADR-014: any → withdrawn while pre-active
 	"applied":    {"screened", "rejected", "withdrawn"},
 	"screened":   {"approved", "rejected", "withdrawn"},
-	"approved":   {"registered"},
-	"registered": {"active"},
+	"approved":   {"registered", "withdrawn"}, // §11: any → withdrawn while pre-active
+	"registered": {"active", "withdrawn"},
 	"active":     {"suspended", "expelled", "resigned", "deceased", "life_member"},
 	"suspended":  {"active", "expelled", "resigned", "deceased"},
 }
@@ -59,7 +63,8 @@ var memberActions = map[string]string{
 // suspended→active is MembershipReinstated, everything else keys on `to`.
 var transitionEvents = map[string]string{
 	"applied": "MemberApplied", "screened": "MemberScreened", "approved": "MemberApproved",
-	"rejected": "MemberRejected", "registered": "MemberRegistered", "active": "MembershipActivated",
+	"rejected": "MemberRejected", "withdrawn": "MemberWithdrawn", "registered": "MemberRegistered",
+	"active":    "MembershipActivated",
 	"suspended": "MembershipSuspended", "expelled": "MemberExpelled", "resigned": "MemberResigned",
 	"deceased": "MemberDeceased", "life_member": "LifeMemberAwarded",
 }
@@ -123,17 +128,37 @@ func (s *Service) Apply(ctx context.Context, orgID, userID uuid.UUID, email, pho
 		return uuid.Nil, ErrBadValue // catalog caps sponsor_required at 2
 	}
 	if userID != uuid.Nil {
+		// A live membership makes a new application meaningless — approve
+		// would hit UNIQUE(organization_id, user_id) mid-tx.
+		if _, err := s.q.GetMembership(ctx, db.GetMembershipParams{
+			OrganizationID: toPg(orgID), UserID: toPg(userID),
+		}); err == nil {
+			return uuid.Nil, ErrAlreadyMember
+		} else if !errors.Is(err, pgx.ErrNoRows) {
+			return uuid.Nil, err
+		}
 		if n, err := s.q.GetApplicationCountForUser(ctx, db.GetApplicationCountForUserParams{OrganizationID: toPg(orgID), UserID: toPg(userID)}); err != nil {
 			return uuid.Nil, err
 		} else if n > 0 {
 			return uuid.Nil, ErrAlreadyApplied
 		}
-	} else if exists, err := s.q.ExistsOpenApplicationByEmail(ctx, db.ExistsOpenApplicationByEmailParams{
-		OrgID: toPg(orgID), Email: email, Phone: phone,
-	}); err != nil {
-		return uuid.Nil, err
-	} else if exists {
-		return uuid.Nil, ErrAlreadyApplied // public intake dedupes on contact
+	} else {
+		if email != "" {
+			if exists, err := s.q.ExistsOrgMemberByContact(ctx, db.ExistsOrgMemberByContactParams{
+				OrgID: toPg(orgID), Email: email,
+			}); err != nil {
+				return uuid.Nil, err
+			} else if exists {
+				return uuid.Nil, ErrAlreadyMember // public intake can't bypass an existing membership
+			}
+		}
+		if exists, err := s.q.ExistsOpenApplicationByEmail(ctx, db.ExistsOpenApplicationByEmailParams{
+			OrgID: toPg(orgID), Email: email, Phone: phone,
+		}); err != nil {
+			return uuid.Nil, err
+		} else if exists {
+			return uuid.Nil, ErrAlreadyApplied // public intake dedupes on contact
+		}
 	}
 	var primary pgtype.UUID
 	if len(sponsorIDs) > 0 {
@@ -234,6 +259,9 @@ func (s *Service) Applications(ctx context.Context, oc *OrgCtx, status string) (
 // public/pre-signup applicants can't supply sponsor ids at intake, so a
 // sponsor-required org's queue would otherwise deadlock at approve.
 func (s *Service) DecideApplication(ctx context.Context, oc *OrgCtx, appID uuid.UUID, action string, extraSponsors []uuid.UUID) error {
+	// Decision verbs per the intake machine: screen|approve|reject|withdraw.
+	// 'withdraw' is officer-on-behalf cleanup (an applicant self-withdraws
+	// via the /withdraw route); 'register' stays a membership transition.
 	to := memberActions[action]
 	if to == "" || to == "registered" {
 		return ErrInvalidTransition
@@ -257,15 +285,25 @@ func (s *Service) DecideApplication(ctx context.Context, oc *OrgCtx, appID uuid.
 		}
 	}
 	return s.withTx(ctx, func(q *db.Queries) error {
-		for _, sid := range extraSponsors {
-			sp, err := q.GetMembershipByID(ctx, toPg(sid))
-			if err != nil || fromPg(sp.OrganizationID) != oc.OrgID || sp.LifecycleState != "active" {
-				return ErrNotMember
-			}
-			if err := q.AddApplicationSponsor(ctx, db.AddApplicationSponsorParams{
-				ApplicationID: toPg(appID), SponsorMemberID: toPg(sid), Kind: "sponsor",
-			}); err != nil {
-				return err
+		// Screener-attached sponsors only make sense for intake-forward
+		// actions; dedupe against the primary and each other so the
+		// sponsor_required numerator can't count one person twice.
+		if action == "screen" || action == "approve" {
+			seen := map[uuid.UUID]bool{}
+			for _, sid := range extraSponsors {
+				if seen[sid] || (app.SponsorMemberID.Valid && fromPg(app.SponsorMemberID) == sid) {
+					continue
+				}
+				seen[sid] = true
+				sp, err := q.GetMembershipByID(ctx, toPg(sid))
+				if err != nil || fromPg(sp.OrganizationID) != oc.OrgID || sp.LifecycleState != "active" {
+					return ErrNotMember
+				}
+				if err := q.AddApplicationSponsor(ctx, db.AddApplicationSponsorParams{
+					ApplicationID: toPg(appID), SponsorMemberID: toPg(sid), Kind: "sponsor",
+				}); err != nil {
+					return err
+				}
 			}
 		}
 		if to == "approved" {
@@ -304,59 +342,143 @@ func (s *Service) DecideApplication(ctx context.Context, oc *OrgCtx, appID uuid.
 		}
 		if to != "approved" || !app.UserID.Valid {
 			// Pre-signup approval still records the decision event —
-			// the membership materializes when they register (Phase-02 hook).
+			// the membership materializes when they register
+			// (MaterializeApprovedApplications, the verify/login hook).
 			if to == "approved" && !app.UserID.Valid {
 				return events.Emit(ctx, q, uuid.Nil, oc.OrgID, "MemberApproved", "membership_application", appID, oc.UserID, true,
 					map[string]any{"application_id": appID, "org_id": oc.OrgID, "to": to})
 			}
 			return nil
 		}
-		// approved: materialize the membership pipeline row + member_no.
-		no, err := s.memberNo(ctx, q, oc.OrgID)
-		if err != nil {
-			return err
-		}
-		mid, err := q.CreateMembership(ctx, db.CreateMembershipParams{
-			OrganizationID: toPg(oc.OrgID), UserID: app.UserID,
-			MemberNo: pgText(no), Category: "floor", LifecycleState: "approved",
-		})
-		if err != nil {
-			return err
-		}
-		if err := events.Emit(ctx, q, oc.TenantID, oc.OrgID, "MemberApproved", "organization_membership", fromPg(mid), oc.UserID, true,
-			map[string]any{"membership_id": fromPg(mid), "org_id": oc.OrgID, "member_no": no, "application_id": appID}); err != nil {
-			return err
-		}
-		if app.SponsorMemberID.Valid {
-			if err := q.AddSponsor(ctx, db.AddSponsorParams{
-				MembershipID: mid, SponsorMemberID: app.SponsorMemberID, Kind: "sponsor",
-			}); err != nil {
-				return err
-			}
-			if err := events.Emit(ctx, q, oc.TenantID, oc.OrgID, "SponsorshipRecorded", "organization_membership", fromPg(mid), oc.UserID, true,
-				map[string]any{"membership_id": fromPg(mid), "sponsor_member_id": fromPg(app.SponsorMemberID), "kind": "sponsor"}); err != nil {
-				return err
-			}
-		}
-		// staged extras become membership sponsor rows too (copy+delete is
-		// unique-index-safe vs an in-place UPDATE when an extra duplicates
-		// the primary).
-		if err := q.CopyApplicationSponsors(ctx, db.CopyApplicationSponsorsParams{
-			MembershipID: mid, ApplicationID: toPg(appID),
-		}); err != nil {
-			return err
-		}
-		return q.DeleteApplicationSponsors(ctx, toPg(appID))
+		return s.materializeMembership(ctx, q, oc.TenantID, oc.OrgID, appID, fromPg(app.UserID), app.SponsorMemberID, oc.UserID)
 	})
 }
 
-// TransitionMember drives the post-approval lifecycle machine. Terminal
-// transitions (expelled/resigned/deceased) vacate appointments + committee
-// seats + cards in the same tx; every legal move emits its event and
-// invalidates the member's perm/org-context caches (Rule 6).
+// materializeMembership creates the pipeline membership for an approved
+// application: mints member_no, lands the primary + staged sponsors, and
+// emits the membership-level MemberApproved. Shared by DecideApplication
+// (approve of a user-linked application) and the registration hook
+// (pre-signup applications materializing on first verified bind).
+func (s *Service) materializeMembership(ctx context.Context, q *db.Queries, tenantID, orgID, appID, userID uuid.UUID, primarySponsor pgtype.UUID, actor uuid.UUID) error {
+	no, err := s.memberNo(ctx, q, orgID)
+	if err != nil {
+		return err
+	}
+	mid, err := q.CreateMembership(ctx, db.CreateMembershipParams{
+		OrganizationID: toPg(orgID), UserID: toPg(userID),
+		MemberNo: pgText(no), Category: "floor", LifecycleState: "approved",
+	})
+	if err != nil {
+		return err
+	}
+	if err := events.Emit(ctx, q, tenantID, orgID, "MemberApproved", "organization_membership", fromPg(mid), actor, true,
+		map[string]any{"membership_id": fromPg(mid), "org_id": orgID, "member_no": no, "application_id": appID}); err != nil {
+		return err
+	}
+	if primarySponsor.Valid {
+		if err := q.AddSponsor(ctx, db.AddSponsorParams{
+			MembershipID: mid, SponsorMemberID: primarySponsor, Kind: "sponsor",
+		}); err != nil {
+			return err
+		}
+		if err := events.Emit(ctx, q, tenantID, orgID, "SponsorshipRecorded", "organization_membership", fromPg(mid), actor, true,
+			map[string]any{"membership_id": fromPg(mid), "sponsor_member_id": fromPg(primarySponsor), "kind": "sponsor"}); err != nil {
+			return err
+		}
+	}
+	// staged extras become membership sponsor rows too (copy+delete is
+	// unique-index-safe vs an in-place UPDATE when an extra duplicates
+	// the primary).
+	if err := q.CopyApplicationSponsors(ctx, db.CopyApplicationSponsorsParams{
+		MembershipID: mid, ApplicationID: toPg(appID),
+	}); err != nil {
+		return err
+	}
+	return q.DeleteApplicationSponsors(ctx, toPg(appID))
+}
+
+// MaterializeApprovedApplications is the §11 registration hook: pre-signup
+// applications approved while the applicant had no account become real
+// memberships once their verified email binds a user. Called from the
+// identity surface after verify/login — idempotent: linking the
+// application's user_id is the consume marker, and a second binder loses
+// the CAS and skips.
+func (s *Service) MaterializeApprovedApplications(ctx context.Context, userID uuid.UUID) error {
+	u, err := s.q.GetUserByID(ctx, toPg(userID))
+	if err != nil || u.Email == "" {
+		return err
+	}
+	apps, err := s.q.ApprovedApplicationsForEmail(ctx, pgText(u.Email))
+	if err != nil {
+		return err
+	}
+	for _, a := range apps {
+		orgID := fromPg(a.OrganizationID)
+		err := s.withTx(ctx, func(q *db.Queries) error {
+			n, err := q.LinkApplicationUser(ctx, db.LinkApplicationUserParams{
+				ID: a.ID, UserID: toPg(userID),
+			})
+			if err != nil {
+				return err
+			}
+			if n == 0 {
+				return nil // a raced bind consumed it — skip
+			}
+			if _, err := q.GetMembership(ctx, db.GetMembershipParams{
+				OrganizationID: a.OrganizationID, UserID: toPg(userID),
+			}); err == nil {
+				return nil // already a member (e.g. invited separately) — link only
+			} else if !errors.Is(err, pgx.ErrNoRows) {
+				return err
+			}
+			org, err := q.GetOrg(ctx, a.OrganizationID)
+			if err != nil {
+				return err
+			}
+			return s.materializeMembership(ctx, q, fromPg(org.TenantID), orgID, fromPg(a.ID), userID, a.SponsorMemberID, userID)
+		})
+		if err != nil {
+			// One bad application must not block the rest of the set or the
+			// caller's login — surface it for ops instead.
+			log.Printf("materialize application %s for user %s: %v", a.ID.Bytes, userID, err)
+		}
+	}
+	return nil
+}
+
+// ResignSelf is the self-resign path for members who can't resolve an
+// OrgCtx — a suspended member carries no org context but §11 still allows
+// {mid}=self → resign. Builds the minimum OrgCtx and runs the normal
+// machine so the terminal cleanup (seats, cards, events) is identical.
+func (s *Service) ResignSelf(ctx context.Context, userID, orgID uuid.UUID) error {
+	m, err := s.q.GetMembership(ctx, db.GetMembershipParams{
+		OrganizationID: toPg(orgID), UserID: toPg(userID),
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotMember
+		}
+		return err
+	}
+	org, err := s.q.GetOrg(ctx, toPg(orgID))
+	if err != nil {
+		return err
+	}
+	oc := &OrgCtx{OrgID: orgID, TenantID: fromPg(org.TenantID), UserID: userID, MembershipID: fromPg(m.ID)}
+	return s.TransitionMember(ctx, oc, fromPg(m.ID), "resign")
+}
+
+// TransitionMember drives the ADR-014 lifecycle machine on the membership
+// row. Intake verbs (screen/approve/reject/withdraw) run here too —
+// invited members land at 'applied' with no application row, so the
+// membership itself carries their intake decisions (approve mints
+// member_no; sponsors aren't re-required — an invite is the org's vouch).
+// Terminal transitions (expelled/resigned/deceased) vacate appointments +
+// committee seats + cards in the same tx; every legal move emits its
+// event and invalidates the member's perm/org-context caches (Rule 6).
 func (s *Service) TransitionMember(ctx context.Context, oc *OrgCtx, memberID uuid.UUID, action string) error {
 	to := memberActions[action]
-	if to == "" || action == "screen" || action == "approve" || action == "reject" || action == "withdraw" {
+	if to == "" {
 		return ErrInvalidTransition
 	}
 	m, err := s.q.GetMembershipFull(ctx, toPg(memberID))
@@ -378,6 +500,17 @@ func (s *Service) TransitionMember(ctx context.Context, oc *OrgCtx, memberID uui
 		return ErrInvalidTransition
 	}
 	userID := fromPg(m.UserID)
+	// ADR-014 guard: approved→registered requires the registration payment —
+	// blocked while the member owes registration money (§12 gate).
+	if to == "registered" && s.regGate != nil {
+		pending, err := s.regGate(ctx, oc.OrgID, memberID)
+		if err != nil {
+			return err
+		}
+		if pending {
+			return ErrRegistrationPending
+		}
+	}
 	err = s.withTx(ctx, func(q *db.Queries) error {
 		if _, err := q.TransitionMembership(ctx, db.TransitionMembershipParams{
 			ID: toPg(memberID), OrganizationID: toPg(oc.OrgID), LifecycleState: to, Column4: []string{from},
@@ -386,9 +519,33 @@ func (s *Service) TransitionMember(ctx context.Context, oc *OrgCtx, memberID uui
 		} else if err != nil {
 			return err
 		}
+		if to == "approved" && (!m.MemberNo.Valid || m.MemberNo.String == "") {
+			// Membership-level approve mints the number the application
+			// path would have minted at materialize-time.
+			no, err := s.memberNo(ctx, q, oc.OrgID)
+			if err != nil {
+				return err
+			}
+			if err := q.SetMemberNo(ctx, db.SetMemberNoParams{ID: toPg(memberID), MemberNo: pgText(no)}); err != nil {
+				return err
+			}
+		}
 		if to == "active" {
-			// activation is "joining" — the member role lands here (invite
-			// path grants it on accept; the application path grants it now).
+			// §07 enforcement point: limit.members.active — the count
+			// already includes this member post-transition; at exactly the
+			// cap the join is allowed, beyond it blocked.
+			if s.ent != nil {
+				count, err := q.CountTenantActiveMembers(ctx, toPg(oc.TenantID))
+				if err != nil {
+					return err
+				}
+				if allowed, _ := s.ent.CheckLimit(ctx, oc.TenantID, "limit.members.active", count-1); !allowed {
+					return ErrMemberLimitExceeded
+				}
+			}
+			// activation is "joining" — the member role lands here for the
+			// application path; invited members already hold it from accept
+			// (org-vouched), so ON CONFLICT DO NOTHING keeps this idempotent.
 			// ON CONFLICT DO NOTHING keeps reinstate idempotent.
 			if err := q.AssignRoleBySlug(ctx, db.AssignRoleBySlugParams{
 				UserID: m.UserID, TenantID: toPg(oc.TenantID), Slug: "member",
@@ -425,8 +582,11 @@ func (s *Service) TransitionMember(ctx context.Context, oc *OrgCtx, memberID uui
 		}
 		// TODO: MemberDeceased → welfare bereavement-case candidate flags
 		// when §13 welfare lands (sourced event already carries the hook).
-		return events.Emit(ctx, q, oc.TenantID, oc.OrgID, transitionEvent(from, to), "organization_membership", memberID, oc.UserID, true,
-			map[string]any{"membership_id": memberID, "org_id": oc.OrgID, "user_id": userID, "from": from, "to": to})
+		if name := transitionEvent(from, to); name != "" {
+			return events.Emit(ctx, q, oc.TenantID, oc.OrgID, name, "organization_membership", memberID, oc.UserID, true,
+				map[string]any{"membership_id": memberID, "org_id": oc.OrgID, "user_id": userID, "from": from, "to": to})
+		}
+		return nil
 	})
 	if err != nil {
 		return err
@@ -484,19 +644,24 @@ func (s *Service) WithdrawApplication(ctx context.Context, userID, orgID, appID 
 	if err != nil {
 		return err
 	}
-	if _, err := s.q.WithdrawApplication(ctx, db.WithdrawApplicationParams{
-		ID: toPg(appID), UserID: toPg(userID),
-	}); errors.Is(err, pgx.ErrNoRows) {
-		return ErrInvalidTransition // already decided
-	} else {
-		return err
-	}
+	return s.withTx(ctx, func(q *db.Queries) error {
+		if _, err := q.WithdrawApplication(ctx, db.WithdrawApplicationParams{
+			ID: toPg(appID), UserID: toPg(userID),
+		}); errors.Is(err, pgx.ErrNoRows) {
+			return ErrInvalidTransition // already decided
+		} else if err != nil {
+			return err
+		}
+		return events.Emit(ctx, q, uuid.Nil, orgID, "MemberWithdrawn", "membership_application", appID, userID, true,
+			map[string]any{"application_id": appID, "org_id": orgID})
+	})
 }
 
 // RenewMember records a dues period (membership_renewals is UNIQUE per
-// membership+period — re-attempts 409, never double-record). Renewal marks
-// the member in good standing again once §12 finance wires payment_id.
-func (s *Service) RenewMember(ctx context.Context, oc *OrgCtx, memberID uuid.UUID, period string, startsAt, endsAt time.Time) (uuid.UUID, error) {
+// membership+period — re-attempts 409, never double-record). An optional
+// payment_id links the settling payment (§12) — the FK validates it; the
+// finance module is the authoritative record of that payment's state.
+func (s *Service) RenewMember(ctx context.Context, oc *OrgCtx, memberID uuid.UUID, period string, startsAt, endsAt time.Time, paymentID uuid.UUID) (uuid.UUID, error) {
 	m, err := s.MemberDetail(ctx, oc, memberID)
 	if err != nil {
 		return uuid.Nil, err
@@ -521,6 +686,20 @@ func (s *Service) RenewMember(ctx context.Context, oc *OrgCtx, memberID uuid.UUI
 			return err
 		}
 		id = fromPg(r)
+		if paymentID != uuid.Nil {
+			n, err := q.SetRenewalPayment(ctx, db.SetRenewalPaymentParams{
+				ID: toPg(id), OrganizationID: toPg(oc.OrgID), PaymentID: toPg(paymentID)})
+			if err != nil {
+				var pgErr *pgconn.PgError
+				if errors.As(err, &pgErr) && pgErr.Code == "23503" {
+					return ErrBadValue // payment_id doesn't reference a real payment
+				}
+				return err
+			}
+			if n == 0 {
+				return ErrBadValue // not a confirmed payment of THIS member in THIS org
+			}
+		}
 		if err := q.TouchRenewal(ctx, toPg(memberID)); err != nil {
 			return err
 		}
@@ -543,10 +722,17 @@ func (s *Service) IssueCard(ctx context.Context, oc *OrgCtx, memberID uuid.UUID,
 	if len(design) == 0 {
 		design = json.RawMessage("{}")
 	}
+	liveCard := func() (db.IssueCardRow, bool) {
+		cur, err := s.q.GetActiveCard(ctx, toPg(memberID))
+		if err != nil {
+			return db.IssueCardRow{}, false
+		}
+		return db.IssueCardRow{ID: cur.ID, Serial: cur.Serial, IssuedAt: cur.IssuedAt}, true
+	}
 	// one active card per member (partial unique index) — re-issue returns
 	// the live card instead of erroring or double-emitting.
-	if cur, err := s.q.GetActiveCard(ctx, toPg(memberID)); err == nil {
-		return db.IssueCardRow{ID: cur.ID, Serial: cur.Serial, IssuedAt: cur.IssuedAt}, nil
+	if c, ok := liveCard(); ok {
+		return c, nil
 	}
 	serial := fmt.Sprintf("CARD-%s-%s", strings.ToUpper(uuid.NewString()[:8]), strings.ToUpper(uuid.NewString()[:4]))
 	if m.MemberNo.Valid && m.MemberNo.String != "" {
@@ -564,6 +750,13 @@ func (s *Service) IssueCard(ctx context.Context, oc *OrgCtx, memberID uuid.UUID,
 		return events.Emit(ctx, q, oc.TenantID, oc.OrgID, "CardIssued", "membership_card", fromPg(r.ID), oc.UserID, true,
 			map[string]any{"card_id": fromPg(r.ID), "membership_id": memberID, "serial": serial})
 	})
+	if err != nil && isUniqueViolation(err) {
+		// Concurrent issue won the race on the partial unique index —
+		// surface the winning card rather than a 500.
+		if c, ok := liveCard(); ok {
+			return c, nil
+		}
+	}
 	return card, err
 }
 
@@ -589,6 +782,30 @@ func (s *Service) MyMemberships(ctx context.Context, userID uuid.UUID) ([]db.Lis
 // Category + tenure rules land with the rules engine (Rule 23).
 func Eligible(state, duesStanding string) bool {
 	return (state == "active" || state == "life_member") && duesStanding == "good"
+}
+
+// StaleImportIDs lists imports stranded at 'processing' — the enqueue
+// died, or the worker was archived mid-run. The scheduler:tick sweep
+// re-drives them (mirrors the webhook stale-redrive pattern).
+func (s *Service) StaleImportIDs(ctx context.Context) ([]uuid.UUID, error) {
+	rows, err := s.q.ListStaleImports(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]uuid.UUID, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, fromPg(r))
+	}
+	return out, nil
+}
+
+// FailImport marks an import row dead — used when the durable record
+// exists but the task could not be enqueued (better a visible failure
+// than a row stuck at 'processing' until the sweep finds it).
+func (s *Service) FailImport(ctx context.Context, importID uuid.UUID, reason string) error {
+	return s.q.FinishImport(ctx, db.FinishImportParams{
+		ID: toPg(importID), Status: "failed", Errors: mustJSON(map[string]any{"enqueue": reason}),
+	})
 }
 
 // CreateImport stores a parsed import payload and lets the handler enqueue
@@ -666,4 +883,62 @@ func (s *Service) ProcessImport(ctx context.Context, importID uuid.UUID) error {
 func mustJSON(v any) []byte {
 	b, _ := json.Marshal(v)
 	return b
+}
+
+// ---------- export (membership:export — durable row + worker) ----------
+
+// RequestExport records the durable export row the worker fills — the
+// handler enqueues membership:export and returns the id (Rule 8).
+func (s *Service) RequestExport(ctx context.Context, oc *OrgCtx, filename string) (uuid.UUID, error) {
+	if filename == "" {
+		filename = "members.csv"
+	}
+	id, err := s.q.CreateExport(ctx, db.CreateExportParams{
+		OrganizationID: toPg(oc.OrgID), RequestedBy: toPg(oc.MembershipID), Filename: filename})
+	return fromPg(id), err
+}
+
+// ExportDownload fetches a finished export (org-scoped).
+func (s *Service) ExportDownload(ctx context.Context, oc *OrgCtx, eid uuid.UUID) (*db.MemberExports, error) {
+	e, err := s.q.GetExport(ctx, db.GetExportParams{ID: toPg(eid), OrganizationID: toPg(oc.OrgID)})
+	if err != nil {
+		return nil, ErrImportNotFound
+	}
+	return &e, nil
+}
+
+// ProcessExport generates the CSV into the durable row — idempotent: a
+// retried worker rewrites the same row.
+func (s *Service) ProcessExport(ctx context.Context, exportID uuid.UUID) error {
+	e, err := s.q.GetExportAny(ctx, toPg(exportID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrImportNotFound
+	}
+	if err != nil {
+		return err
+	}
+	rows, err := s.q.ListMembersForExport(ctx, e.OrganizationID)
+	if err != nil {
+		return err
+	}
+	var b strings.Builder
+	b.WriteString("member_no,display_name,email,category,lifecycle_state,dues_standing,joined_at\n")
+	for _, m := range rows {
+		joined := ""
+		if m.JoinedAt.Valid {
+			joined = m.JoinedAt.Time.Format("2006-01-02")
+		}
+		fmt.Fprintf(&b, "%s,%s,%s,%s,%s,%s,%s\n",
+			m.MemberNo.String, csvCell(m.DisplayName), csvCell(m.Email), m.Category, m.LifecycleState, m.DuesStanding, joined)
+	}
+	return s.q.FinishExport(ctx, db.FinishExportParams{
+		ID: e.ID, Status: "done", Content: []byte(b.String()),
+		RowCount: pgtype.Int4{Int32: int32(len(rows)), Valid: true}})
+}
+
+func csvCell(s string) string {
+	if strings.ContainsAny(s, ",\"\n") {
+		return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
+	}
+	return s
 }

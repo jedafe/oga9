@@ -13,10 +13,13 @@ import (
 )
 
 // linkRule maps an event to a derived edge: source = the event's
-// aggregate, target = the entity behind a payload key.
+// aggregate, target = the entity behind a payload key. AltKeys are
+// accepted spellings ONLY for that target type — a missing key must skip
+// the edge, never guess a different-typed id (an org id is not a tenant).
 type linkRule struct {
 	SourceType, TargetType string
 	TargetKey              string
+	AltKeys                []string
 	Rel                    string
 }
 
@@ -25,11 +28,21 @@ var linkRules = map[string][]linkRule{
 		{SourceType: "organization", TargetType: "tenant", TargetKey: "tenant_id", Rel: "belongs_to"},
 	},
 	"OrgUnitCreated": {
-		{SourceType: "org_unit", TargetType: "organization", TargetKey: "organization_id", Rel: "child_of"},
+		{SourceType: "org_unit", TargetType: "organization", TargetKey: "organization_id",
+			AltKeys: []string{"org_id"}, Rel: "child_of"},
 	},
 	"LeaderAppointed": {
 		{SourceType: "officer_appointment", TargetType: "org_position", TargetKey: "position_id", Rel: "holds"},
 		{SourceType: "officer_appointment", TargetType: "term", TargetKey: "term_id", Rel: "during"},
+	},
+	// §13: approved minutes link back to their meeting; §14: the archived
+	// document links to the minutes it preserves.
+	"MinutesApproved": {
+		{SourceType: "minutes", TargetType: "activity", TargetKey: "meeting_id",
+			AltKeys: []string{"activity_id"}, Rel: "minutes_of"},
+	},
+	"MinutesArchived": {
+		{SourceType: "minutes", TargetType: "document", TargetKey: "document_id", Rel: "archived_as"},
 	},
 }
 
@@ -42,13 +55,12 @@ func EntityLinksConsumer(ctx context.Context, q *db.Queries, e Event) error {
 		return nil
 	}
 	for _, r := range rules {
-		// emitters use both "organization_id" (catalog) and "org_id" spellings
 		target := e.UUID(r.TargetKey)
-		if target == uuid.Nil {
-			target = e.UUID("organization_id")
-		}
-		if target == uuid.Nil {
-			target = e.UUID("org_id")
+		for _, alt := range r.AltKeys {
+			if target != uuid.Nil {
+				break
+			}
+			target = e.UUID(alt)
 		}
 		if target == uuid.Nil {
 			continue // payload key absent — nothing to link

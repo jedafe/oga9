@@ -50,9 +50,11 @@ var (
 )
 
 type Service struct {
-	pool *pgxpool.Pool
-	q    *db.Queries
-	vk   valkey.Client
+	pool    *pgxpool.Pool
+	q       *db.Queries
+	vk      valkey.Client
+	ent     *entitlements.Service // Rule 25 — SetEntitlements wires it
+	regGate func(ctx context.Context, orgID, memberID uuid.UUID) (bool, error)
 }
 
 func NewService(pool *pgxpool.Pool, vk valkey.Client) *Service {
@@ -70,9 +72,17 @@ func pgUUIDPtr(u uuid.UUID) pgtype.UUID {
 }
 func pgDate(t time.Time) pgtype.Date { return pgtype.Date{Time: t, Valid: !t.IsZero()} }
 
-// lifecycleBlocked — ADR-014 states that revoke org context entirely.
+func isUniqueViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505"
+}
+
+// lifecycleBlocked — ADR-014 states that revoke org context entirely
+// (suspended/terminal) plus intake exits (rejected/withdrawn — the row
+// exists for history but confers nothing).
 var lifecycleBlocked = map[string]bool{
 	"suspended": true, "expelled": true, "resigned": true, "deceased": true,
+	"rejected": true, "withdrawn": true,
 }
 
 // OrgCtx is the verified (user, org, membership) context injected into
@@ -89,10 +99,22 @@ type OrgCtx struct {
 // ResolveOrgCtx verifies the caller's membership for orgID, injecting a
 // cached tenant_ctx (oga9:tenant_ctx:{user}:{org}, 5 min).
 func (s *Service) ResolveOrgCtx(ctx context.Context, userID, orgID uuid.UUID) (*OrgCtx, error) {
+	suspendBlocked := func(tid uuid.UUID) bool {
+		if !s.tenantSuspended(ctx, tid) {
+			return false
+		}
+		op, e := s.q.UserHasAnyPlatformRole(ctx, toPg(userID))
+		return e != nil || !op
+	}
 	key := "oga9:tenant_ctx:" + userID.String() + ":" + orgID.String()
 	if raw, err := s.vk.Do(ctx, s.vk.B().Get().Key(key).Build()).AsBytes(); err == nil {
 		var oc OrgCtx
 		if json.Unmarshal(raw, &oc) == nil && oc.MembershipID != uuid.Nil {
+			// §15: the cached ctx still honors suspend — tenant_status is
+			// write-through so this check stays off the DB hot path.
+			if suspendBlocked(oc.TenantID) {
+				return nil, ErrTenantSuspended
+			}
 			return &oc, nil
 		}
 	}
@@ -121,6 +143,12 @@ func (s *Service) ResolveOrgCtx(ctx context.Context, userID, orgID uuid.UUID) (*
 		OrgID: orgID, TenantID: fromPg(org.TenantID), UserID: userID,
 		MembershipID: fromPg(m.ID), Category: m.Category, State: m.LifecycleState,
 	}
+	// §15: suspended tenants refuse org context for non-platform users —
+	// the tenant_status cache is write-through on suspend so this is
+	// immediate; platform operators pass through for support/reinstate.
+	if suspendBlocked(oc.TenantID) {
+		return nil, ErrTenantSuspended
+	}
 	if b, err := json.Marshal(oc); err == nil {
 		_ = s.vk.Do(ctx, s.vk.B().Set().Key(key).Value(string(b)).ExSeconds(300).Build()).Error()
 	}
@@ -136,6 +164,19 @@ func (s *Service) InvalidateOrgCtx(ctx context.Context, userID, orgID uuid.UUID)
 
 // HasTenantRole reports whether the user holds the named role in the tenant —
 // used by tenant resolution where org context doesn't exist yet.
+// SetEntitlements wires the central entitlement service (Rule 25) for the
+// limit.members.active gate at membership activation (§07 enforcement
+// point). Post-construction so billing/finance/tentant wiring stays acyclic.
+func (s *Service) SetEntitlements(e *entitlements.Service) { s.ent = e }
+
+// SetRegistrationGate wires the §12 registration-dues check — the
+// approved→registered transition requires the member's registration
+// obligations settled (ADR-014). The gate lives in finance (Rule 26:
+// members never reads finance tables).
+func (s *Service) SetRegistrationGate(fn func(ctx context.Context, orgID, memberID uuid.UUID) (bool, error)) {
+	s.regGate = fn
+}
+
 // AdminTenants returns the tenants where the user holds org_admin — the
 // server-side basis for billing-tenant resolution (Rule 24).
 func (s *Service) AdminTenants(ctx context.Context, userID uuid.UUID) ([]uuid.UUID, error) {
@@ -513,4 +554,39 @@ func (s *Service) CreateOrg(ctx context.Context, userID uuid.UUID, name, slug, t
 	s.InvalidatePermCache(ctx, userID, orgID) // Rule 6: org_admin grant
 	s.InvalidateOrgCtx(ctx, userID, orgID)
 	return s.GetOrg(ctx, orgID)
+}
+
+// ErrTenantSuspended — §15: orgs under a suspended tenant refuse context.
+var ErrTenantSuspended = errors.New("tenant_suspended")
+
+// tenantSuspended reads tenant status through the oga9:tenant_status:{tid}
+// cache (60s TTL). Suspend/Reinstate events write the key through, so the
+// gate takes effect immediately — the TTL is only the cold-start fallback.
+func (s *Service) tenantSuspended(ctx context.Context, tid uuid.UUID) bool {
+	key := "oga9:tenant_status:" + tid.String()
+	if raw, err := s.vk.Do(ctx, s.vk.B().Get().Key(key).Build()).AsBytes(); err == nil && len(raw) > 0 {
+		return string(raw) == "suspended"
+	}
+	t, err := s.q.GetTenantRow(ctx, toPg(tid))
+	if err != nil {
+		return false
+	}
+	_ = s.vk.Do(ctx, s.vk.B().Set().Key(key).Value(t.Status).ExSeconds(60).Build()).Error()
+	return t.Status == "suspended"
+}
+
+// TenantStatusCacheConsumer — §15: TenantSuspended/TenantReinstated write
+// the status cache directly (suspend can't wait out the TTL).
+func (s *Service) TenantStatusCacheConsumer(ctx context.Context, q *db.Queries, e events.Event) error {
+	if e.Type != "TenantSuspended" && e.Type != "TenantReinstated" {
+		return nil
+	}
+	if e.TenantID == uuid.Nil {
+		return nil
+	}
+	status := "active"
+	if e.Type == "TenantSuspended" {
+		status = "suspended"
+	}
+	return s.vk.Do(ctx, s.vk.B().Set().Key("oga9:tenant_status:"+e.TenantID.String()).Value(status).ExSeconds(3600).Build()).Error()
 }

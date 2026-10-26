@@ -1,0 +1,1 @@
+DROP INDEX event_registrations_guest_contact;

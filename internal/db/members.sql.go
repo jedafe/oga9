@@ -47,6 +47,41 @@ func (q *Queries) AddSponsor(ctx context.Context, arg AddSponsorParams) error {
 	return err
 }
 
+const approvedApplicationsForEmail = `-- name: ApprovedApplicationsForEmail :many
+SELECT id, organization_id, sponsor_member_id FROM membership_applications
+WHERE user_id IS NULL AND status = 'approved' AND email = $1
+`
+
+type ApprovedApplicationsForEmailRow struct {
+	ID              pgtype.UUID `json:"id"`
+	OrganizationID  pgtype.UUID `json:"organization_id"`
+	SponsorMemberID pgtype.UUID `json:"sponsor_member_id"`
+}
+
+// Registration hook (§11): pre-signup applications approved while the
+// applicant had no account materialize into memberships once their
+// verified email binds a user. user_id IS NULL keeps it idempotent —
+// linking the row consumes it.
+func (q *Queries) ApprovedApplicationsForEmail(ctx context.Context, email pgtype.Text) ([]ApprovedApplicationsForEmailRow, error) {
+	rows, err := q.db.Query(ctx, approvedApplicationsForEmail, email)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ApprovedApplicationsForEmailRow
+	for rows.Next() {
+		var i ApprovedApplicationsForEmailRow
+		if err := rows.Scan(&i.ID, &i.OrganizationID, &i.SponsorMemberID); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const copyApplicationSponsors = `-- name: CopyApplicationSponsors :exec
 INSERT INTO member_sponsors (membership_id, sponsor_member_id, kind)
 SELECT $1::uuid, sponsor_member_id, kind
@@ -123,6 +158,25 @@ func (q *Queries) CreateApplication(ctx context.Context, arg CreateApplicationPa
 		arg.Answers,
 		arg.SponsorMemberID,
 	)
+	var id pgtype.UUID
+	err := row.Scan(&id)
+	return id, err
+}
+
+const createExport = `-- name: CreateExport :one
+INSERT INTO member_exports (organization_id, requested_by, filename)
+VALUES ($1, $2, $3)
+RETURNING id
+`
+
+type CreateExportParams struct {
+	OrganizationID pgtype.UUID `json:"organization_id"`
+	RequestedBy    pgtype.UUID `json:"requested_by"`
+	Filename       string      `json:"filename"`
+}
+
+func (q *Queries) CreateExport(ctx context.Context, arg CreateExportParams) (pgtype.UUID, error) {
+	row := q.db.QueryRow(ctx, createExport, arg.OrganizationID, arg.RequestedBy, arg.Filename)
 	var id pgtype.UUID
 	err := row.Scan(&id)
 	return id, err
@@ -223,7 +277,7 @@ func (q *Queries) EndMemberAppointments(ctx context.Context, memberID pgtype.UUI
 const existsOpenApplicationByEmail = `-- name: ExistsOpenApplicationByEmail :one
 SELECT EXISTS(
   SELECT 1 FROM membership_applications
-  WHERE organization_id = $1::uuid AND status IN ('applied','screened','approved')
+  WHERE organization_id = $1::uuid AND status IN ('applied','screened')
     AND (($2 <> '' AND lower(email::text) = lower($2))
       OR ($2 = '' AND $3 <> '' AND phone = $3))
 )
@@ -237,12 +291,57 @@ type ExistsOpenApplicationByEmailParams struct {
 
 // Import idempotency: a retried member_import worker must not mint a
 // second open application for the same applicant (Rule 27) — dedupe on
-// email when present, phone otherwise.
+// email when present, phone otherwise. Decided rows don't block.
 func (q *Queries) ExistsOpenApplicationByEmail(ctx context.Context, arg ExistsOpenApplicationByEmailParams) (bool, error) {
 	row := q.db.QueryRow(ctx, existsOpenApplicationByEmail, arg.OrgID, arg.Email, arg.Phone)
 	var exists bool
 	err := row.Scan(&exists)
 	return exists, err
+}
+
+const existsOrgMemberByContact = `-- name: ExistsOrgMemberByContact :one
+SELECT EXISTS(
+  SELECT 1 FROM organization_memberships m
+  JOIN users u ON u.id = m.user_id
+  WHERE m.organization_id = $1::uuid
+    AND $2 <> '' AND lower(u.email) = lower($2)
+)
+`
+
+type ExistsOrgMemberByContactParams struct {
+	OrgID pgtype.UUID `json:"org_id"`
+	Email interface{} `json:"email"`
+}
+
+// Public-apply dedupe: an email that already belongs to a member of this
+// org must not mint a parallel application (the member applies through
+// their account, or not at all).
+func (q *Queries) ExistsOrgMemberByContact(ctx context.Context, arg ExistsOrgMemberByContactParams) (bool, error) {
+	row := q.db.QueryRow(ctx, existsOrgMemberByContact, arg.OrgID, arg.Email)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
+}
+
+const finishExport = `-- name: FinishExport :exec
+UPDATE member_exports SET status = $2, content = $3, row_count = $4 WHERE id = $1
+`
+
+type FinishExportParams struct {
+	ID       pgtype.UUID `json:"id"`
+	Status   string      `json:"status"`
+	Content  []byte      `json:"content"`
+	RowCount pgtype.Int4 `json:"row_count"`
+}
+
+func (q *Queries) FinishExport(ctx context.Context, arg FinishExportParams) error {
+	_, err := q.db.Exec(ctx, finishExport,
+		arg.ID,
+		arg.Status,
+		arg.Content,
+		arg.RowCount,
+	)
+	return err
 }
 
 const finishImport = `-- name: FinishImport :exec
@@ -325,7 +424,7 @@ func (q *Queries) GetApplication(ctx context.Context, id pgtype.UUID) (GetApplic
 
 const getApplicationCountForUser = `-- name: GetApplicationCountForUser :one
 SELECT count(*) FROM membership_applications
-WHERE organization_id = $1 AND user_id = $2 AND status IN ('applied','screened','approved')
+WHERE organization_id = $1 AND user_id = $2 AND status IN ('applied','screened')
 `
 
 type GetApplicationCountForUserParams struct {
@@ -333,11 +432,58 @@ type GetApplicationCountForUserParams struct {
 	UserID         pgtype.UUID `json:"user_id"`
 }
 
+// Only UNDECIDED applications block a new one — a decided (approved/
+// rejected/withdrawn) row is history, not an open intake.
 func (q *Queries) GetApplicationCountForUser(ctx context.Context, arg GetApplicationCountForUserParams) (int64, error) {
 	row := q.db.QueryRow(ctx, getApplicationCountForUser, arg.OrganizationID, arg.UserID)
 	var count int64
 	err := row.Scan(&count)
 	return count, err
+}
+
+const getExport = `-- name: GetExport :one
+SELECT id, organization_id, requested_by, filename, content, row_count, status, created_at FROM member_exports WHERE id = $1 AND organization_id = $2
+`
+
+type GetExportParams struct {
+	ID             pgtype.UUID `json:"id"`
+	OrganizationID pgtype.UUID `json:"organization_id"`
+}
+
+func (q *Queries) GetExport(ctx context.Context, arg GetExportParams) (MemberExports, error) {
+	row := q.db.QueryRow(ctx, getExport, arg.ID, arg.OrganizationID)
+	var i MemberExports
+	err := row.Scan(
+		&i.ID,
+		&i.OrganizationID,
+		&i.RequestedBy,
+		&i.Filename,
+		&i.Content,
+		&i.RowCount,
+		&i.Status,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const getExportAny = `-- name: GetExportAny :one
+SELECT id, organization_id, requested_by, filename, content, row_count, status, created_at FROM member_exports WHERE id = $1
+`
+
+func (q *Queries) GetExportAny(ctx context.Context, id pgtype.UUID) (MemberExports, error) {
+	row := q.db.QueryRow(ctx, getExportAny, id)
+	var i MemberExports
+	err := row.Scan(
+		&i.ID,
+		&i.OrganizationID,
+		&i.RequestedBy,
+		&i.Filename,
+		&i.Content,
+		&i.RowCount,
+		&i.Status,
+		&i.CreatedAt,
+	)
+	return i, err
 }
 
 const getImport = `-- name: GetImport :one
@@ -469,6 +615,26 @@ func (q *Queries) IssueCard(ctx context.Context, arg IssueCardParams) (IssueCard
 	return i, err
 }
 
+const linkApplicationUser = `-- name: LinkApplicationUser :execrows
+UPDATE membership_applications SET user_id = $2
+WHERE id = $1 AND user_id IS NULL
+`
+
+type LinkApplicationUserParams struct {
+	ID     pgtype.UUID `json:"id"`
+	UserID pgtype.UUID `json:"user_id"`
+}
+
+// Binds the applicant's new account — CAS on NULL so a raced bind can't
+// steal the row; 0 rows = already linked, treat as consumed.
+func (q *Queries) LinkApplicationUser(ctx context.Context, arg LinkApplicationUserParams) (int64, error) {
+	result, err := q.db.Exec(ctx, linkApplicationUser, arg.ID, arg.UserID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const listApplications = `-- name: ListApplications :many
 SELECT id, user_id, email, phone, status, sponsor_member_id, answers, created_at, decided_at
 FROM membership_applications
@@ -591,6 +757,52 @@ func (q *Queries) ListMembers(ctx context.Context, arg ListMembersParams) ([]Lis
 	return items, nil
 }
 
+const listMembersForExport = `-- name: ListMembersForExport :many
+SELECT m.member_no, u.display_name, u.email, m.category, m.lifecycle_state,
+       m.dues_standing, m.joined_at
+FROM organization_memberships m
+JOIN users u ON u.id = m.user_id
+WHERE m.organization_id = $1 ORDER BY m.member_no
+`
+
+type ListMembersForExportRow struct {
+	MemberNo       pgtype.Text        `json:"member_no"`
+	DisplayName    string             `json:"display_name"`
+	Email          string             `json:"email"`
+	Category       string             `json:"category"`
+	LifecycleState string             `json:"lifecycle_state"`
+	DuesStanding   string             `json:"dues_standing"`
+	JoinedAt       pgtype.Timestamptz `json:"joined_at"`
+}
+
+func (q *Queries) ListMembersForExport(ctx context.Context, organizationID pgtype.UUID) ([]ListMembersForExportRow, error) {
+	rows, err := q.db.Query(ctx, listMembersForExport, organizationID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListMembersForExportRow
+	for rows.Next() {
+		var i ListMembersForExportRow
+		if err := rows.Scan(
+			&i.MemberNo,
+			&i.DisplayName,
+			&i.Email,
+			&i.Category,
+			&i.LifecycleState,
+			&i.DuesStanding,
+			&i.JoinedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listRenewals = `-- name: ListRenewals :many
 SELECT id, period_label, starts_at, ends_at, created_at
 FROM membership_renewals WHERE membership_id = $1::uuid
@@ -665,6 +877,37 @@ func (q *Queries) ListSponsors(ctx context.Context, membershipID pgtype.UUID) ([
 	return items, nil
 }
 
+const listStaleImports = `-- name: ListStaleImports :many
+SELECT id FROM member_imports
+WHERE status = 'processing'
+  AND created_at < now() - interval '30 minutes'
+  AND created_at > now() - interval '7 days'
+ORDER BY created_at LIMIT 100
+`
+
+// Durable-row floor: imports recorded but never picked up (the enqueue
+// died) or whose worker was archived mid-run — re-driven by the
+// scheduler:tick sweep, mirroring ListStaleWebhookEvents (Rule 9-style).
+func (q *Queries) ListStaleImports(ctx context.Context) ([]pgtype.UUID, error) {
+	rows, err := q.db.Query(ctx, listStaleImports)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []pgtype.UUID
+	for rows.Next() {
+		var id pgtype.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listUserMemberships = `-- name: ListUserMemberships :many
 SELECT m.id, m.organization_id, o.name AS org_name, o.slug AS org_slug,
        m.member_no, m.category, m.lifecycle_state, m.dues_standing, m.joined_at
@@ -719,11 +962,16 @@ func (q *Queries) ListUserMemberships(ctx context.Context, userID pgtype.UUID) (
 const memberHistory = `-- name: MemberHistory :many
 SELECT event_type, payload, occurred_at FROM domain_events
 WHERE organization_id = $1::uuid
-  AND (aggregate_id = $2::uuid
-       OR (aggregate_type = 'user' AND aggregate_id = $3::uuid)
-       OR aggregate_id IN (
-         SELECT id FROM membership_applications
-         WHERE organization_id = $1::uuid AND user_id = $3::uuid))
+  AND sourced
+  AND (
+    (aggregate_type = 'organization_membership' AND aggregate_id = $2::uuid)
+    OR (aggregate_type = 'membership_application' AND aggregate_id IN (
+          SELECT id FROM membership_applications
+          WHERE organization_id = $1::uuid AND user_id = $3::uuid))
+    OR (aggregate_type = 'membership_card' AND aggregate_id IN (
+          SELECT id FROM membership_cards WHERE membership_id = $2::uuid))
+    OR (aggregate_type = 'membership_renewal' AND aggregate_id IN (
+          SELECT id FROM membership_renewals WHERE membership_id = $2::uuid)))
 ORDER BY occurred_at
 `
 
@@ -739,9 +987,10 @@ type MemberHistoryRow struct {
 	OccurredAt pgtype.Timestamptz `json:"occurred_at"`
 }
 
-// Lifecycle journey: sourced domain events against the membership, user
-// AND the member's application aggregates (ADR-014 "complete replayable
-// journey" — the intake trail belongs in the history too).
+// Lifecycle journey: the SOURCED event stream over membership-family
+// aggregates only (the membership_history view contract, §11) — the
+// membership itself, its intake application, and its cards/renewals.
+// Identity events on the user aggregate stay out of this surface.
 func (q *Queries) MemberHistory(ctx context.Context, arg MemberHistoryParams) ([]MemberHistoryRow, error) {
 	rows, err := q.db.Query(ctx, memberHistory, arg.OrgID, arg.MembershipID, arg.UserID)
 	if err != nil {
@@ -899,9 +1148,11 @@ func (q *Queries) SetMemberNo(ctx context.Context, arg SetMemberNoParams) error 
 }
 
 const touchRenewal = `-- name: TouchRenewal :exec
-UPDATE organization_memberships SET last_renewed_at = now() WHERE id = $1
+UPDATE organization_memberships SET last_renewed_at = now(), dues_standing = 'good' WHERE id = $1
 `
 
+// A recorded renewal settles the period — restore good standing (§12
+// payment consumers take over standing changes once finance lands).
 func (q *Queries) TouchRenewal(ctx context.Context, id pgtype.UUID) error {
 	_, err := q.db.Exec(ctx, touchRenewal, id)
 	return err

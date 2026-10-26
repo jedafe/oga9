@@ -124,7 +124,9 @@ VALUES (sqlc.arg(membership_id), sqlc.arg(period_label), sqlc.arg(starts_at), sq
 RETURNING id;
 
 -- name: TouchRenewal :exec
-UPDATE organization_memberships SET last_renewed_at = now() WHERE id = $1;
+-- A recorded renewal settles the period — restore good standing (§12
+-- payment consumers take over standing changes once finance lands).
+UPDATE organization_memberships SET last_renewed_at = now(), dues_standing = 'good' WHERE id = $1;
 
 -- name: ListRenewals :many
 SELECT id, period_label, starts_at, ends_at, created_at
@@ -174,16 +176,22 @@ WHERE member_id = $1
 RETURNING id, org_unit_id;
 
 -- name: MemberHistory :many
--- Lifecycle journey: sourced domain events against the membership, user
--- AND the member's application aggregates (ADR-014 "complete replayable
--- journey" — the intake trail belongs in the history too).
+-- Lifecycle journey: the SOURCED event stream over membership-family
+-- aggregates only (the membership_history view contract, §11) — the
+-- membership itself, its intake application, and its cards/renewals.
+-- Identity events on the user aggregate stay out of this surface.
 SELECT event_type, payload, occurred_at FROM domain_events
 WHERE organization_id = sqlc.arg(org_id)::uuid
-  AND (aggregate_id = sqlc.arg(membership_id)::uuid
-       OR (aggregate_type = 'user' AND aggregate_id = sqlc.arg(user_id)::uuid)
-       OR aggregate_id IN (
-         SELECT id FROM membership_applications
-         WHERE organization_id = sqlc.arg(org_id)::uuid AND user_id = sqlc.arg(user_id)::uuid))
+  AND sourced
+  AND (
+    (aggregate_type = 'organization_membership' AND aggregate_id = sqlc.arg(membership_id)::uuid)
+    OR (aggregate_type = 'membership_application' AND aggregate_id IN (
+          SELECT id FROM membership_applications
+          WHERE organization_id = sqlc.arg(org_id)::uuid AND user_id = sqlc.arg(user_id)::uuid))
+    OR (aggregate_type = 'membership_card' AND aggregate_id IN (
+          SELECT id FROM membership_cards WHERE membership_id = sqlc.arg(membership_id)::uuid))
+    OR (aggregate_type = 'membership_renewal' AND aggregate_id IN (
+          SELECT id FROM membership_renewals WHERE membership_id = sqlc.arg(membership_id)::uuid)))
 ORDER BY occurred_at;
 
 -- name: WithdrawApplication :one
@@ -195,19 +203,56 @@ WHERE id = $1 AND user_id = $2 AND status IN ('applied','screened')
 RETURNING id, organization_id;
 
 -- name: GetApplicationCountForUser :one
+-- Only UNDECIDED applications block a new one — a decided (approved/
+-- rejected/withdrawn) row is history, not an open intake.
 SELECT count(*) FROM membership_applications
-WHERE organization_id = $1 AND user_id = $2 AND status IN ('applied','screened','approved');
+WHERE organization_id = $1 AND user_id = $2 AND status IN ('applied','screened');
 
 -- name: ExistsOpenApplicationByEmail :one
 -- Import idempotency: a retried member_import worker must not mint a
 -- second open application for the same applicant (Rule 27) — dedupe on
--- email when present, phone otherwise.
+-- email when present, phone otherwise. Decided rows don't block.
 SELECT EXISTS(
   SELECT 1 FROM membership_applications
-  WHERE organization_id = sqlc.arg(org_id)::uuid AND status IN ('applied','screened','approved')
+  WHERE organization_id = sqlc.arg(org_id)::uuid AND status IN ('applied','screened')
     AND ((sqlc.arg(email) <> '' AND lower(email::text) = lower(sqlc.arg(email)))
       OR (sqlc.arg(email) = '' AND sqlc.arg(phone) <> '' AND phone = sqlc.arg(phone)))
 );
+
+-- name: ExistsOrgMemberByContact :one
+-- Public-apply dedupe: an email that already belongs to a member of this
+-- org must not mint a parallel application (the member applies through
+-- their account, or not at all).
+SELECT EXISTS(
+  SELECT 1 FROM organization_memberships m
+  JOIN users u ON u.id = m.user_id
+  WHERE m.organization_id = sqlc.arg(org_id)::uuid
+    AND sqlc.arg(email) <> '' AND lower(u.email) = lower(sqlc.arg(email))
+);
+
+-- name: ApprovedApplicationsForEmail :many
+-- Registration hook (§11): pre-signup applications approved while the
+-- applicant had no account materialize into memberships once their
+-- verified email binds a user. user_id IS NULL keeps it idempotent —
+-- linking the row consumes it.
+SELECT id, organization_id, sponsor_member_id FROM membership_applications
+WHERE user_id IS NULL AND status = 'approved' AND email = sqlc.arg(email);
+
+-- name: LinkApplicationUser :execrows
+-- Binds the applicant's new account — CAS on NULL so a raced bind can't
+-- steal the row; 0 rows = already linked, treat as consumed.
+UPDATE membership_applications SET user_id = $2
+WHERE id = $1 AND user_id IS NULL;
+
+-- name: ListStaleImports :many
+-- Durable-row floor: imports recorded but never picked up (the enqueue
+-- died) or whose worker was archived mid-run — re-driven by the
+-- scheduler:tick sweep, mirroring ListStaleWebhookEvents (Rule 9-style).
+SELECT id FROM member_imports
+WHERE status = 'processing'
+  AND created_at < now() - interval '30 minutes'
+  AND created_at > now() - interval '7 days'
+ORDER BY created_at LIMIT 100;
 
 -- name: ListUserMemberships :many
 SELECT m.id, m.organization_id, o.name AS org_name, o.slug AS org_slug,
@@ -220,3 +265,24 @@ ORDER BY o.name;
 -- name: GetPublicOrgBySlug :one
 SELECT id, name FROM organizations
 WHERE slug = $1 AND is_public_listed AND deleted_at IS NULL;
+
+-- name: CreateExport :one
+INSERT INTO member_exports (organization_id, requested_by, filename)
+VALUES (sqlc.arg(organization_id), sqlc.arg(requested_by), sqlc.arg(filename))
+RETURNING id;
+
+-- name: FinishExport :exec
+UPDATE member_exports SET status = $2, content = $3, row_count = $4 WHERE id = $1;
+
+-- name: GetExport :one
+SELECT * FROM member_exports WHERE id = $1 AND organization_id = $2;
+
+-- name: GetExportAny :one
+SELECT * FROM member_exports WHERE id = $1;
+
+-- name: ListMembersForExport :many
+SELECT m.member_no, u.display_name, u.email, m.category, m.lifecycle_state,
+       m.dues_standing, m.joined_at
+FROM organization_memberships m
+JOIN users u ON u.id = m.user_id
+WHERE m.organization_id = $1 ORDER BY m.member_no;

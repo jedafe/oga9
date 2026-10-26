@@ -527,6 +527,16 @@ JOIN user_roles r ON r.id = ura.role_id
 JOIN role_permissions rp ON rp.role_id = r.id
 WHERE ura.user_id = $1::uuid
   AND r.tenant_id IS NOT NULL AND rp.permission = $2
+UNION
+SELECT DISTINCT o.tenant_id FROM officer_appointments oa
+JOIN position_permissions pp ON pp.position_id = oa.position_id
+JOIN organization_memberships m ON m.id = oa.member_id
+JOIN organizations o ON o.id = oa.organization_id
+JOIN terms t ON t.id = oa.term_id AND (t.ends_at IS NULL OR t.ends_at > now())
+WHERE m.user_id = $1::uuid
+  AND m.lifecycle_state = 'active'
+  AND (oa.ends_at IS NULL OR oa.ends_at >= now()::date)
+  AND pp.permission = $2
 `
 
 type ListTenantsWithNodeParams struct {
@@ -534,9 +544,9 @@ type ListTenantsWithNodeParams struct {
 	Node   string      `json:"node"`
 }
 
-// Billing-tenant resolution (Rule 24): tenants where the caller holds a
-// tenant-scoped role granting the permission node — the api-routes-catalog
-// gate for /billing/* is org.admin.billing, not a role name (Rule 20).
+// Billing-tenant resolution (Rule 24): tenants where the caller holds the
+// permission node — tenant-scoped roles UNION current-term position grants
+// (Rule 20: nodes resolve through the full grant union, not roles alone).
 func (q *Queries) ListTenantsWithNode(ctx context.Context, arg ListTenantsWithNodeParams) ([]pgtype.UUID, error) {
 	rows, err := q.db.Query(ctx, listTenantsWithNode, arg.UserID, arg.Node)
 	if err != nil {
@@ -571,19 +581,26 @@ func (q *Queries) MarkWebhookProcessed(ctx context.Context, id pgtype.UUID) (int
 	return result.RowsAffected(), nil
 }
 
-const setSubscriptionPlan = `-- name: SetSubscriptionPlan :exec
+const setSubscriptionPlan = `-- name: SetSubscriptionPlan :execrows
 UPDATE subscriptions SET plan_slug = $1
-WHERE id = $2::uuid
+WHERE id = $2::uuid AND plan_slug = $3
+  AND state <> 'cancelled'
 `
 
 type SetSubscriptionPlanParams struct {
-	PlanSlug string      `json:"plan_slug"`
-	ID       pgtype.UUID `json:"id"`
+	PlanSlug     string      `json:"plan_slug"`
+	ID           pgtype.UUID `json:"id"`
+	ExpectedSlug string      `json:"expected_slug"`
 }
 
-func (q *Queries) SetSubscriptionPlan(ctx context.Context, arg SetSubscriptionPlanParams) error {
-	_, err := q.db.Exec(ctx, setSubscriptionPlan, arg.PlanSlug, arg.ID)
-	return err
+// CAS on the read plan_slug: a concurrent change-plan can't silently
+// overwrite a newer plan (0 rows = raced — caller surfaces the conflict).
+func (q *Queries) SetSubscriptionPlan(ctx context.Context, arg SetSubscriptionPlanParams) (int64, error) {
+	result, err := q.db.Exec(ctx, setSubscriptionPlan, arg.PlanSlug, arg.ID, arg.ExpectedSlug)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const setSubscriptionState = `-- name: SetSubscriptionState :exec
@@ -614,6 +631,75 @@ func (q *Queries) SetSubscriptionState(ctx context.Context, arg SetSubscriptionS
 		arg.ID,
 	)
 	return err
+}
+
+const setUsage = `-- name: SetUsage :execrows
+INSERT INTO usage_meters (tenant_id, limit_key, used, period_start)
+VALUES ($1::uuid, $2, $3::bigint,
+        $4::date)
+ON CONFLICT (tenant_id, limit_key, period_start) DO UPDATE SET used = EXCLUDED.used
+`
+
+type SetUsageParams struct {
+	TenantID    pgtype.UUID `json:"tenant_id"`
+	LimitKey    string      `json:"limit_key"`
+	Used        int64       `json:"used"`
+	PeriodStart pgtype.Date `json:"period_start"`
+}
+
+// §15 usage recompute — absolute write (AddUsage is the incremental path).
+func (q *Queries) SetUsage(ctx context.Context, arg SetUsageParams) (int64, error) {
+	result, err := q.db.Exec(ctx, setUsage,
+		arg.TenantID,
+		arg.LimitKey,
+		arg.Used,
+		arg.PeriodStart,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const tenantUsageCounts = `-- name: TenantUsageCounts :many
+SELECT 'limit.organizations' AS limit_key, count(*)::bigint AS used
+FROM organizations org WHERE org.tenant_id = $1 AND org.deleted_at IS NULL
+UNION ALL
+SELECT 'limit.members.active', count(*)::bigint
+FROM organization_memberships m
+JOIN organizations o ON o.id = m.organization_id
+WHERE o.tenant_id = $1 AND m.lifecycle_state IN ('active','life_member')
+UNION ALL
+SELECT 'limit.branches', count(*)::bigint
+FROM org_units u JOIN organizations o ON o.id = u.organization_id
+WHERE o.tenant_id = $1 AND u.type IN ('hq','branch','chapter')
+`
+
+type TenantUsageCountsRow struct {
+	LimitKey string `json:"limit_key"`
+	Used     int64  `json:"used"`
+}
+
+// §15: recompute countable limits tenant-wide (storage.mb has no size
+// column to count yet — joins later when documents carry byte size).
+func (q *Queries) TenantUsageCounts(ctx context.Context, tenantID pgtype.UUID) ([]TenantUsageCountsRow, error) {
+	rows, err := q.db.Query(ctx, tenantUsageCounts, tenantID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []TenantUsageCountsRow
+	for rows.Next() {
+		var i TenantUsageCountsRow
+		if err := rows.Scan(&i.LimitKey, &i.Used); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const transitionSubscriptionState = `-- name: TransitionSubscriptionState :execrows

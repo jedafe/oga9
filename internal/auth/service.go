@@ -32,6 +32,7 @@ var (
 	ErrEmailTaken       = errors.New("email_taken")
 	ErrBadCredentials   = errors.New("invalid_credentials")
 	ErrUserSuspended    = errors.New("user_suspended")
+	ErrTenantSuspended  = errors.New("tenant_suspended")
 	ErrSessionRevoked   = errors.New("session_revoked")
 	ErrWeakPassword     = errors.New("weak_password")
 	ErrMFARequired      = errors.New("mfa_required")
@@ -60,6 +61,7 @@ type User struct {
 type LoginResult struct {
 	Token     string
 	SessionID uuid.UUID
+	UserID    uuid.UUID // set on session success — drives post-login hooks
 	MFAToken  string
 	Email     string
 }
@@ -199,6 +201,15 @@ func (s *Service) Login(ctx context.Context, email, password, mfaCode, deviceLab
 // finishLogin is the shared post-credential tail: MFA gate → session.
 // mfaSecret is the raw encrypted bytea; empty means MFA is off.
 func (s *Service) finishLogin(ctx context.Context, userID uuid.UUID, mfaSecret []byte, mfaCode, deviceLabel, ip, ua, provider string) (*LoginResult, error) {
+	// §15: a suspended tenant blocks login for its users; platform operators
+	// (platform.tenants.manage) still authenticate to support/reinstate.
+	healthy, err := s.q.UserHasHealthyMembership(ctx, toPg(userID))
+	if err == nil && !healthy {
+		op, e := s.q.UserHasAnyPlatformRole(ctx, toPg(userID))
+		if e != nil || !op {
+			return nil, ErrTenantSuspended // every org they belong to is frozen
+		}
+	}
 	if len(mfaSecret) > 0 {
 		if mfaCode == "" {
 			tok, err := s.stageMFAGate(ctx, userID, deviceLabel, ip, ua, provider)
@@ -229,23 +240,30 @@ func (s *Service) finishLogin(ctx context.Context, userID uuid.UUID, mfaSecret [
 	if err != nil {
 		return nil, err
 	}
-	return &LoginResult{Token: token, SessionID: sessionID}, nil
+	return &LoginResult{Token: token, SessionID: sessionID, UserID: userID}, nil
 }
 
 // createSession is the shared session-issuing tail of Login/OAuthCallback:
 // session row + UserLoggedIn event in one tx → sign JWT keyed to jti.
 func (s *Service) createSession(ctx context.Context, userID uuid.UUID, deviceLabel, ip, ua, provider string) (string, uuid.UUID, error) {
+	return s.createSessionTTL(ctx, userID, deviceLabel, ip, ua, provider, s.tokenTTL, uuid.Nil)
+}
+
+// createSessionTTL — same flow with an explicit TTL (§15 support sessions
+// run a fixed 30min regardless of the session TTL).
+func (s *Service) createSessionTTL(ctx context.Context, userID uuid.UUID, deviceLabel, ip, ua, provider string, ttl time.Duration, supportSessionID uuid.UUID) (string, uuid.UUID, error) {
 	jti := uuid.New()
-	expires := time.Now().Add(s.tokenTTL)
+	expires := time.Now().Add(ttl)
 	var sessID pgtype.UUID
 	err := s.withTx(ctx, func(q *db.Queries) error {
 		id, e := q.CreateSession(ctx, db.CreateSessionParams{
-			UserID:      toPg(userID),
-			Jti:         toPg(jti),
-			DeviceLabel: pgText(deviceLabel),
-			Ip:          ip,
-			UserAgent:   pgText(ua),
-			ExpiresAt:   pgtype.Timestamptz{Time: expires, Valid: true},
+			UserID:           toPg(userID),
+			Jti:              toPg(jti),
+			DeviceLabel:      pgText(deviceLabel),
+			Ip:               ip,
+			UserAgent:        pgText(ua),
+			ExpiresAt:        pgtype.Timestamptz{Time: expires, Valid: true},
+			SupportSessionID: toPg(supportSessionID),
 		})
 		if e != nil {
 			return e
@@ -257,7 +275,7 @@ func (s *Service) createSession(ctx context.Context, userID uuid.UUID, deviceLab
 	if err != nil {
 		return "", uuid.Nil, err
 	}
-	token, err := IssueToken(s.jwtSecret, userID, jti, s.tokenTTL)
+	token, err := IssueToken(s.jwtSecret, userID, jti, ttl)
 	if err != nil {
 		return "", uuid.Nil, err
 	}
@@ -342,27 +360,39 @@ func (s *Service) UserIDByEmail(ctx context.Context, email string) (string, erro
 	return fromPg(id).String(), nil
 }
 
-// VerifyEmail consumes the single-use signed token and marks the user verified.
-func (s *Service) VerifyEmail(ctx context.Context, token string) error {
+// VerifyEmail consumes the single-use signed token, marks the user
+// verified, and returns the user — the handler uses the verified email
+// to materialize any approved pre-signup applications (§11 hook).
+func (s *Service) VerifyEmail(ctx context.Context, token string) (*User, error) {
 	jti, userID, err := s.ConsumeActionToken(ctx, token, "verify_email")
 	if err != nil {
-		return err
+		return nil, err
 	}
 	uid, err := uuid.Parse(userID)
 	if err != nil {
-		return errors.New("malformed token subject")
+		return nil, errors.New("malformed token subject")
 	}
+	var u *User
 	err = s.withTx(ctx, func(q *db.Queries) error {
 		if err := q.SetUserVerified(ctx, toPg(uid)); err != nil {
 			return err
 		}
-		return events.Emit(ctx, q, uuid.Nil, uuid.Nil, "IdentityVerified", "user", uid, uid, true,
-			map[string]any{"user_id": uid, "method": "email_link"})
+		if err := events.Emit(ctx, q, uuid.Nil, uuid.Nil, "IdentityVerified", "user", uid, uid, true,
+			map[string]any{"user_id": uid, "method": "email_link"}); err != nil {
+			return err
+		}
+		row, err := q.GetUserByID(ctx, toPg(uid))
+		if err != nil {
+			return err
+		}
+		u = &User{ID: uid, Email: row.Email, DisplayName: row.DisplayName, IsVerified: row.IsVerified, Status: row.Status}
+		return nil
 	})
 	if err != nil {
 		s.releaseActionToken(ctx, jti) // burned but tx failed — allow retry
+		return nil, err
 	}
-	return err
+	return u, nil
 }
 
 // ConsumeActionToken verifies a signed token and burns it (single-use,
@@ -519,7 +549,7 @@ func (s *Service) CompleteMFALogin(ctx context.Context, mfaToken, code string) (
 	if err != nil {
 		return nil, err
 	}
-	return &LoginResult{Token: token, SessionID: sessionID}, nil
+	return &LoginResult{Token: token, SessionID: sessionID, UserID: gate.UserID}, nil
 }
 
 // decryptMFA unwraps the AES-GCM envelope; plaintext TOTP never persists.
@@ -707,4 +737,19 @@ func (s *Service) createOAuthUser(ctx context.Context, email, displayName string
 		return uuid.Nil, err
 	}
 	return fromPg(id), nil
+}
+
+// MintActionToken issues a single-use token on another actor's behalf —
+// the §15 provision welcome link uses purpose "password_reset" so the
+// existing reset flow consumes it (the owner picks their own password).
+func (s *Service) MintActionToken(userID uuid.UUID, purpose string, ttl time.Duration) string {
+	tok, _ := SignActionToken(s.jwtSecret, userID.String(), purpose, ttl)
+	return tok
+}
+
+// CreateSupportSession mints a 30min session for the impersonation target
+// — the §15 support flow. The user_sessions row links back to the
+// support_sessions record so session listings surface the operator chain.
+func (s *Service) CreateSupportSession(ctx context.Context, supportSessionID, targetUserID uuid.UUID, ttl time.Duration, ip, ua string) (string, uuid.UUID, error) {
+	return s.createSessionTTL(ctx, targetUserID, "support", ip, ua, "support", ttl, supportSessionID)
 }

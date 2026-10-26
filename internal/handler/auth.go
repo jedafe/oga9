@@ -17,15 +17,35 @@ import (
 	"github.com/jedafe/oga9/internal/tasks"
 )
 
+// MemberMaterializer is the §11 registration hook seam — the members
+// module materializes approved pre-signup applications once a verified
+// identity binds. Wired with the tenant service; nil-safe for tests.
+type MemberMaterializer interface {
+	MaterializeApprovedApplications(ctx context.Context, userID uuid.UUID) error
+}
+
 type AuthHandler struct {
 	svc    *auth.Service
 	queue  *asynq.Client
 	secret string
 	appURL string
+	mat    MemberMaterializer
 }
 
-func NewAuthHandler(svc *auth.Service, q *asynq.Client, secret, appURL string) *AuthHandler {
-	return &AuthHandler{svc: svc, queue: q, secret: secret, appURL: appURL}
+func NewAuthHandler(svc *auth.Service, q *asynq.Client, secret, appURL string, mat MemberMaterializer) *AuthHandler {
+	return &AuthHandler{svc: svc, queue: q, secret: secret, appURL: appURL, mat: mat}
+}
+
+// materialize runs the approved-application hook after a verified bind —
+// best-effort: membership materialization must never fail a login or
+// verification response (the sweep/self-service path can retry).
+func (h *AuthHandler) materialize(ctx context.Context, userID uuid.UUID) {
+	if h.mat == nil || userID == uuid.Nil {
+		return
+	}
+	if err := h.mat.MaterializeApprovedApplications(ctx, userID); err != nil {
+		log.Printf("materialize applications for user %s: %v", userID, err)
+	}
 }
 
 // enqueueMail is fire-and-forget (Rule 8): queue the mail task, never block.
@@ -101,6 +121,10 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteErr(w, 401, "invalid_credentials", "email or password incorrect")
 		return
 	}
+	if errors.Is(err, auth.ErrTenantSuspended) {
+		httpx.WriteErr(w, 403, "tenant_suspended", "organization account is suspended")
+		return
+	}
 	if errors.Is(err, auth.ErrUserSuspended) {
 		httpx.WriteErr(w, 403, "user_suspended", "account suspended")
 		return
@@ -128,6 +152,7 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteErr(w, 500, "internal_error", "login failed")
 		return
 	}
+	h.materialize(r.Context(), res.UserID)
 	httpx.WriteData(w, 200, map[string]any{"token": res.Token, "session_id": res.SessionID})
 }
 
@@ -146,10 +171,12 @@ func (h *AuthHandler) VerifyEmail(w http.ResponseWriter, r *http.Request) {
 		httpx.Decode(w, r, &b)
 		token = b.Token
 	}
-	if err := h.svc.VerifyEmail(r.Context(), token); err != nil {
+	u, err := h.svc.VerifyEmail(r.Context(), token)
+	if err != nil {
 		httpx.WriteErr(w, 400, "invalid_token", "verification link invalid or expired")
 		return
 	}
+	h.materialize(r.Context(), u.ID)
 	httpx.WriteData(w, 200, map[string]any{"verified": true})
 }
 

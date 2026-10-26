@@ -146,14 +146,14 @@ func TestMemberLifecycleFlow(t *testing.T) {
 	if card2, err := svc.IssueCard(ctx, oc, mid, nil); err != nil || card2.Serial != card.Serial {
 		t.Fatalf("re-issue should return the live card, got %v err %v", card2.Serial, err)
 	}
-	rid, err := svc.RenewMember(ctx, oc, mid, "2026", time.Now(), time.Now().AddDate(1, 0, 0))
+	rid, err := svc.RenewMember(ctx, oc, mid, "2026", time.Now(), time.Now().AddDate(1, 0, 0), uuid.Nil)
 	if err != nil || rid == uuid.Nil {
 		t.Fatalf("renew: %v", err)
 	}
-	if _, err := svc.RenewMember(ctx, oc, mid, "2026", time.Now(), time.Now().AddDate(1, 0, 0)); err != ErrDuplicateRenewal {
+	if _, err := svc.RenewMember(ctx, oc, mid, "2026", time.Now(), time.Now().AddDate(1, 0, 0), uuid.Nil); err != ErrDuplicateRenewal {
 		t.Fatalf("dup period renewal should 409, got %v", err)
 	}
-	if _, err := svc.RenewMember(ctx, oc, mid, "2025", time.Now(), time.Now().AddDate(-1, 0, 0)); err != ErrBadValue {
+	if _, err := svc.RenewMember(ctx, oc, mid, "2025", time.Now(), time.Now().AddDate(-1, 0, 0), uuid.Nil); err != ErrBadValue {
 		t.Fatalf("backwards renewal window should fail, got %v", err)
 	}
 	if !Eligible("active", "good") || Eligible("suspended", "good") || Eligible("active", "bad") {
@@ -393,5 +393,113 @@ func TestSponsorWorkflow(t *testing.T) {
 	pool.QueryRow(ctx, "SELECT status FROM membership_applications WHERE id=$1", wa).Scan(&st)
 	if st != "withdrawn" {
 		t.Fatalf("expected withdrawn, got %s", st)
+	}
+}
+
+// Regression: invited members land 'applied' with no application row —
+// the membership-level intake path must carry them to activation, and a
+// pre-signup approved application must materialize when the account binds.
+func TestIntakeDeadEnds(t *testing.T) {
+	svc, pool := testSvc(t)
+	ctx := context.Background()
+	owner := mkUser(t, pool, "io"+uuid.NewString()[:8]+"@test.oga9")
+
+	org, err := svc.CreateOrg(ctx, owner, "Intake Union", "iu"+uuid.NewString()[:6], "union", "union", "NG", "Abuja", "i@t.co", uuid.Nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oc, _ := svc.ResolveOrgCtx(ctx, owner, org.ID)
+
+	// 1) invite → accept → 'applied' → approve (mints member_no) →
+	//    register → activate. Previously 'applied' was a dead end.
+	invEmail := "iv" + uuid.NewString()[:8] + "@test.oga9"
+	invUser := mkUser(t, pool, invEmail)
+	inv, err := svc.CreateInvitation(ctx, oc, invEmail, "", "", "floor")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.AcceptInvitation(ctx, invUser, inv.Token); err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+	moc, err := svc.ResolveOrgCtx(ctx, invUser, org.ID)
+	if err != nil {
+		t.Fatalf("invited member ctx: %v", err)
+	}
+	// intake sequence is the same as the application path: applied→screened→approved
+	if err := svc.TransitionMember(ctx, oc, moc.MembershipID, "approve"); err != ErrInvalidTransition {
+		t.Fatalf("skipping screen should be invalid, got %v", err)
+	}
+	if err := svc.TransitionMember(ctx, oc, moc.MembershipID, "screen"); err != nil {
+		t.Fatalf("membership screen: %v", err)
+	}
+	if err := svc.TransitionMember(ctx, oc, moc.MembershipID, "approve"); err != nil {
+		t.Fatalf("membership approve: %v", err)
+	}
+	var memberNo string
+	var state string
+	pool.QueryRow(ctx, "SELECT member_no, lifecycle_state FROM organization_memberships WHERE id=$1", moc.MembershipID).
+		Scan(&memberNo, &state)
+	if state != "approved" || memberNo == "" {
+		t.Fatalf("invited approve should mint member_no, got %q %q", memberNo, state)
+	}
+	if err := svc.TransitionMember(ctx, oc, moc.MembershipID, "register"); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	if err := svc.TransitionMember(ctx, oc, moc.MembershipID, "activate"); err != nil {
+		t.Fatalf("activate: %v", err)
+	}
+	pool.QueryRow(ctx, "SELECT lifecycle_state FROM organization_memberships WHERE id=$1", moc.MembershipID).Scan(&state)
+	if state != "active" {
+		t.Fatalf("invited member never reached active, got %q", state)
+	}
+
+	// 2) public (pre-signup) application → approve → materialize on bind.
+	pubEmail := "pb" + uuid.NewString()[:8] + "@test.oga9"
+	pubUser := mkUser(t, pool, pubEmail)
+	app, err := svc.Apply(ctx, org.ID, uuid.Nil, pubEmail, "", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.DecideApplication(ctx, oc, app, "screen", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.DecideApplication(ctx, oc, app, "approve", nil); err != nil {
+		t.Fatalf("pre-signup approve: %v", err)
+	}
+	var n int64
+	pool.QueryRow(ctx, "SELECT count(*) FROM organization_memberships WHERE organization_id=$1 AND user_id=$2", org.ID, pubUser).Scan(&n)
+	if n != 0 {
+		t.Fatal("pre-signup approve should not materialize a membership yet")
+	}
+	if err := svc.MaterializeApprovedApplications(ctx, pubUser); err != nil {
+		t.Fatalf("materialize: %v", err)
+	}
+	pool.QueryRow(ctx, "SELECT lifecycle_state FROM organization_memberships WHERE organization_id=$1 AND user_id=$2", org.ID, pubUser).Scan(&state)
+	if state != "approved" {
+		t.Fatalf("materialized membership should be 'approved', got %q", state)
+	}
+	// idempotent: a second run must not mint a second membership
+	if err := svc.MaterializeApprovedApplications(ctx, pubUser); err != nil {
+		t.Fatal(err)
+	}
+	pool.QueryRow(ctx, "SELECT count(*) FROM organization_memberships WHERE organization_id=$1 AND user_id=$2", org.ID, pubUser).Scan(&n)
+	if n != 1 {
+		t.Fatalf("materialize replay minted %d memberships", n)
+	}
+
+	// 3) sponsor double-count: required=2, attaching the primary sponsor
+	// as a screener-extra must NOT satisfy the count with one person.
+	if err := svc.SetSetting(ctx, oc, "org.membership.sponsor_required", json.RawMessage("2")); err != nil {
+		t.Fatal(err)
+	}
+	dbl, err := svc.Apply(ctx, org.ID, uuid.Nil, "dbl@t.co", "", nil, []uuid.UUID{oc.MembershipID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.DecideApplication(ctx, oc, dbl, "screen", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.DecideApplication(ctx, oc, dbl, "approve", []uuid.UUID{oc.MembershipID}); err != ErrSponsorRequired {
+		t.Fatalf("primary-as-extra must not count twice, got %v", err)
 	}
 }

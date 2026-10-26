@@ -8,6 +8,7 @@ package handler
 
 import (
 	"errors"
+	"log"
 	"net/http"
 
 	"github.com/jedafe/oga9/internal/auth"
@@ -16,9 +17,14 @@ import (
 	"github.com/pquerna/otp/totp"
 )
 
-type MFAHandler struct{ svc *auth.Service }
+type MFAHandler struct {
+	svc *auth.Service
+	mat MemberMaterializer
+}
 
-func NewMFAHandler(svc *auth.Service) *MFAHandler { return &MFAHandler{svc: svc} }
+func NewMFAHandler(svc *auth.Service, mat MemberMaterializer) *MFAHandler {
+	return &MFAHandler{svc: svc, mat: mat}
+}
 
 func (h *MFAHandler) Setup(w http.ResponseWriter, r *http.Request) {
 	userID := middleware.UserID(r.Context())
@@ -111,6 +117,13 @@ func (h *MFAHandler) Complete(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		httpx.WriteErr(w, 500, "internal_error", "mfa completion failed")
 		return
+	}
+	// §11 hook — same verified-bind materialization as login/verify/OAuth;
+	// an MFA gate must not strand an approved pre-signup application.
+	if h.mat != nil {
+		if err := h.mat.MaterializeApprovedApplications(r.Context(), res.UserID); err != nil {
+			log.Printf("materialize applications for user %s: %v", res.UserID, err)
+		}
 	}
 	httpx.WriteData(w, 200, map[string]any{"token": res.Token, "session_id": res.SessionID})
 }

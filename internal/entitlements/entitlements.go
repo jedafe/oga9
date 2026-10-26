@@ -143,7 +143,8 @@ func (s *Service) resolve(ctx context.Context, tenantID uuid.UUID) (*Set, error)
 		limits[l.LimitKey] = l.LimitValue
 	}
 	// License merge (self-hosted, Rule 29): capabilities union; limits take
-	// the greater grant across sources.
+	// the greater grant across sources. -1 (unlimited) is absorbing — a
+	// license that lifts a cap must beat any positive plan limit.
 	if lic, err := s.q.GetLatestLicense(ctx, toPg(tenantID)); err == nil {
 		var le struct {
 			Capabilities []string         `json:"capabilities"`
@@ -154,7 +155,7 @@ func (s *Service) resolve(ctx context.Context, tenantID uuid.UUID) (*Set, error)
 				caps[c] = true
 			}
 			for k, v := range le.Limits {
-				if cur, ok := limits[k]; !ok || v > cur {
+				if cur, ok := limits[k]; !ok || (cur != -1 && (v == -1 || v > cur)) {
 					limits[k] = v
 				}
 			}

@@ -442,8 +442,10 @@ func (s *Service) AcceptInvitation(ctx context.Context, userID uuid.UUID, token 
 		}
 		// Idempotent: an existing membership means the goal is already
 		// achieved (re-accept, prior approval) — consume the invite and
-		// move on instead of failing on the unique constraint.
-		if _, err := q.GetMembership(ctx, db.GetMembershipParams{
+		// move on instead of failing on the unique constraint. A member
+		// who left (resigned/withdrawn/rejected) re-enters intake at
+		// 'applied'; expelled stays out (expulsion is a bar, not a pause).
+		if m, err := q.GetMembership(ctx, db.GetMembershipParams{
 			OrganizationID: inv.OrganizationID, UserID: toPg(userID),
 		}); err != nil {
 			if err != pgx.ErrNoRows {
@@ -455,9 +457,10 @@ func (s *Service) AcceptInvitation(ctx context.Context, userID uuid.UUID, token 
 			}); err != nil {
 				return err
 			}
-			// A departed inviter shouldn't block acceptance — granted_by
-			// falls back to NULL (invited_by points at a membership that may
-			// no longer exist, e.g. expelled/resigned).
+			// Invited members are org-vouched — the member role lands on
+			// accept even at 'applied' (office still requires 'active' via
+			// the appointment/committee guards; application-path members
+			// gain it at activation).
 			var grantedBy pgtype.UUID
 			if mb, err := q.GetMembershipByID(ctx, inv.InvitedBy); err == nil {
 				grantedBy = mb.UserID
@@ -468,6 +471,20 @@ func (s *Service) AcceptInvitation(ctx context.Context, userID uuid.UUID, token 
 				UserID: toPg(userID), TenantID: tenantID, GrantedBy: grantedBy, Slug: "member",
 			}); err != nil {
 				return err
+			}
+		} else {
+			switch m.LifecycleState {
+			case "expelled":
+				return ErrForbidden
+			case "resigned", "withdrawn", "rejected":
+				// Intake reset, not a lifecycle transition — the ADR-014
+				// machine owns forward edges; re-invite re-queues the row.
+				if _, err := q.TransitionMembership(ctx, db.TransitionMembershipParams{
+					ID: m.ID, OrganizationID: inv.OrganizationID,
+					LifecycleState: "applied", Column4: []string{m.LifecycleState},
+				}); err != nil {
+					return err
+				}
 			}
 		}
 		return events.Emit(ctx, q, fromPg(tenantID), orgID, "InvitationAccepted", "invitation", fromPg(inv.ID), userID, true,
