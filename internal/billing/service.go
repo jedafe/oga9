@@ -759,7 +759,7 @@ func (s *Service) SubscribeAddon(ctx context.Context, tenantID uuid.UUID, slug, 
 	if term == "" {
 		term = "monthly"
 	}
-	if !billingTerms[term] {
+	if term != "monthly" && term != "annual" { // addons bill monthly|annual only
 		return ErrBadBillingTerm
 	}
 	a, err := s.q.GetAddon(ctx, slug)
@@ -818,17 +818,29 @@ func (s *Service) CancelAddon(ctx context.Context, tenantID uuid.UUID, slug stri
 // ExpireAddonSweep lapses past-expiry addons — folded into SweepStates so
 // the hourly billing tick emits AddonExpired (→ entitlement cache flush).
 func (s *Service) ExpireAddonSweep(ctx context.Context) error {
-	rows, err := s.q.ExpireTenantAddons(ctx)
+	rows, err := s.q.ListExpiringAddons(ctx)
 	if err != nil {
 		return err
 	}
 	for _, r := range rows {
 		tid := uuid.UUID(r.TenantID.Bytes)
-		_ = s.withTx(ctx, func(q *db.Queries) error {
+		// Rule 12: the expiry flip and its event commit together — a
+		// failed emit rolls the state back for the next sweep to retry.
+		err := s.withTx(ctx, func(q *db.Queries) error {
+			n, err := q.ExpireTenantAddon(ctx, r.ID)
+			if err != nil {
+				return err
+			}
+			if n == 0 {
+				return nil // another path expired/cancelled it
+			}
 			return events.Emit(ctx, q, tid, uuid.Nil, "AddonExpired",
 				"tenant_addon", tid, uuid.Nil, true,
 				map[string]any{"tenant_id": tid, "addon_slug": r.AddonSlug})
 		})
+		if err != nil {
+			return err
+		}
 	}
 	return nil
 }

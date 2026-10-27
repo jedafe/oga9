@@ -48,11 +48,15 @@ RETURNING *;
 UPDATE tenant_addons SET state = 'cancelled', cancelled_at = now()
 WHERE tenant_id = $1 AND addon_slug = $2 AND state IN ('trialing','active');
 
--- name: ExpireTenantAddons :many
--- sweep: past-expiry active/trialing addons lapse (emits AddonExpired per row).
+-- name: ListExpiringAddons :many
+-- sweep candidates: past-expiry live addons (each row is then CAS-expired
+-- and its AddonExpired emitted in ONE tx — Rule 12).
+SELECT id, tenant_id, addon_slug FROM tenant_addons
+WHERE state IN ('trialing','active') AND expires_at IS NOT NULL AND expires_at < now();
+
+-- name: ExpireTenantAddon :execrows
 UPDATE tenant_addons SET state = 'expired'
-WHERE state IN ('trialing','active') AND expires_at IS NOT NULL AND expires_at < now()
-RETURNING tenant_id, addon_slug;
+WHERE id = $1 AND state IN ('trialing','active');
 
 -- name: ListActiveAddonGrants :many
 -- entitlement merge source (§07 resolution order): live grants only.

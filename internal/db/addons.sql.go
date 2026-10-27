@@ -29,36 +29,17 @@ func (q *Queries) CancelTenantAddon(ctx context.Context, arg CancelTenantAddonPa
 	return result.RowsAffected(), nil
 }
 
-const expireTenantAddons = `-- name: ExpireTenantAddons :many
+const expireTenantAddon = `-- name: ExpireTenantAddon :execrows
 UPDATE tenant_addons SET state = 'expired'
-WHERE state IN ('trialing','active') AND expires_at IS NOT NULL AND expires_at < now()
-RETURNING tenant_id, addon_slug
+WHERE id = $1 AND state IN ('trialing','active')
 `
 
-type ExpireTenantAddonsRow struct {
-	TenantID  pgtype.UUID `json:"tenant_id"`
-	AddonSlug string      `json:"addon_slug"`
-}
-
-// sweep: past-expiry active/trialing addons lapse (emits AddonExpired per row).
-func (q *Queries) ExpireTenantAddons(ctx context.Context) ([]ExpireTenantAddonsRow, error) {
-	rows, err := q.db.Query(ctx, expireTenantAddons)
+func (q *Queries) ExpireTenantAddon(ctx context.Context, id pgtype.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, expireTenantAddon, id)
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
-	defer rows.Close()
-	var items []ExpireTenantAddonsRow
-	for rows.Next() {
-		var i ExpireTenantAddonsRow
-		if err := rows.Scan(&i.TenantID, &i.AddonSlug); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
+	return result.RowsAffected(), nil
 }
 
 const getAddon = `-- name: GetAddon :one
@@ -200,6 +181,39 @@ func (q *Queries) ListAddonCatalogActive(ctx context.Context) ([]AddonCatalog, e
 			&i.AvailableOnPlans,
 			&i.Active,
 		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listExpiringAddons = `-- name: ListExpiringAddons :many
+SELECT id, tenant_id, addon_slug FROM tenant_addons
+WHERE state IN ('trialing','active') AND expires_at IS NOT NULL AND expires_at < now()
+`
+
+type ListExpiringAddonsRow struct {
+	ID        pgtype.UUID `json:"id"`
+	TenantID  pgtype.UUID `json:"tenant_id"`
+	AddonSlug string      `json:"addon_slug"`
+}
+
+// sweep candidates: past-expiry live addons (each row is then CAS-expired
+// and its AddonExpired emitted in ONE tx — Rule 12).
+func (q *Queries) ListExpiringAddons(ctx context.Context) ([]ListExpiringAddonsRow, error) {
+	rows, err := q.db.Query(ctx, listExpiringAddons)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListExpiringAddonsRow
+	for rows.Next() {
+		var i ListExpiringAddonsRow
+		if err := rows.Scan(&i.ID, &i.TenantID, &i.AddonSlug); err != nil {
 			return nil, err
 		}
 		items = append(items, i)

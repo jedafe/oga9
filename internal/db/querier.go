@@ -365,8 +365,7 @@ type Querier interface {
 	// org must not mint a parallel application (the member applies through
 	// their account, or not at all).
 	ExistsOrgMemberByContact(ctx context.Context, arg ExistsOrgMemberByContactParams) (bool, error)
-	// sweep: past-expiry active/trialing addons lapse (emits AddonExpired per row).
-	ExpireTenantAddons(ctx context.Context) ([]ExpireTenantAddonsRow, error)
+	ExpireTenantAddon(ctx context.Context, id pgtype.UUID) (int64, error)
 	// governance:term_transitions sweep — current terms past ends_at.
 	ExpiredCurrentTerms(ctx context.Context) ([]Terms, error)
 	// the daily expiry sweep — rows past expiry not yet evented; each is
@@ -645,6 +644,9 @@ type Querier interface {
 	ListDueSubscriptions(ctx context.Context) ([]ListDueSubscriptionsRow, error)
 	ListDuesSchedules(ctx context.Context, organizationID pgtype.UUID) ([]DuesSchedules, error)
 	ListElections(ctx context.Context, organizationID pgtype.UUID) ([]Elections, error)
+	// sweep candidates: past-expiry live addons (each row is then CAS-expired
+	// and its AddonExpired emitted in ONE tx — Rule 12).
+	ListExpiringAddons(ctx context.Context) ([]ListExpiringAddonsRow, error)
 	// ---------- feature flags ----------
 	ListFeatureFlags(ctx context.Context) ([]FeatureFlags, error)
 	ListGenerations(ctx context.Context, arg ListGenerationsParams) ([]AiGenerations, error)
