@@ -173,6 +173,28 @@ func (s *Service) DeactivateApp(ctx context.Context, oc *OrgCtx, appID string) e
 	})
 }
 
+// ScaffoldTenant prepares a control-plane-provisioned tenant for its first
+// org (§15 pipeline): clones the system role templates + their permission
+// grants, installs the MVP app set, and grants the owner org_admin — the
+// administered-tenant gate in resolveOrgTenant requires it. The self-serve
+// path does all of this inside CreateOrg's provision branch; platform
+// provisioning (platform.Provision) calls this inside its own tx.
+// Idempotent: role clones skip existing rows, app installs conflict-noop,
+// the assignment is ON CONFLICT DO NOTHING.
+func ScaffoldTenant(ctx context.Context, q *db.Queries, tenantID, ownerID uuid.UUID) error {
+	if err := q.CloneTenantRoles(ctx, toPg(tenantID)); err != nil {
+		return err
+	}
+	if err := q.CloneTenantRolePermissions(ctx, toPg(tenantID)); err != nil {
+		return err
+	}
+	if err := provisionMVPApps(ctx, q, tenantID); err != nil {
+		return err
+	}
+	return q.AssignRoleBySlug(ctx, db.AssignRoleBySlugParams{
+		UserID: toPg(ownerID), TenantID: toPg(tenantID), GrantedBy: toPg(ownerID), Slug: "org_admin"})
+}
+
 // provisionMVPApps installs every mvp_required app on a fresh tenant — runs
 // inside the provisioning tx (CreateOrg).
 func provisionMVPApps(ctx context.Context, q *db.Queries, tenantID uuid.UUID) error {

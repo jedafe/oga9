@@ -40,6 +40,9 @@ var (
 	ErrTenantNotFound      = errors.New("tenant_not_found")
 	ErrWebhookUnconfigured = errors.New("webhook_provider_not_configured")
 	ErrBadPayload          = errors.New("invalid_webhook_payload")
+	ErrBadValue            = errors.New("bad_value")
+	ErrNotFound            = errors.New("not_found")
+	ErrAddonNotEligible    = errors.New("addon_not_eligible")
 	// ErrPaymentRequired: self-serve billing covers the free plan and
 	// downgrades only — upgrades flow through the provider webhook or a
 	// platform override (§15), never a bare plan_slug write.
@@ -241,6 +244,21 @@ func (s *Service) ChangePlan(ctx context.Context, tenantID uuid.UUID, plan strin
 		return err
 	}
 	if sub.PlanSlug == plan {
+		// Re-selecting the current plan cancels a pending scheduled
+		// downgrade — without this the stale schedule still fires at
+		// period end (a "stay" that downgrades anyway).
+		if sub.ScheduledPlanSlug.Valid && sub.ScheduledPlanSlug.String != "" {
+			return s.withTx(ctx, func(q *db.Queries) error {
+				if err := q.ClearScheduledPlan(ctx, sub.ID); err != nil {
+					return err
+				}
+				return events.Emit(ctx, q, uuid.UUID(sub.TenantID.Bytes), uuid.Nil, "SubscriptionChanged",
+					"subscription", uuid.UUID(sub.ID.Bytes), actor, true,
+					map[string]any{"tenant_id": uuid.UUID(sub.TenantID.Bytes),
+						"from": sub.State, "to": sub.State, "plan_slug": sub.PlanSlug,
+						"cleared_scheduled": sub.ScheduledPlanSlug.String})
+			})
+		}
 		return nil
 	}
 	if sub.State == "cancelled" {
@@ -257,6 +275,28 @@ func (s *Service) ChangePlan(ctx context.Context, tenantID uuid.UUID, plan strin
 	// unlisted current plan offers no comparison (never a bare slug write).
 	if !targetOK || (targetPrice > 0 && (!curOK || targetPrice > curPrice)) {
 		return ErrPaymentRequired
+	}
+	// §15: a downgrade on an ACTIVE subscription schedules at period end —
+	// the tenant keeps the paid tier until current_period_end, then the
+	// sweep applies it. Trials/sidegrades (and past-due rows already off
+	// the paid period) apply immediately.
+	if curOK && targetPrice < curPrice && sub.State == "active" {
+		return s.withTx(ctx, func(q *db.Queries) error {
+			n, err := q.ScheduleSubscriptionPlan(ctx, db.ScheduleSubscriptionPlanParams{
+				ID: sub.ID, PlanSlug: pgtype.Text{String: plan, Valid: true}, ExpectedSlug: sub.PlanSlug,
+			})
+			if err != nil {
+				return err
+			}
+			if n == 0 {
+				return ErrBadTransition // raced or no longer active
+			}
+			return events.Emit(ctx, q, uuid.UUID(sub.TenantID.Bytes), uuid.Nil, "PlanChangeScheduled",
+				"subscription", uuid.UUID(sub.ID.Bytes), actor, true,
+				map[string]any{"tenant_id": uuid.UUID(sub.TenantID.Bytes),
+					"from_plan": sub.PlanSlug, "plan_slug": plan,
+					"effective_at": sub.CurrentPeriodEnd.Time})
+		})
 	}
 	return s.withTx(ctx, func(q *db.Queries) error {
 		n, err := q.SetSubscriptionPlan(ctx, db.SetSubscriptionPlanParams{
@@ -285,6 +325,9 @@ func (s *Service) Cancel(ctx context.Context, tenantID uuid.UUID, actor uuid.UUI
 		return nil // idempotent
 	}
 	return s.withTx(ctx, func(q *db.Queries) error {
+		if err := q.ClearScheduledPlan(ctx, sub.ID); err != nil {
+			return err
+		}
 		return s.transition(ctx, q, sub, "cancelled", time.Time{}, time.Now(), actor)
 	})
 }
@@ -342,6 +385,23 @@ func (s *Service) SweepStates(ctx context.Context) error {
 			continue
 		}
 		err := s.withTx(ctx, func(q *db.Queries) error {
+			// §15: a scheduled downgrade applies at period end — emit the
+			// plan change before the state move so listeners see both.
+			if r.ScheduledPlanSlug.Valid && r.ScheduledPlanSlug.String != "" {
+				n, err := q.ApplyScheduledPlan(ctx, r.ID)
+				if err != nil {
+					return err
+				}
+				if n > 0 {
+					if err := events.Emit(ctx, q, uuid.UUID(r.TenantID.Bytes), uuid.Nil, "SubscriptionChanged",
+						"subscription", uuid.UUID(r.ID.Bytes), uuid.Nil, true,
+						map[string]any{"tenant_id": uuid.UUID(r.TenantID.Bytes),
+							"from_plan": r.PlanSlug, "to": r.State,
+							"plan_slug": r.ScheduledPlanSlug.String}); err != nil {
+						return err
+					}
+				}
+			}
 			return s.transition(ctx, q, &sub, to, graceEnd, time.Time{}, uuid.Nil)
 		})
 		if err != nil {
@@ -645,6 +705,130 @@ func (s *Service) UsageRecomputeConsumer(ctx context.Context, q *db.Queries, e e
 			PeriodStart: pgtype.Date{Time: period, Valid: true}}); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// ---------- add-ons (§07) ----------
+
+// ListAddons is the operator's catalog list (all rows, incl. inactive).
+func (s *Service) ListAddons(ctx context.Context) ([]db.AddonCatalog, error) {
+	return s.q.ListAddonCatalog(ctx)
+}
+
+// UpsertAddon is the audited catalog admin path (platform.plans.manage).
+func (s *Service) UpsertAddon(ctx context.Context, p db.UpsertAddonParams, actor uuid.UUID) (*db.AddonCatalog, error) {
+	if p.AddonSlug == "" || p.Label == "" {
+		return nil, ErrBadValue
+	}
+	if len(p.Grants) == 0 {
+		p.Grants = json.RawMessage(`{}`)
+	}
+	if p.Currency == "" {
+		p.Currency = "USD"
+	}
+	var row db.AddonCatalog
+	err := s.withTx(ctx, func(q *db.Queries) error {
+		r, err := q.UpsertAddon(ctx, p)
+		if err != nil {
+			return err
+		}
+		row = r
+		ctxb, _ := json.Marshal(map[string]any{"addon_slug": p.AddonSlug})
+		return q.InsertAuditEvent(ctx, db.InsertAuditEventParams{
+			ActorID: toPg(actor), Action: "addon.upsert",
+			TargetType: pgtype.Text{String: "addon_catalog", Valid: true},
+			Context:    ctxb})
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &row, nil
+}
+
+// TenantAddons is the tenant's own purchases + labels (GET /billing/addons).
+func (s *Service) TenantAddons(ctx context.Context, tenantID uuid.UUID) ([]db.ListTenantAddonsRow, error) {
+	return s.q.ListTenantAddons(ctx, toPg(tenantID))
+}
+
+// SubscribeAddon activates a catalog addon for the tenant — emits
+// AddonSubscribed so the entitlement cache flushes (Rule 25). Eligibility:
+// the addon must be active and the tenant's current plan must be in
+// available_on_plans.
+func (s *Service) SubscribeAddon(ctx context.Context, tenantID uuid.UUID, slug, term string, expiresAt *time.Time, actor uuid.UUID) error {
+	if term == "" {
+		term = "monthly"
+	}
+	if !billingTerms[term] {
+		return ErrBadBillingTerm
+	}
+	a, err := s.q.GetAddon(ctx, slug)
+	if err != nil || !a.Active {
+		return ErrPlanNotFound
+	}
+	plan := "starter"
+	if sub, err := s.q.GetSubscription(ctx, toPg(tenantID)); err == nil {
+		plan = sub.PlanSlug
+		if sub.State == "restricted" || sub.State == "cancelled" {
+			plan = "starter" // Rule 28 floor — same as entitlement resolve
+		}
+	}
+	eligible := false
+	for _, p := range a.AvailableOnPlans {
+		if p == plan {
+			eligible = true
+			break
+		}
+	}
+	if !eligible {
+		return ErrAddonNotEligible
+	}
+	var exp pgtype.Timestamptz
+	if expiresAt != nil {
+		exp = pgtype.Timestamptz{Time: *expiresAt, Valid: true}
+	}
+	return s.withTx(ctx, func(q *db.Queries) error {
+		if _, err := q.SubscribeTenantAddon(ctx, db.SubscribeTenantAddonParams{
+			TenantID: toPg(tenantID), AddonSlug: slug, BillingTerm: term, ExpiresAt: exp}); err != nil {
+			return err
+		}
+		return events.Emit(ctx, q, tenantID, uuid.Nil, "AddonSubscribed",
+			"tenant_addon", tenantID, actor, true,
+			map[string]any{"tenant_id": tenantID, "addon_slug": slug, "term": term})
+	})
+}
+
+// CancelAddon lapses a live addon — emits AddonCancelled (cache flush).
+func (s *Service) CancelAddon(ctx context.Context, tenantID uuid.UUID, slug string, actor uuid.UUID) error {
+	return s.withTx(ctx, func(q *db.Queries) error {
+		n, err := q.CancelTenantAddon(ctx, db.CancelTenantAddonParams{
+			TenantID: toPg(tenantID), AddonSlug: slug})
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return ErrNoSubscription
+		}
+		return events.Emit(ctx, q, tenantID, uuid.Nil, "AddonCancelled",
+			"tenant_addon", tenantID, actor, true,
+			map[string]any{"tenant_id": tenantID, "addon_slug": slug})
+	})
+}
+
+// ExpireAddonSweep lapses past-expiry addons — folded into SweepStates so
+// the hourly billing tick emits AddonExpired (→ entitlement cache flush).
+func (s *Service) ExpireAddonSweep(ctx context.Context) error {
+	rows, err := s.q.ExpireTenantAddons(ctx)
+	if err != nil {
+		return err
+	}
+	for _, r := range rows {
+		tid := uuid.UUID(r.TenantID.Bytes)
+		_ = s.withTx(ctx, func(q *db.Queries) error {
+			return events.Emit(ctx, q, tid, uuid.Nil, "AddonExpired",
+				"tenant_addon", tid, uuid.Nil, true,
+				map[string]any{"tenant_id": tid, "addon_slug": r.AddonSlug})
+		})
 	}
 	return nil
 }

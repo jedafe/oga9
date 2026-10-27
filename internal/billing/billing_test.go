@@ -113,16 +113,31 @@ func TestChangePlanGates(t *testing.T) {
 	}
 	// seat the tenant on professional directly (provider/platform flow)
 	if _, err := pool.Exec(ctx,
-		"UPDATE subscriptions SET plan_slug='professional', state='active' WHERE tenant_id=$1",
+		"UPDATE subscriptions SET plan_slug='professional', state='active', current_period_end=now()+interval '10 days' WHERE tenant_id=$1",
 		tenant); err != nil {
 		t.Fatal(err)
 	}
+	// §15: downgrade on an active sub SCHEDULES at period end — plan stays
+	// professional with scheduled_plan_slug=basic until the sweep applies.
 	if err := svc.ChangePlan(ctx, tenant, "basic", uuid.Nil); err != nil {
 		t.Fatalf("downgrade pro→basic should be allowed, got %v", err)
 	}
 	sub, _ := svc.GetSubscription(ctx, tenant)
-	if sub.PlanSlug != "basic" {
-		t.Fatalf("expected basic, got %s", sub.PlanSlug)
+	if sub.PlanSlug != "professional" || sub.ScheduledPlanSlug.String != "basic" {
+		t.Fatalf("expected professional + scheduled basic, got %s/%s", sub.PlanSlug, sub.ScheduledPlanSlug.String)
+	}
+	// lapse the period → sweep applies the pending downgrade, then moves
+	// the sub to past_due (no provider event = lapse, not free-forever).
+	if _, err := pool.Exec(ctx,
+		"UPDATE subscriptions SET current_period_end=now()-interval '1 hour' WHERE tenant_id=$1", tenant); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.SweepStates(ctx); err != nil {
+		t.Fatal(err)
+	}
+	sub, _ = svc.GetSubscription(ctx, tenant)
+	if sub.PlanSlug != "basic" || sub.ScheduledPlanSlug.Valid {
+		t.Fatalf("sweep must apply scheduled plan, got %s/%s", sub.PlanSlug, sub.ScheduledPlanSlug.String)
 	}
 	if err := svc.Cancel(ctx, tenant, uuid.Nil); err != nil {
 		t.Fatal(err)

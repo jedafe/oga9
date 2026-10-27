@@ -181,6 +181,56 @@ func TestActivitiesIsolation(t *testing.T) {
 	}
 }
 
+func TestMembersIsolation(t *testing.T) {
+	e := testEnv(t)
+	ctx := context.Background()
+	orgA, ocA := mkOrg(t, e)
+	orgB, ocB := mkOrg(t, e)
+	forged := forge(ocA, orgB, ocB.TenantID)
+
+	// org A's membership must not appear in org B's list under a forged
+	// ctx (org B legitimately has its own owner member).
+	var memberA uuid.UUID
+	if err := e.pool.QueryRow(ctx,
+		"SELECT id FROM organization_memberships WHERE organization_id=$1 LIMIT 1", orgA).Scan(&memberA); err != nil {
+		t.Fatal(err)
+	}
+	list, err := e.org.Members(ctx, forged, "", "", uuid.Nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range list {
+		if uuid.UUID(m.ID.Bytes) == memberA {
+			t.Fatal("forged ctx listed an org A member — cross-tenant leak")
+		}
+	}
+	// member detail of org A's membership under org B ctx → not found.
+	if _, err := e.org.MemberDetail(ctx, forged, memberA); err == nil {
+		t.Fatal("forged ctx read a foreign membership")
+	}
+}
+
+func TestAnnouncementsIsolation(t *testing.T) {
+	e := testEnv(t)
+	ctx := context.Background()
+	orgA, ocA := mkOrg(t, e)
+	orgB, ocB := mkOrg(t, e)
+	forged := forge(ocA, orgB, ocB.TenantID)
+
+	if _, err := e.pool.Exec(ctx,
+		`INSERT INTO announcements (organization_id, author_id, title, body, state)
+		 VALUES ($1,$2,'secret','org A only','published')`, orgA, ocA.MembershipID); err != nil {
+		t.Fatal(err)
+	}
+	list, err := e.docs.List(ctx, forged, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 0 {
+		t.Fatalf("forged ctx listed %d org A announcements", len(list))
+	}
+}
+
 func TestDocumentsIsolation(t *testing.T) {
 	e := testEnv(t)
 	ctx := context.Background()

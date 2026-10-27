@@ -17,7 +17,9 @@ import (
 	"github.com/google/uuid"
 	"github.com/hibiken/asynq"
 
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jedafe/oga9/internal/billing"
+	"github.com/jedafe/oga9/internal/db"
 	"github.com/jedafe/oga9/internal/entitlements"
 	"github.com/jedafe/oga9/internal/httpx"
 	"github.com/jedafe/oga9/internal/middleware"
@@ -296,6 +298,119 @@ func (h *BillingHandler) LicenseFile(w http.ResponseWriter, r *http.Request) {
 // Webhook — Rule 9: verify signature → durable record → enqueue → return
 // fast. Provider signature is HMAC-SHA256 (hex) over the raw body in the
 // X-Webhook-Signature header.
+// addonErr maps addon service errors to the standard envelope.
+func addonErr(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, billing.ErrPlanNotFound):
+		httpx.WriteErr(w, 404, "addon_not_found", "unknown or inactive addon")
+	case errors.Is(err, billing.ErrAddonNotEligible):
+		httpx.WriteErr(w, 403, "addon_not_eligible", "your plan cannot buy this addon")
+	case errors.Is(err, billing.ErrBadBillingTerm):
+		httpx.WriteErr(w, 400, "invalid_billing_term", "monthly|annual")
+	case errors.Is(err, billing.ErrNoSubscription):
+		httpx.WriteErr(w, 404, "addon_not_active", "addon is not active for this tenant")
+	default:
+		httpx.WriteErr(w, 500, "internal_error", "addon request failed")
+	}
+}
+
+// PlatformAddons — GET /platform/addons: operator catalog list.
+func (h *BillingHandler) PlatformAddons(w http.ResponseWriter, r *http.Request) {
+	list, err := h.svc.ListAddons(r.Context())
+	if err != nil {
+		httpx.WriteErr(w, 500, "internal_error", "addon catalog lookup failed")
+		return
+	}
+	httpx.WriteData(w, 200, list)
+}
+
+// UpsertAddon — POST /platform/addons + PATCH /platform/addons/{slug}
+// (platform.plans.manage, audited in the service).
+func (h *BillingHandler) UpsertAddon(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Slug        string          `json:"addon_slug"`
+		Label       string          `json:"label"`
+		Description string          `json:"description"`
+		AppID       string          `json:"app_id"`
+		Grants      json.RawMessage `json:"grants"`
+		Monthly     int64           `json:"price_monthly_minor"`
+		Annual      int64           `json:"price_annual_minor"`
+		Currency    string          `json:"currency"`
+		Plans       []string        `json:"available_on_plans"`
+		Active      bool            `json:"active"`
+	}
+	if err := httpx.Decode(w, r, &in); err != nil {
+		httpx.WriteErr(w, 422, "bad_value", "invalid addon payload")
+		return
+	}
+	if slug := chi.URLParam(r, "slug"); slug != "" {
+		in.Slug = slug
+	}
+	if in.Slug == "" || in.Label == "" {
+		httpx.WriteErr(w, 422, "bad_value", "addon_slug and label required")
+		return
+	}
+	a, err := h.svc.UpsertAddon(r.Context(), db.UpsertAddonParams{
+		AddonSlug: in.Slug, Label: in.Label,
+		Description:       pgtype.Text{String: in.Description, Valid: in.Description != ""},
+		AppID:             pgtype.Text{String: in.AppID, Valid: in.AppID != ""},
+		Grants:            in.Grants,
+		PriceMonthlyMinor: pgtype.Int8{Int64: in.Monthly, Valid: in.Monthly != 0},
+		PriceAnnualMinor:  pgtype.Int8{Int64: in.Annual, Valid: in.Annual != 0},
+		Currency:          in.Currency, AvailableOnPlans: in.Plans, Active: in.Active},
+		middleware.UserID(r.Context()))
+	if err != nil {
+		addonErr(w, err)
+		return
+	}
+	httpx.WriteData(w, 200, a)
+}
+
+// Addons — GET /billing/addons: the tenant's purchases (catalog rows join).
+func (h *BillingHandler) Addons(w http.ResponseWriter, r *http.Request) {
+	tenantID, ok := h.tenantFor(w, r)
+	if !ok {
+		return
+	}
+	list, err := h.svc.TenantAddons(r.Context(), tenantID)
+	if err != nil {
+		addonErr(w, err)
+		return
+	}
+	httpx.WriteData(w, 200, list)
+}
+
+// SubscribeAddon — POST /billing/addons/{slug}/subscribe (org.admin.billing).
+func (h *BillingHandler) SubscribeAddon(w http.ResponseWriter, r *http.Request) {
+	tenantID, ok := h.tenantFor(w, r)
+	if !ok {
+		return
+	}
+	var in struct {
+		Term      string     `json:"billing_term"`
+		ExpiresAt *time.Time `json:"expires_at"`
+	}
+	_ = httpx.Decode(w, r, &in)
+	if err := h.svc.SubscribeAddon(r.Context(), tenantID, chi.URLParam(r, "slug"), in.Term, in.ExpiresAt, middleware.UserID(r.Context())); err != nil {
+		addonErr(w, err)
+		return
+	}
+	httpx.WriteData(w, 200, map[string]any{"addon_slug": chi.URLParam(r, "slug"), "state": "active"})
+}
+
+// CancelAddon — POST /billing/addons/{slug}/cancel (org.admin.billing).
+func (h *BillingHandler) CancelAddon(w http.ResponseWriter, r *http.Request) {
+	tenantID, ok := h.tenantFor(w, r)
+	if !ok {
+		return
+	}
+	if err := h.svc.CancelAddon(r.Context(), tenantID, chi.URLParam(r, "slug"), middleware.UserID(r.Context())); err != nil {
+		addonErr(w, err)
+		return
+	}
+	httpx.WriteData(w, 200, map[string]any{"addon_slug": chi.URLParam(r, "slug"), "state": "cancelled"})
+}
+
 func (h *BillingHandler) Webhook(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	if err != nil || len(body) == 0 {

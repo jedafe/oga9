@@ -45,7 +45,8 @@ SELECT * FROM chat_channel_members WHERE channel_id = $1 AND membership_id = $2;
 
 -- name: IsChannelMember :one
 -- implicit membership: general channel = every active member; unit channel
--- = home-unit members; explicit rows cover exco/custom/dm/committee.
+-- = home-unit members; exco/committee derive from appointments/committee
+-- rows; explicit rows cover custom/dm (+ seats added on committee).
 -- The join binds the membership to the channel's org — a foreign
 -- membership id must never satisfy this check (cross-org seats don't
 -- exist, Rule 24).
@@ -94,7 +95,10 @@ ON CONFLICT (channel_id, membership_id)
 DO UPDATE SET last_read_message_id = EXCLUDED.last_read_message_id, updated_at = now();
 
 -- name: MuteChannel :exec
-INSERT INTO chat_channel_members (channel_id, membership_id, muted_until)
+-- mute lives on chat_read_states, never chat_channel_members: a members row
+-- is a SEAT, and on derived channels (exco/unit/committee) a minted seat
+-- would outlive the appointment/unit it derived from (§24).
+INSERT INTO chat_read_states (channel_id, membership_id, muted_until)
 VALUES ($1, $2, $3)
 ON CONFLICT (channel_id, membership_id) DO UPDATE SET muted_until = EXCLUDED.muted_until;
 

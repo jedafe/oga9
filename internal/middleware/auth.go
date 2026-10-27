@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jedafe/oga9/internal/auth"
+	"github.com/jedafe/oga9/internal/db"
 	"github.com/jedafe/oga9/internal/httpx"
 )
 
@@ -18,6 +19,7 @@ const (
 	CtxUserID     ctxKey = "user_id"
 	CtxSessionJTI ctxKey = "session_jti"
 	CtxMFAGate    ctxKey = "mfa_gate"
+	CtxTenantID   ctxKey = "tenant_id"
 )
 
 func bearerToken(r *http.Request) (string, bool) {
@@ -54,6 +56,10 @@ func resolveSessionToken(r *http.Request, svc *auth.Service, jwtSecret, token st
 func RequireAuth(svc *auth.Service, jwtSecret string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if UserID(r.Context()) != uuid.Nil {
+				next.ServeHTTP(w, r) // pre-resolved by APIKeyAuth
+				return
+			}
 			token, ok := bearerToken(r)
 			if !ok {
 				httpx.WriteErr(w, 401, "unauthorized", "missing bearer token")
@@ -114,4 +120,39 @@ func SessionJTI(ctx context.Context) uuid.UUID {
 func MFAGateNonce(ctx context.Context) string {
 	v, _ := ctx.Value(CtxMFAGate).(string)
 	return v
+}
+
+// APIKeyAuth — §23: X-API-Key (or `Bearer oga9_*`) resolves to a
+// tenant/user identity through the integrations service. A present-but-
+// invalid or revoked key is an immediate 401 (spec test 4); an absent
+// header falls through to the session middleware.
+type APIKeyResolver interface {
+	Authenticate(ctx context.Context, rawKey string) (db.ApiKeys, error)
+}
+
+func APIKeyAuth(svc APIKeyResolver) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			raw := r.Header.Get("X-API-Key")
+			if raw == "" {
+				if tok := r.Header.Get("Authorization"); strings.HasPrefix(tok, "Bearer oga9_") {
+					raw = strings.TrimPrefix(tok, "Bearer ")
+				}
+			}
+			if raw == "" {
+				next.ServeHTTP(w, r)
+				return
+			}
+			k, err := svc.Authenticate(r.Context(), raw)
+			if err != nil {
+				httpx.WriteErr(w, 401, "api_key_revoked", "api key revoked or invalid")
+				return
+			}
+			ctx := context.WithValue(r.Context(), CtxTenantID, uuid.UUID(k.TenantID.Bytes))
+			if k.UserID.Valid {
+				ctx = context.WithValue(ctx, CtxUserID, uuid.UUID(k.UserID.Bytes))
+			}
+			next.ServeHTTP(w, r.WithContext(ctx))
+		})
+	}
 }

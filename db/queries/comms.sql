@@ -116,3 +116,26 @@ WHERE m.organization_id = $1 AND m.lifecycle_state IN ('active','life_member')
 UPDATE announcements SET state = 'published', published_at = now()
 WHERE id = $1 AND organization_id = $2 AND state = 'draft'
 RETURNING *;
+
+-- name: NotifPrefsForUsers :many
+-- batch preference read for the dispatch fan-out: absent row = enabled.
+SELECT user_id, channel, enabled FROM notification_preferences
+WHERE kind = $1 AND user_id = ANY($2::uuid[]);
+
+-- name: NotifExistingByRef :many
+-- batch dedupe read for the dispatch fan-out: existing rows per
+-- (user,kind,ref) so a retried fan-out reuses tracking rows instead of
+-- N per-recipient queries inside the tx.
+SELECT user_id, id, channel, delivered_at FROM notifications
+WHERE kind = $1 AND ref_id = $2 AND user_id = ANY($3::uuid[]);
+
+-- name: StaleEmailNotifications :many
+-- email-channel rows that never got delivered past the grace window —
+-- enqueue-loss redrive for the notifications:email fan-out (the row is
+-- durable, the task wasn't). Announcement refs only: body/subject
+-- re-derive from the announcement.
+SELECT n.id, n.ref_id, u.email FROM notifications n
+JOIN users u ON u.id = n.user_id
+WHERE n.channel = 'email' AND n.delivered_at IS NULL AND n.kind = 'announcement'
+  AND n.created_at < now() - interval '1 hour'
+ORDER BY n.created_at LIMIT 100;

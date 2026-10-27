@@ -50,6 +50,60 @@ type ActivityRecurrences struct {
 	CreatedAt      pgtype.Timestamptz `json:"created_at"`
 }
 
+type AddonCatalog struct {
+	AddonSlug         string      `json:"addon_slug"`
+	Label             string      `json:"label"`
+	Description       pgtype.Text `json:"description"`
+	AppID             pgtype.Text `json:"app_id"`
+	Grants            []byte      `json:"grants"`
+	PriceMonthlyMinor pgtype.Int8 `json:"price_monthly_minor"`
+	PriceAnnualMinor  pgtype.Int8 `json:"price_annual_minor"`
+	Currency          string      `json:"currency"`
+	AvailableOnPlans  []string    `json:"available_on_plans"`
+	Active            bool        `json:"active"`
+}
+
+type AiConversations struct {
+	ID             pgtype.UUID        `json:"id"`
+	UserID         pgtype.UUID        `json:"user_id"`
+	OrganizationID pgtype.UUID        `json:"organization_id"`
+	Persona        string             `json:"persona"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+}
+
+type AiGenerations struct {
+	ID             pgtype.UUID        `json:"id"`
+	OrganizationID pgtype.UUID        `json:"organization_id"`
+	AuthorID       pgtype.UUID        `json:"author_id"`
+	Kind           string             `json:"kind"`
+	Draft          []byte             `json:"draft"`
+	State          string             `json:"state"`
+	ReviewedBy     pgtype.UUID        `json:"reviewed_by"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+}
+
+type AiMessages struct {
+	ID             pgtype.UUID        `json:"id"`
+	ConversationID pgtype.UUID        `json:"conversation_id"`
+	Role           string             `json:"role"`
+	Body           string             `json:"body"`
+	Citations      []byte             `json:"citations"`
+	TokensIn       pgtype.Int4        `json:"tokens_in"`
+	TokensOut      pgtype.Int4        `json:"tokens_out"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+}
+
+type AiUsageLog struct {
+	ID           pgtype.UUID        `json:"id"`
+	TenantID     pgtype.UUID        `json:"tenant_id"`
+	UserID       pgtype.UUID        `json:"user_id"`
+	Kind         string             `json:"kind"`
+	TokensIn     pgtype.Int4        `json:"tokens_in"`
+	TokensOut    pgtype.Int4        `json:"tokens_out"`
+	CostMicroUsd pgtype.Int8        `json:"cost_micro_usd"`
+	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+}
+
 type Announcements struct {
 	ID             pgtype.UUID        `json:"id"`
 	OrganizationID pgtype.UUID        `json:"organization_id"`
@@ -60,6 +114,18 @@ type Announcements struct {
 	State          string             `json:"state"`
 	PublishedAt    pgtype.Timestamptz `json:"published_at"`
 	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+}
+
+type ApiKeys struct {
+	ID        pgtype.UUID        `json:"id"`
+	TenantID  pgtype.UUID        `json:"tenant_id"`
+	UserID    pgtype.UUID        `json:"user_id"`
+	Prefix    string             `json:"prefix"`
+	HashedKey string             `json:"hashed_key"`
+	Scopes    []string           `json:"scopes"`
+	RateTier  string             `json:"rate_tier"`
+	RevokedAt pgtype.Timestamptz `json:"revoked_at"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
 }
 
 type AppInstallations struct {
@@ -79,6 +145,31 @@ type AppRegistry struct {
 	Manifest    []byte             `json:"manifest"`
 	MvpRequired bool               `json:"mvp_required"`
 	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+}
+
+type AssetAudits struct {
+	ID             pgtype.UUID        `json:"id"`
+	OrganizationID pgtype.UUID        `json:"organization_id"`
+	StartedBy      pgtype.UUID        `json:"started_by"`
+	Findings       []byte             `json:"findings"`
+	State          string             `json:"state"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+}
+
+type Assets struct {
+	ID             pgtype.UUID        `json:"id"`
+	OrganizationID pgtype.UUID        `json:"organization_id"`
+	Category       string             `json:"category"`
+	Name           string             `json:"name"`
+	Description    pgtype.Text        `json:"description"`
+	Identifier     pgtype.Text        `json:"identifier"`
+	Condition      string             `json:"condition"`
+	AcquiredAt     pgtype.Date        `json:"acquired_at"`
+	CostMinor      pgtype.Int8        `json:"cost_minor"`
+	Currency       pgtype.Text        `json:"currency"`
+	UnitID         pgtype.UUID        `json:"unit_id"`
+	State          string             `json:"state"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
 }
 
 type Attendances struct {
@@ -101,6 +192,13 @@ type AuditEvents struct {
 	CreatedAt      pgtype.Timestamptz `json:"created_at"`
 }
 
+type Ballots struct {
+	ID           pgtype.UUID        `json:"id"`
+	ElectionID   pgtype.UUID        `json:"election_id"`
+	MembershipID pgtype.UUID        `json:"membership_id"`
+	CastAt       pgtype.Timestamptz `json:"cast_at"`
+}
+
 type BillingWebhookEvents struct {
 	ID          pgtype.UUID        `json:"id"`
 	Provider    string             `json:"provider"`
@@ -111,11 +209,21 @@ type BillingWebhookEvents struct {
 	CreatedAt   pgtype.Timestamptz `json:"created_at"`
 }
 
+type Candidates struct {
+	ID           pgtype.UUID `json:"id"`
+	ElectionID   pgtype.UUID `json:"election_id"`
+	PositionID   pgtype.UUID `json:"position_id"`
+	MembershipID pgtype.UUID `json:"membership_id"`
+	Manifesto    pgtype.Text `json:"manifesto"`
+	State        string      `json:"state"`
+	NominatedBy  pgtype.UUID `json:"nominated_by"`
+	ScopeUnitID  pgtype.UUID `json:"scope_unit_id"`
+}
+
 type ChatChannelMembers struct {
 	ChannelID    pgtype.UUID        `json:"channel_id"`
 	MembershipID pgtype.UUID        `json:"membership_id"`
 	Role         string             `json:"role"`
-	MutedUntil   pgtype.Timestamptz `json:"muted_until"`
 	JoinedAt     pgtype.Timestamptz `json:"joined_at"`
 }
 
@@ -150,6 +258,16 @@ type ChatReadStates struct {
 	MembershipID      pgtype.UUID        `json:"membership_id"`
 	LastReadMessageID pgtype.UUID        `json:"last_read_message_id"`
 	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
+	MutedUntil        pgtype.Timestamptz `json:"muted_until"`
+}
+
+type CommitteeMandates struct {
+	OrgUnitID        pgtype.UUID `json:"org_unit_id"`
+	Mandate          string      `json:"mandate"`
+	ReportsTo        pgtype.UUID `json:"reports_to"`
+	BudgetLimitMinor pgtype.Int8 `json:"budget_limit_minor"`
+	Currency         pgtype.Text `json:"currency"`
+	Active           bool        `json:"active"`
 }
 
 type CommitteeMemberships struct {
@@ -159,6 +277,25 @@ type CommitteeMemberships struct {
 	MemberID       pgtype.UUID        `json:"member_id"`
 	Role           string             `json:"role"`
 	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+}
+
+type Connectors struct {
+	ID             pgtype.UUID        `json:"id"`
+	OrganizationID pgtype.UUID        `json:"organization_id"`
+	Kind           string             `json:"kind"`
+	Config         []byte             `json:"config"`
+	CredentialRef  pgtype.Text        `json:"credential_ref"`
+	Enabled        bool               `json:"enabled"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+}
+
+type ConstitutionVersions struct {
+	ID                    pgtype.UUID        `json:"id"`
+	OrganizationID        pgtype.UUID        `json:"organization_id"`
+	Version               int32              `json:"version"`
+	Body                  string             `json:"body"`
+	AdoptedByResolutionID pgtype.UUID        `json:"adopted_by_resolution_id"`
+	AdoptedAt             pgtype.Timestamptz `json:"adopted_at"`
 }
 
 type ContributionDrives struct {
@@ -185,6 +322,17 @@ type ContributionTypes struct {
 	Label          string             `json:"label"`
 	Kind           string             `json:"kind"`
 	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+}
+
+type CustodyAssignments struct {
+	ID             pgtype.UUID        `json:"id"`
+	AssetID        pgtype.UUID        `json:"asset_id"`
+	HolderMemberID pgtype.UUID        `json:"holder_member_id"`
+	HolderUnitID   pgtype.UUID        `json:"holder_unit_id"`
+	TermID         pgtype.UUID        `json:"term_id"`
+	AssignedBy     pgtype.UUID        `json:"assigned_by"`
+	AssignedAt     pgtype.Timestamptz `json:"assigned_at"`
+	ReturnedAt     pgtype.Timestamptz `json:"returned_at"`
 }
 
 type CustomFieldGroups struct {
@@ -226,6 +374,13 @@ type CustomFields struct {
 	CreatedAt      pgtype.Timestamptz `json:"created_at"`
 }
 
+type DashboardSnapshots struct {
+	OrganizationID pgtype.UUID        `json:"organization_id"`
+	Role           string             `json:"role"`
+	Snapshot       []byte             `json:"snapshot"`
+	RefreshedAt    pgtype.Timestamptz `json:"refreshed_at"`
+}
+
 type Deployments struct {
 	ID            pgtype.UUID        `json:"id"`
 	TenantID      pgtype.UUID        `json:"tenant_id"`
@@ -234,6 +389,16 @@ type Deployments struct {
 	DeploymentKey string             `json:"deployment_key"`
 	LastSeenAt    pgtype.Timestamptz `json:"last_seen_at"`
 	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+}
+
+type DigitalCredentials struct {
+	ID        pgtype.UUID        `json:"id"`
+	AssetID   pgtype.UUID        `json:"asset_id"`
+	Kind      string             `json:"kind"`
+	Label     string             `json:"label"`
+	Reference string             `json:"reference"`
+	VaultRef  pgtype.Text        `json:"vault_ref"`
+	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
 }
 
 type DocumentVersions struct {
@@ -291,6 +456,19 @@ type DuesSchedules struct {
 	Active             bool        `json:"active"`
 }
 
+type Elections struct {
+	ID              pgtype.UUID        `json:"id"`
+	OrganizationID  pgtype.UUID        `json:"organization_id"`
+	TermID          pgtype.UUID        `json:"term_id"`
+	Title           string             `json:"title"`
+	State           string             `json:"state"`
+	NominationsOpen pgtype.Timestamptz `json:"nominations_open"`
+	VotingOpens     pgtype.Timestamptz `json:"voting_opens"`
+	VotingCloses    pgtype.Timestamptz `json:"voting_closes"`
+	Eligibility     []byte             `json:"eligibility"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+}
+
 type EntityLinks struct {
 	ID               pgtype.UUID        `json:"id"`
 	OrganizationID   pgtype.UUID        `json:"organization_id"`
@@ -320,11 +498,36 @@ type EventRegistrations struct {
 	RegisteredBy pgtype.UUID        `json:"registered_by"`
 }
 
+type ExternalEventMap struct {
+	InternalType string      `json:"internal_type"`
+	InternalID   pgtype.UUID `json:"internal_id"`
+	ExternalType string      `json:"external_type"`
+	ExternalID   string      `json:"external_id"`
+}
+
 type FeatureFlags struct {
 	Key       string             `json:"key"`
 	Enabled   bool               `json:"enabled"`
 	Rollout   []byte             `json:"rollout"`
 	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
+}
+
+type HealthScores struct {
+	ID             pgtype.UUID        `json:"id"`
+	OrganizationID pgtype.UUID        `json:"organization_id"`
+	Period         string             `json:"period"`
+	Score          int32              `json:"score"`
+	Components     []byte             `json:"components"`
+	FormulaVersion string             `json:"formula_version"`
+	ComputedAt     pgtype.Timestamptz `json:"computed_at"`
+}
+
+type KpiDefinitions struct {
+	ID             pgtype.UUID        `json:"id"`
+	OrganizationID pgtype.UUID        `json:"organization_id"`
+	Key            string             `json:"key"`
+	Formula        []byte             `json:"formula"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
 }
 
 type LedgerEntries struct {
@@ -351,6 +554,18 @@ type Licenses struct {
 	ExpiresAt       pgtype.Timestamptz `json:"expires_at"`
 	Signature       []byte             `json:"signature"`
 	ExpiredNotified bool               `json:"expired_notified"`
+}
+
+type MaintenanceRecords struct {
+	ID        pgtype.UUID        `json:"id"`
+	AssetID   pgtype.UUID        `json:"asset_id"`
+	Kind      string             `json:"kind"`
+	Detail    pgtype.Text        `json:"detail"`
+	CostMinor pgtype.Int8        `json:"cost_minor"`
+	Currency  pgtype.Text        `json:"currency"`
+	NextDue   pgtype.Date        `json:"next_due"`
+	LoggedBy  pgtype.UUID        `json:"logged_by"`
+	LoggedAt  pgtype.Timestamptz `json:"logged_at"`
 }
 
 type MeetingAgendas struct {
@@ -451,6 +666,18 @@ type Minutes struct {
 	State      string             `json:"state"`
 	ApprovedBy pgtype.UUID        `json:"approved_by"`
 	ApprovedAt pgtype.Timestamptz `json:"approved_at"`
+}
+
+type Motions struct {
+	ID             pgtype.UUID        `json:"id"`
+	OrganizationID pgtype.UUID        `json:"organization_id"`
+	ActivityID     pgtype.UUID        `json:"activity_id"`
+	MoverID        pgtype.UUID        `json:"mover_id"`
+	SeconderID     pgtype.UUID        `json:"seconder_id"`
+	Title          string             `json:"title"`
+	Body           string             `json:"body"`
+	State          string             `json:"state"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
 }
 
 type NotificationPreferences struct {
@@ -688,6 +915,52 @@ type PositionPermissions struct {
 	Permission string      `json:"permission"`
 }
 
+type ProjectDonors struct {
+	ID           pgtype.UUID        `json:"id"`
+	ProjectID    pgtype.UUID        `json:"project_id"`
+	DonorName    string             `json:"donor_name"`
+	MembershipID pgtype.UUID        `json:"membership_id"`
+	AmountMinor  pgtype.Int8        `json:"amount_minor"`
+	Currency     pgtype.Text        `json:"currency"`
+	PaymentID    pgtype.UUID        `json:"payment_id"`
+	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+}
+
+type ProjectMilestones struct {
+	ID          pgtype.UUID `json:"id"`
+	ProjectID   pgtype.UUID `json:"project_id"`
+	Title       string      `json:"title"`
+	Weight      int32       `json:"weight"`
+	DueOn       pgtype.Date `json:"due_on"`
+	CompletedOn pgtype.Date `json:"completed_on"`
+	State       string      `json:"state"`
+}
+
+type ProjectUpdates struct {
+	ID          pgtype.UUID        `json:"id"`
+	ProjectID   pgtype.UUID        `json:"project_id"`
+	AuthorID    pgtype.UUID        `json:"author_id"`
+	Body        string             `json:"body"`
+	ProgressPct pgtype.Int4        `json:"progress_pct"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+}
+
+type Projects struct {
+	ID             pgtype.UUID        `json:"id"`
+	OrganizationID pgtype.UUID        `json:"organization_id"`
+	Title          string             `json:"title"`
+	Description    pgtype.Text        `json:"description"`
+	ResolutionID   pgtype.UUID        `json:"resolution_id"`
+	State          string             `json:"state"`
+	BudgetID       pgtype.UUID        `json:"budget_id"`
+	UnitID         pgtype.UUID        `json:"unit_id"`
+	StartsOn       pgtype.Date        `json:"starts_on"`
+	TargetOn       pgtype.Date        `json:"target_on"`
+	CompletedOn    pgtype.Date        `json:"completed_on"`
+	ProgressPct    int32              `json:"progress_pct"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+}
+
 type Receipts struct {
 	ID             pgtype.UUID        `json:"id"`
 	OrganizationID pgtype.UUID        `json:"organization_id"`
@@ -706,22 +979,49 @@ type ReconciliationRecords struct {
 	ReconciledAt   pgtype.Timestamptz `json:"reconciled_at"`
 }
 
+type ReportRuns struct {
+	ID             pgtype.UUID        `json:"id"`
+	OrganizationID pgtype.UUID        `json:"organization_id"`
+	Kind           string             `json:"kind"`
+	Period         pgtype.Text        `json:"period"`
+	Params         []byte             `json:"params"`
+	DocumentID     pgtype.UUID        `json:"document_id"`
+	GeneratedBy    pgtype.UUID        `json:"generated_by"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+}
+
+type Resolutions struct {
+	ID             pgtype.UUID        `json:"id"`
+	OrganizationID pgtype.UUID        `json:"organization_id"`
+	MotionID       pgtype.UUID        `json:"motion_id"`
+	ActivityID     pgtype.UUID        `json:"activity_id"`
+	TermID         pgtype.UUID        `json:"term_id"`
+	Title          string             `json:"title"`
+	Body           string             `json:"body"`
+	Outcome        string             `json:"outcome"`
+	VotesFor       pgtype.Int4        `json:"votes_for"`
+	VotesAgainst   pgtype.Int4        `json:"votes_against"`
+	VotesAbstain   pgtype.Int4        `json:"votes_abstain"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+}
+
 type RolePermissions struct {
 	RoleID     pgtype.UUID `json:"role_id"`
 	Permission string      `json:"permission"`
 }
 
 type Subscriptions struct {
-	ID               pgtype.UUID        `json:"id"`
-	TenantID         pgtype.UUID        `json:"tenant_id"`
-	PlanSlug         string             `json:"plan_slug"`
-	State            string             `json:"state"`
-	BillingTerm      string             `json:"billing_term"`
-	TrialEndsAt      pgtype.Timestamptz `json:"trial_ends_at"`
-	CurrentPeriodEnd pgtype.Timestamptz `json:"current_period_end"`
-	GraceEndsAt      pgtype.Timestamptz `json:"grace_ends_at"`
-	CancelledAt      pgtype.Timestamptz `json:"cancelled_at"`
-	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+	ID                pgtype.UUID        `json:"id"`
+	TenantID          pgtype.UUID        `json:"tenant_id"`
+	PlanSlug          string             `json:"plan_slug"`
+	State             string             `json:"state"`
+	BillingTerm       string             `json:"billing_term"`
+	TrialEndsAt       pgtype.Timestamptz `json:"trial_ends_at"`
+	CurrentPeriodEnd  pgtype.Timestamptz `json:"current_period_end"`
+	GraceEndsAt       pgtype.Timestamptz `json:"grace_ends_at"`
+	CancelledAt       pgtype.Timestamptz `json:"cancelled_at"`
+	CreatedAt         pgtype.Timestamptz `json:"created_at"`
+	ScheduledPlanSlug pgtype.Text        `json:"scheduled_plan_slug"`
 }
 
 type SupportSessions struct {
@@ -735,10 +1035,32 @@ type SupportSessions struct {
 	CreatedAt      pgtype.Timestamptz `json:"created_at"`
 }
 
+type SyncJobs struct {
+	ID          pgtype.UUID        `json:"id"`
+	ConnectorID pgtype.UUID        `json:"connector_id"`
+	Direction   string             `json:"direction"`
+	Cursor      pgtype.Text        `json:"cursor"`
+	State       string             `json:"state"`
+	Detail      []byte             `json:"detail"`
+	RanAt       pgtype.Timestamptz `json:"ran_at"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+}
+
 type SystemSettings struct {
 	Key       string             `json:"key"`
 	Value     []byte             `json:"value"`
 	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
+}
+
+type TenantAddons struct {
+	ID          pgtype.UUID        `json:"id"`
+	TenantID    pgtype.UUID        `json:"tenant_id"`
+	AddonSlug   string             `json:"addon_slug"`
+	State       string             `json:"state"`
+	BillingTerm string             `json:"billing_term"`
+	StartedAt   pgtype.Timestamptz `json:"started_at"`
+	ExpiresAt   pgtype.Timestamptz `json:"expires_at"`
+	CancelledAt pgtype.Timestamptz `json:"cancelled_at"`
 }
 
 type TenantExports struct {
@@ -845,6 +1167,15 @@ type Users struct {
 	DeletedAt         pgtype.Timestamptz `json:"deleted_at"`
 }
 
+type Vendors struct {
+	ID             pgtype.UUID        `json:"id"`
+	OrganizationID pgtype.UUID        `json:"organization_id"`
+	Name           string             `json:"name"`
+	Contact        []byte             `json:"contact"`
+	Kind           pgtype.Text        `json:"kind"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+}
+
 type VoiceRoomParticipants struct {
 	RoomID       pgtype.UUID        `json:"room_id"`
 	MembershipID pgtype.UUID        `json:"membership_id"`
@@ -865,4 +1196,77 @@ type VoiceRooms struct {
 	State          string             `json:"state"`
 	StartedAt      pgtype.Timestamptz `json:"started_at"`
 	EndedAt        pgtype.Timestamptz `json:"ended_at"`
+}
+
+type Votes struct {
+	ID          pgtype.UUID `json:"id"`
+	ElectionID  pgtype.UUID `json:"election_id"`
+	PositionID  pgtype.UUID `json:"position_id"`
+	CandidateID pgtype.UUID `json:"candidate_id"`
+	CastSeq     int64       `json:"cast_seq"`
+}
+
+type WebhookReceipts struct {
+	ID          pgtype.UUID        `json:"id"`
+	Provider    string             `json:"provider"`
+	Raw         []byte             `json:"raw"`
+	SignatureOk bool               `json:"signature_ok"`
+	ProcessedAt pgtype.Timestamptz `json:"processed_at"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+}
+
+type WelfareApprovals struct {
+	ID                  pgtype.UUID        `json:"id"`
+	CaseID              pgtype.UUID        `json:"case_id"`
+	ApproverID          pgtype.UUID        `json:"approver_id"`
+	Decision            string             `json:"decision"`
+	ApprovedAmountMinor pgtype.Int8        `json:"approved_amount_minor"`
+	Currency            pgtype.Text        `json:"currency"`
+	DecidedAt           pgtype.Timestamptz `json:"decided_at"`
+}
+
+type WelfareBenefits struct {
+	ID          pgtype.UUID        `json:"id"`
+	CaseID      pgtype.UUID        `json:"case_id"`
+	Kind        string             `json:"kind"`
+	AmountMinor pgtype.Int8        `json:"amount_minor"`
+	Currency    pgtype.Text        `json:"currency"`
+	PaymentID   pgtype.UUID        `json:"payment_id"`
+	DisbursedAt pgtype.Timestamptz `json:"disbursed_at"`
+}
+
+type WelfareCaseEvents struct {
+	ID        pgtype.UUID        `json:"id"`
+	CaseID    pgtype.UUID        `json:"case_id"`
+	ActorID   pgtype.UUID        `json:"actor_id"`
+	Action    string             `json:"action"`
+	Note      pgtype.Text        `json:"note"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
+}
+
+type WelfareCases struct {
+	ID                   pgtype.UUID        `json:"id"`
+	OrganizationID       pgtype.UUID        `json:"organization_id"`
+	MembershipID         pgtype.UUID        `json:"membership_id"`
+	Kind                 string             `json:"kind"`
+	Title                string             `json:"title"`
+	Details              pgtype.Text        `json:"details"`
+	RequestedAmountMinor pgtype.Int8        `json:"requested_amount_minor"`
+	Currency             pgtype.Text        `json:"currency"`
+	AutoSuggested        bool               `json:"auto_suggested"`
+	State                string             `json:"state"`
+	CreatedAt            pgtype.Timestamptz `json:"created_at"`
+}
+
+type WelfareVisitDelegates struct {
+	VisitID  pgtype.UUID `json:"visit_id"`
+	MemberID pgtype.UUID `json:"member_id"`
+}
+
+type WelfareVisits struct {
+	ID          pgtype.UUID        `json:"id"`
+	CaseID      pgtype.UUID        `json:"case_id"`
+	ScheduledAt pgtype.Timestamptz `json:"scheduled_at"`
+	CompletedAt pgtype.Timestamptz `json:"completed_at"`
+	Report      pgtype.Text        `json:"report"`
 }

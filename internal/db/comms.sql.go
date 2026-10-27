@@ -481,6 +481,89 @@ func (q *Queries) MyPreferences(ctx context.Context, userID pgtype.UUID) ([]Noti
 	return items, nil
 }
 
+const notifExistingByRef = `-- name: NotifExistingByRef :many
+SELECT user_id, id, channel, delivered_at FROM notifications
+WHERE kind = $1 AND ref_id = $2 AND user_id = ANY($3::uuid[])
+`
+
+type NotifExistingByRefParams struct {
+	Kind    string        `json:"kind"`
+	RefID   pgtype.UUID   `json:"ref_id"`
+	Column3 []pgtype.UUID `json:"column_3"`
+}
+
+type NotifExistingByRefRow struct {
+	UserID      pgtype.UUID        `json:"user_id"`
+	ID          pgtype.UUID        `json:"id"`
+	Channel     string             `json:"channel"`
+	DeliveredAt pgtype.Timestamptz `json:"delivered_at"`
+}
+
+// batch dedupe read for the dispatch fan-out: existing rows per
+// (user,kind,ref) so a retried fan-out reuses tracking rows instead of
+// N per-recipient queries inside the tx.
+func (q *Queries) NotifExistingByRef(ctx context.Context, arg NotifExistingByRefParams) ([]NotifExistingByRefRow, error) {
+	rows, err := q.db.Query(ctx, notifExistingByRef, arg.Kind, arg.RefID, arg.Column3)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []NotifExistingByRefRow
+	for rows.Next() {
+		var i NotifExistingByRefRow
+		if err := rows.Scan(
+			&i.UserID,
+			&i.ID,
+			&i.Channel,
+			&i.DeliveredAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const notifPrefsForUsers = `-- name: NotifPrefsForUsers :many
+SELECT user_id, channel, enabled FROM notification_preferences
+WHERE kind = $1 AND user_id = ANY($2::uuid[])
+`
+
+type NotifPrefsForUsersParams struct {
+	Kind    string        `json:"kind"`
+	Column2 []pgtype.UUID `json:"column_2"`
+}
+
+type NotifPrefsForUsersRow struct {
+	UserID  pgtype.UUID `json:"user_id"`
+	Channel string      `json:"channel"`
+	Enabled bool        `json:"enabled"`
+}
+
+// batch preference read for the dispatch fan-out: absent row = enabled.
+func (q *Queries) NotifPrefsForUsers(ctx context.Context, arg NotifPrefsForUsersParams) ([]NotifPrefsForUsersRow, error) {
+	rows, err := q.db.Query(ctx, notifPrefsForUsers, arg.Kind, arg.Column2)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []NotifPrefsForUsersRow
+	for rows.Next() {
+		var i NotifPrefsForUsersRow
+		if err := rows.Scan(&i.UserID, &i.Channel, &i.Enabled); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const notificationExists = `-- name: NotificationExists :one
 SELECT EXISTS (SELECT 1 FROM notifications
   WHERE user_id = $1 AND kind = $2 AND ref_id = $3 AND channel = $4)
@@ -581,6 +664,44 @@ func (q *Queries) RetractAnnouncement(ctx context.Context, arg RetractAnnounceme
 		&i.CreatedAt,
 	)
 	return i, err
+}
+
+const staleEmailNotifications = `-- name: StaleEmailNotifications :many
+SELECT n.id, n.ref_id, u.email FROM notifications n
+JOIN users u ON u.id = n.user_id
+WHERE n.channel = 'email' AND n.delivered_at IS NULL AND n.kind = 'announcement'
+  AND n.created_at < now() - interval '1 hour'
+ORDER BY n.created_at LIMIT 100
+`
+
+type StaleEmailNotificationsRow struct {
+	ID    pgtype.UUID `json:"id"`
+	RefID pgtype.UUID `json:"ref_id"`
+	Email string      `json:"email"`
+}
+
+// email-channel rows that never got delivered past the grace window —
+// enqueue-loss redrive for the notifications:email fan-out (the row is
+// durable, the task wasn't). Announcement refs only: body/subject
+// re-derive from the announcement.
+func (q *Queries) StaleEmailNotifications(ctx context.Context) ([]StaleEmailNotificationsRow, error) {
+	rows, err := q.db.Query(ctx, staleEmailNotifications)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []StaleEmailNotificationsRow
+	for rows.Next() {
+		var i StaleEmailNotificationsRow
+		if err := rows.Scan(&i.ID, &i.RefID, &i.Email); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const upsertPreference = `-- name: UpsertPreference :exec

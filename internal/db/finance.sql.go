@@ -1197,6 +1197,24 @@ func (q *Queries) GetReceiptByIDOrg(ctx context.Context, arg GetReceiptByIDOrgPa
 	return i, err
 }
 
+const ledgerMemoExists = `-- name: LedgerMemoExists :one
+SELECT EXISTS(SELECT 1 FROM ledger_entries WHERE organization_id = $1 AND memo = $2)
+`
+
+type LedgerMemoExistsParams struct {
+	OrganizationID pgtype.UUID `json:"organization_id"`
+	Memo           pgtype.Text `json:"memo"`
+}
+
+// idempotent welfare disbursement: BenefitDisbursed is at-least-once —
+// the consumer dedupes on the benefit-keyed memo.
+func (q *Queries) LedgerMemoExists(ctx context.Context, arg LedgerMemoExistsParams) (bool, error) {
+	row := q.db.QueryRow(ctx, ledgerMemoExists, arg.OrganizationID, arg.Memo)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
+}
+
 const listClaims = `-- name: ListClaims :many
 SELECT id, organization_id, membership_id, drive_id, obligation_id, amount_minor, currency, channel, external_ref, receipt_media_id, note, state, reviewed_by, reviewed_at, review_note, payment_id, created_at, hide_contributor FROM payment_claims WHERE organization_id = $1
   AND ($2::text = '' OR state = $2) ORDER BY created_at DESC LIMIT 500

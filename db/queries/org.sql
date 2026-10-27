@@ -69,7 +69,8 @@ JOIN organizations o ON o.id = m.organization_id
 WHERE m.organization_id = $1 AND m.user_id = $2 AND o.deleted_at IS NULL;
 
 -- name: GetMembershipByID :one
-SELECT id, organization_id, user_id, member_no, category, lifecycle_state
+SELECT id, organization_id, user_id, member_no, category, lifecycle_state,
+  dues_standing, joined_at, created_at
 FROM organization_memberships WHERE id = $1;
 
 -- name: CreateMembership :one

@@ -217,6 +217,11 @@ VALUES (sqlc.arg(organization_id), sqlc.arg(payment_id), sqlc.arg(reversal_of),
   sqlc.arg(memo), sqlc.arg(posted_by))
 RETURNING *;
 
+-- name: LedgerMemoExists :one
+-- idempotent welfare disbursement: BenefitDisbursed is at-least-once —
+-- the consumer dedupes on the benefit-keyed memo.
+SELECT EXISTS(SELECT 1 FROM ledger_entries WHERE organization_id = $1 AND memo = $2);
+
 -- name: ListLedgerEntries :many
 SELECT * FROM ledger_entries WHERE organization_id = $1
   AND ($2::text = '' OR account = $2)

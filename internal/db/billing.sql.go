@@ -34,11 +34,12 @@ func (q *Queries) ActivateSubscription(ctx context.Context, arg ActivateSubscrip
 	return result.RowsAffected(), nil
 }
 
-const addUsage = `-- name: AddUsage :execrows
+const addUsage = `-- name: AddUsage :one
 INSERT INTO usage_meters (tenant_id, limit_key, used, period_start)
 VALUES ($1::uuid, $2, $3::bigint,
         $4::date)
 ON CONFLICT (tenant_id, limit_key, period_start) DO UPDATE SET used = usage_meters.used + $3
+RETURNING used
 `
 
 type AddUsageParams struct {
@@ -49,16 +50,41 @@ type AddUsageParams struct {
 }
 
 func (q *Queries) AddUsage(ctx context.Context, arg AddUsageParams) (int64, error) {
-	result, err := q.db.Exec(ctx, addUsage,
+	row := q.db.QueryRow(ctx, addUsage,
 		arg.TenantID,
 		arg.LimitKey,
 		arg.Delta,
 		arg.PeriodStart,
 	)
+	var used int64
+	err := row.Scan(&used)
+	return used, err
+}
+
+const applyScheduledPlan = `-- name: ApplyScheduledPlan :execrows
+UPDATE subscriptions SET plan_slug = scheduled_plan_slug,
+  scheduled_plan_slug = NULL
+WHERE id = $1::uuid AND scheduled_plan_slug IS NOT NULL
+`
+
+// Sweep: current_period_end passed — the pending downgrade takes effect.
+func (q *Queries) ApplyScheduledPlan(ctx context.Context, id pgtype.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, applyScheduledPlan, id)
 	if err != nil {
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const clearScheduledPlan = `-- name: ClearScheduledPlan :exec
+UPDATE subscriptions SET scheduled_plan_slug = NULL
+WHERE id = $1::uuid
+`
+
+// Terminal moves (cancel) drop any pending downgrade with them.
+func (q *Queries) ClearScheduledPlan(ctx context.Context, id pgtype.UUID) error {
+	_, err := q.db.Exec(ctx, clearScheduledPlan, id)
+	return err
 }
 
 const createSubscription = `-- name: CreateSubscription :one
@@ -251,7 +277,8 @@ func (q *Queries) GetPlanLimits(ctx context.Context, planSlug string) ([]GetPlan
 
 const getSubscription = `-- name: GetSubscription :one
 SELECT id, tenant_id, plan_slug, state, billing_term, trial_ends_at,
-       current_period_end, grace_ends_at, cancelled_at, created_at
+       current_period_end, grace_ends_at, cancelled_at, created_at,
+       scheduled_plan_slug
 FROM subscriptions WHERE tenant_id = $1::uuid
 ORDER BY created_at DESC LIMIT 1
 `
@@ -271,6 +298,7 @@ func (q *Queries) GetSubscription(ctx context.Context, tenantID pgtype.UUID) (Su
 		&i.GraceEndsAt,
 		&i.CancelledAt,
 		&i.CreatedAt,
+		&i.ScheduledPlanSlug,
 	)
 	return i, err
 }
@@ -441,17 +469,19 @@ func (q *Queries) InsertWebhookEvent(ctx context.Context, arg InsertWebhookEvent
 }
 
 const listDueSubscriptions = `-- name: ListDueSubscriptions :many
-SELECT id, tenant_id, plan_slug, state FROM subscriptions
+SELECT id, tenant_id, plan_slug, state, scheduled_plan_slug, current_period_end FROM subscriptions
 WHERE (state = 'trial' AND trial_ends_at IS NOT NULL AND trial_ends_at < now())
    OR (state IN ('past_due','grace') AND grace_ends_at IS NOT NULL AND grace_ends_at < now())
    OR (state = 'active' AND current_period_end IS NOT NULL AND current_period_end < now())
 `
 
 type ListDueSubscriptionsRow struct {
-	ID       pgtype.UUID `json:"id"`
-	TenantID pgtype.UUID `json:"tenant_id"`
-	PlanSlug string      `json:"plan_slug"`
-	State    string      `json:"state"`
+	ID                pgtype.UUID        `json:"id"`
+	TenantID          pgtype.UUID        `json:"tenant_id"`
+	PlanSlug          string             `json:"plan_slug"`
+	State             string             `json:"state"`
+	ScheduledPlanSlug pgtype.Text        `json:"scheduled_plan_slug"`
+	CurrentPeriodEnd  pgtype.Timestamptz `json:"current_period_end"`
 }
 
 // Sweep set: trials past expiry, past_due/grace rows past their grace
@@ -472,6 +502,8 @@ func (q *Queries) ListDueSubscriptions(ctx context.Context) ([]ListDueSubscripti
 			&i.TenantID,
 			&i.PlanSlug,
 			&i.State,
+			&i.ScheduledPlanSlug,
+			&i.CurrentPeriodEnd,
 		); err != nil {
 			return nil, err
 		}
@@ -627,8 +659,32 @@ func (q *Queries) MarkWebhookProcessed(ctx context.Context, id pgtype.UUID) (int
 	return result.RowsAffected(), nil
 }
 
+const scheduleSubscriptionPlan = `-- name: ScheduleSubscriptionPlan :execrows
+UPDATE subscriptions SET scheduled_plan_slug = $1
+WHERE id = $2::uuid AND plan_slug = $3
+  AND state = 'active'
+`
+
+type ScheduleSubscriptionPlanParams struct {
+	PlanSlug     pgtype.Text `json:"plan_slug"`
+	ID           pgtype.UUID `json:"id"`
+	ExpectedSlug string      `json:"expected_slug"`
+}
+
+// §15: a self-serve downgrade schedules at period end instead of applying
+// now. CAS on the read plan_slug — a concurrent change can't be silently
+// queued onto a plan the caller never saw.
+func (q *Queries) ScheduleSubscriptionPlan(ctx context.Context, arg ScheduleSubscriptionPlanParams) (int64, error) {
+	result, err := q.db.Exec(ctx, scheduleSubscriptionPlan, arg.PlanSlug, arg.ID, arg.ExpectedSlug)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const setSubscriptionPlan = `-- name: SetSubscriptionPlan :execrows
-UPDATE subscriptions SET plan_slug = $1
+UPDATE subscriptions SET plan_slug = $1,
+  scheduled_plan_slug = NULL
 WHERE id = $2::uuid AND plan_slug = $3
   AND state <> 'cancelled'
 `

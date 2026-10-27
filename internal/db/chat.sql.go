@@ -30,7 +30,7 @@ func (q *Queries) ArchiveChannel(ctx context.Context, arg ArchiveChannelParams) 
 }
 
 const channelMember = `-- name: ChannelMember :one
-SELECT channel_id, membership_id, role, muted_until, joined_at FROM chat_channel_members WHERE channel_id = $1 AND membership_id = $2
+SELECT channel_id, membership_id, role, joined_at FROM chat_channel_members WHERE channel_id = $1 AND membership_id = $2
 `
 
 type ChannelMemberParams struct {
@@ -45,7 +45,6 @@ func (q *Queries) ChannelMember(ctx context.Context, arg ChannelMemberParams) (C
 		&i.ChannelID,
 		&i.MembershipID,
 		&i.Role,
-		&i.MutedUntil,
 		&i.JoinedAt,
 	)
 	return i, err
@@ -391,7 +390,8 @@ type IsChannelMemberParams struct {
 }
 
 // implicit membership: general channel = every active member; unit channel
-// = home-unit members; explicit rows cover exco/custom/dm/committee.
+// = home-unit members; exco/committee derive from appointments/committee
+// rows; explicit rows cover custom/dm (+ seats added on committee).
 // The join binds the membership to the channel's org — a foreign
 // membership id must never satisfy this check (cross-org seats don't
 // exist, Rule 24).
@@ -483,7 +483,7 @@ func (q *Queries) MarkChannelRead(ctx context.Context, arg MarkChannelReadParams
 }
 
 const muteChannel = `-- name: MuteChannel :exec
-INSERT INTO chat_channel_members (channel_id, membership_id, muted_until)
+INSERT INTO chat_read_states (channel_id, membership_id, muted_until)
 VALUES ($1, $2, $3)
 ON CONFLICT (channel_id, membership_id) DO UPDATE SET muted_until = EXCLUDED.muted_until
 `
@@ -494,6 +494,9 @@ type MuteChannelParams struct {
 	MutedUntil   pgtype.Timestamptz `json:"muted_until"`
 }
 
+// mute lives on chat_read_states, never chat_channel_members: a members row
+// is a SEAT, and on derived channels (exco/unit/committee) a minted seat
+// would outlive the appointment/unit it derived from (§24).
 func (q *Queries) MuteChannel(ctx context.Context, arg MuteChannelParams) error {
 	_, err := q.db.Exec(ctx, muteChannel, arg.ChannelID, arg.MembershipID, arg.MutedUntil)
 	return err

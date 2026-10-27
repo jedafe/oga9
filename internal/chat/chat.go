@@ -117,6 +117,12 @@ func (s *Service) CreateChannel(ctx context.Context, oc *tenant.OrgCtx, kind, na
 			OrganizationID: toPg(oc.OrgID), Kind: kind, UnitID: toPg(unitID),
 			Name: pgtype.Text{String: name, Valid: name != ""}, CreatedBy: toPg(oc.MembershipID)})
 		if errors.Is(err, pgx.ErrNoRows) {
+			if kind == "dm" || kind == "custom" {
+				// no uniqueness for these kinds — a conflict here is
+				// impossible in a correct schema; never fall back to
+				// GetChannelByKind (it would return an UNRELATED channel).
+				return ErrBadValue
+			}
 			// channel already exists (unique index) — return it; the
 			// create event must not re-fire for an existing channel.
 			created = false

@@ -150,3 +150,43 @@ func TestCheckLimitThresholds(t *testing.T) {
 		t.Fatal("missing limit should deny")
 	}
 }
+
+// TestAddonMerge — §07 resolution order: an active tenant_addons grant
+// unions capabilities + limit overrides/deltas into the resolved set;
+// cancelling drops them back to the plan floor.
+func TestAddonMerge(t *testing.T) {
+	svc, pool := testSvc(t)
+	ctx := context.Background()
+	tid := mkTenant(t, pool)
+	mkSub(t, pool, tid, "starter", "active")
+
+	if svc.IsEnabled(ctx, tid, "app.elections") {
+		t.Fatal("starter should not bundle elections")
+	}
+	if got := svc.Limit(ctx, tid, "limit.branches"); got != 1 {
+		t.Fatalf("starter branches = %d, want 1", got)
+	}
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO tenant_addons (tenant_id, addon_slug, state) VALUES ($1,'elections','active')`, tid); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO tenant_addons (tenant_id, addon_slug, state) VALUES ($1,'multi-branch','active')`, tid); err != nil {
+		t.Fatal(err)
+	}
+	svc.Invalidate(ctx, tid)
+	if !svc.IsEnabled(ctx, tid, "app.elections") {
+		t.Fatal("elections addon capability did not resolve")
+	}
+	if got := svc.Limit(ctx, tid, "limit.branches"); got != 6 {
+		t.Fatalf("branches with +5 delta = %d, want 6", got)
+	}
+	if _, err := pool.Exec(ctx,
+		`UPDATE tenant_addons SET state='cancelled' WHERE tenant_id=$1 AND addon_slug='elections'`, tid); err != nil {
+		t.Fatal(err)
+	}
+	svc.Invalidate(ctx, tid)
+	if svc.IsEnabled(ctx, tid, "app.elections") {
+		t.Fatal("cancelled addon still grants capability")
+	}
+}

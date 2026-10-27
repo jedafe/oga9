@@ -45,6 +45,28 @@ VALUES ($1, $2, $3, $4);
 SELECT * FROM document_versions WHERE document_id = $1 ORDER BY version DESC;
 
 -- name: PublicDocuments :many
-SELECT d.* FROM documents d JOIN organizations o ON o.id = d.organization_id
-WHERE o.slug = $1 AND d.visibility = 'public' AND d.deleted_at IS NULL
+-- directory surface honors the same opt-in as /apply: an org that never
+-- listed itself exposes no public docs listing (§03 opt-in). Slim
+-- projection — storage_key is internal, never shipped to anonymous clients.
+SELECT d.id, d.kind, d.title, d.version, d.created_at
+FROM documents d JOIN organizations o ON o.id = d.organization_id
+WHERE o.slug = $1 AND o.is_public_listed AND o.deleted_at IS NULL
+  AND d.visibility = 'public' AND d.deleted_at IS NULL
 ORDER BY d.created_at DESC;
+
+-- name: DropLatestVersion :one
+-- documents:process_upload recovery — a poisoned new version drops its
+-- version row and reverts the head to the previous version instead of
+-- deleting the whole document (good v1 survives a bad v2).
+DELETE FROM document_versions WHERE document_id = $1 AND version = $2
+RETURNING storage_key;
+
+-- name: RevertDocumentHead :exec
+-- point the head back at a surviving version row (called after
+-- DropLatestVersion; the caller passes the previous version's key).
+UPDATE documents SET version = version - 1, storage_key = $3
+WHERE id = $1 AND organization_id = $2 AND deleted_at IS NULL;
+
+-- name: LatestVersionRow :one
+SELECT version, storage_key FROM document_versions
+WHERE document_id = $1 ORDER BY version DESC LIMIT 1;

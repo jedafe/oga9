@@ -7,6 +7,7 @@ package chat
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -208,13 +209,14 @@ func (s *Service) RoomSweep(ctx context.Context, maxAgeHours int) error {
 	if err != nil {
 		return err
 	}
+	var errs []error
 	for _, r := range rooms {
 		orgID := fromPg(r.OrganizationID)
 		var tid uuid.UUID
 		if t, err := s.q.GetOrgTenantID(ctx, r.OrganizationID); err == nil {
 			tid = fromPg(t)
 		}
-		_ = s.withTx(ctx, func(q *db.Queries) error {
+		err := s.withTx(ctx, func(q *db.Queries) error {
 			n, err := q.EndVoiceRoom(ctx, db.EndVoiceRoomParams{ID: r.ID, OrganizationID: r.OrganizationID})
 			if err != nil || n == 0 {
 				return err
@@ -227,6 +229,10 @@ func (s *Service) RoomSweep(ctx context.Context, maxAgeHours int) error {
 				map[string]any{"room_id": fromPg(r.ID), "reason": "sweep",
 					"duration_sec": int(time.Since(r.StartedAt.Time).Seconds())})
 		})
+		if err != nil {
+			// one bad room can't stall the sweep — collect and surface.
+			errs = append(errs, fmt.Errorf("room %s: %w", uuid.UUID(r.ID.Bytes), err))
+		}
 	}
-	return nil
+	return errors.Join(errs...)
 }

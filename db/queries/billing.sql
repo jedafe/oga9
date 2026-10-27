@@ -17,7 +17,8 @@ SELECT limit_key, limit_value FROM plan_limits WHERE plan_slug = $1;
 -- name: GetSubscription :one
 -- Latest subscription row is the current one.
 SELECT id, tenant_id, plan_slug, state, billing_term, trial_ends_at,
-       current_period_end, grace_ends_at, cancelled_at, created_at
+       current_period_end, grace_ends_at, cancelled_at, created_at,
+       scheduled_plan_slug
 FROM subscriptions WHERE tenant_id = sqlc.arg(tenant_id)::uuid
 ORDER BY created_at DESC LIMIT 1;
 
@@ -40,9 +41,29 @@ WHERE id = sqlc.arg(id)::uuid;
 -- name: SetSubscriptionPlan :execrows
 -- CAS on the read plan_slug: a concurrent change-plan can't silently
 -- overwrite a newer plan (0 rows = raced — caller surfaces the conflict).
-UPDATE subscriptions SET plan_slug = sqlc.arg(plan_slug)
+UPDATE subscriptions SET plan_slug = sqlc.arg(plan_slug),
+  scheduled_plan_slug = NULL
 WHERE id = sqlc.arg(id)::uuid AND plan_slug = sqlc.arg(expected_slug)
   AND state <> 'cancelled';
+
+-- name: ScheduleSubscriptionPlan :execrows
+-- §15: a self-serve downgrade schedules at period end instead of applying
+-- now. CAS on the read plan_slug — a concurrent change can't be silently
+-- queued onto a plan the caller never saw.
+UPDATE subscriptions SET scheduled_plan_slug = sqlc.arg(plan_slug)
+WHERE id = sqlc.arg(id)::uuid AND plan_slug = sqlc.arg(expected_slug)
+  AND state = 'active';
+
+-- name: ApplyScheduledPlan :execrows
+-- Sweep: current_period_end passed — the pending downgrade takes effect.
+UPDATE subscriptions SET plan_slug = scheduled_plan_slug,
+  scheduled_plan_slug = NULL
+WHERE id = sqlc.arg(id)::uuid AND scheduled_plan_slug IS NOT NULL;
+
+-- name: ClearScheduledPlan :exec
+-- Terminal moves (cancel) drop any pending downgrade with them.
+UPDATE subscriptions SET scheduled_plan_slug = NULL
+WHERE id = sqlc.arg(id)::uuid;
 
 -- name: ActivateSubscription :execrows
 -- Webhook activation: a late invoice.paid must not resurrect a cancelled
@@ -69,7 +90,7 @@ WHERE id = sqlc.arg(id)::uuid AND state = sqlc.arg(from_state);
 -- deadline, and active rows whose period lapsed without a provider event
 -- (silent provider → lapse to past_due, never free-forever). The state
 -- machine moves each one step per pass.
-SELECT id, tenant_id, plan_slug, state FROM subscriptions
+SELECT id, tenant_id, plan_slug, state, scheduled_plan_slug, current_period_end FROM subscriptions
 WHERE (state = 'trial' AND trial_ends_at IS NOT NULL AND trial_ends_at < now())
    OR (state IN ('past_due','grace') AND grace_ends_at IS NOT NULL AND grace_ends_at < now())
    OR (state = 'active' AND current_period_end IS NOT NULL AND current_period_end < now());
@@ -144,11 +165,12 @@ SELECT used FROM usage_meters
 WHERE tenant_id = sqlc.arg(tenant_id)::uuid AND limit_key = sqlc.arg(limit_key)
   AND period_start = sqlc.arg(period_start)::date;
 
--- name: AddUsage :execrows
+-- name: AddUsage :one
 INSERT INTO usage_meters (tenant_id, limit_key, used, period_start)
 VALUES (sqlc.arg(tenant_id)::uuid, sqlc.arg(limit_key), sqlc.arg(delta)::bigint,
         sqlc.arg(period_start)::date)
-ON CONFLICT (tenant_id, limit_key, period_start) DO UPDATE SET used = usage_meters.used + sqlc.arg(delta);
+ON CONFLICT (tenant_id, limit_key, period_start) DO UPDATE SET used = usage_meters.used + sqlc.arg(delta)
+RETURNING used;
 
 -- name: ListTenantsWithNode :many
 -- Billing-tenant resolution (Rule 24): tenants where the caller holds the

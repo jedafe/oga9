@@ -91,7 +91,7 @@ func TestAnnouncementFlow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	emails, err := e.svc.DispatchAnnouncement(ctx, aid)
+	emails, err := e.svc.DispatchAnnouncement(ctx, aid, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -119,7 +119,7 @@ func TestAnnouncementFlow(t *testing.T) {
 		t.Fatal(err)
 	}
 	aid2, _ := e.svc.Publish(ctx, oc, "Follow-up", "x", Audience{All: true}, false)
-	emails2, err := e.svc.DispatchAnnouncement(ctx, aid2)
+	emails2, err := e.svc.DispatchAnnouncement(ctx, aid2, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -165,9 +165,14 @@ func TestDocumentFlow(t *testing.T) {
 		t.Fatalf("download: %v", err)
 	}
 	rc.Close()
-	// public listing sees it — addressed by slug, not org id
+	// public listing sees it — addressed by slug, and only while the
+	// org is directory-opted-in (§03 opt-in honored by the docs surface)
 	var slug string
 	e.pool.QueryRow(ctx, "SELECT slug FROM organizations WHERE id=$1", d.OrganizationID).Scan(&slug)
+	if none, _ := e.svc.PublicDocs(ctx, slug); len(none) != 0 {
+		t.Fatal("non-listed org must not expose a public docs listing")
+	}
+	e.pool.Exec(ctx, "UPDATE organizations SET is_public_listed=true WHERE id=$1", d.OrganizationID)
 	pub, err := e.svc.PublicDocs(ctx, slug)
 	if err != nil || len(pub) != 1 {
 		t.Fatalf("public docs: %v %d", err, len(pub))
@@ -266,5 +271,81 @@ func TestChatFlow(t *testing.T) {
 	oc3, _ := e.org.ResolveOrgCtx(ctx, u3, oc.OrgID)
 	if err := e.chat.AddMember(ctx, oc, dmID, oc3.MembershipID, "member"); err != chat.ErrBadValue {
 		t.Fatalf("third dm member should be refused, got %v", err)
+	}
+}
+
+// TestDocumentVersionsV1 — §14: prior versions stay retrievable. The v1
+// row is written at upload so a v2 bump can't orphan the original blob.
+func TestDocumentVersionsV1(t *testing.T) {
+	e := testEnv(t)
+	ctx := context.Background()
+	oc, _, _ := setup(t, e)
+
+	did, err := e.svc.Upload(ctx, oc, "report", "v1", "members", uuid.Nil,
+		strings.NewReader("original"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ver, err := e.svc.NewVersion(ctx, oc, did, strings.NewReader("replacement"))
+	if err != nil || ver != 2 {
+		t.Fatalf("new version: %d %v", ver, err)
+	}
+	var v1key, headkey string
+	if err := e.pool.QueryRow(ctx,
+		"SELECT storage_key FROM document_versions WHERE document_id=$1 AND version=1",
+		did).Scan(&v1key); err != nil {
+		t.Fatalf("v1 row missing — original blob orphaned: %v", err)
+	}
+	e.pool.QueryRow(ctx, "SELECT storage_key FROM documents WHERE id=$1", did).Scan(&headkey)
+	if headkey == v1key {
+		t.Fatal("head still points at v1 key after bump")
+	}
+	// a poisoned v3 drops ONLY that version — head reverts to v2
+	v3 := "#!/bin/sh\necho bad"
+	if _, err := e.svc.NewVersion(ctx, oc, did, strings.NewReader(v3)); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.svc.ProcessUpload(ctx, did); err != nil {
+		t.Fatal(err)
+	}
+	var v int
+	var alive bool
+	e.pool.QueryRow(ctx,
+		"SELECT version, deleted_at IS NULL FROM documents WHERE id=$1", did).Scan(&v, &alive)
+	if v != 2 || !alive {
+		t.Fatalf("poisoned v3 must drop only the version row (doc alive at v2), got v%d alive=%v", v, alive)
+	}
+}
+
+// TestSecondDMChannel — the 000157 unique-index regression: a second dm
+// channel must create its own row, never resolve to the existing one.
+func TestSecondDMChannel(t *testing.T) {
+	e := testEnv(t)
+	ctx := context.Background()
+	oc, _, _ := setup(t, e)
+
+	dm1, err := e.chat.CreateChannel(ctx, oc, "dm", "pair-1", uuid.Nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dm2, err := e.chat.CreateChannel(ctx, oc, "dm", "pair-2", uuid.Nil)
+	if err != nil {
+		t.Fatalf("second dm channel must create, got %v", err)
+	}
+	if dm1 == dm2 {
+		t.Fatal("second dm resolved to the FIRST channel — unique index collapse")
+	}
+	custom2, err := e.chat.CreateChannel(ctx, oc, "custom", "admins-2", uuid.Nil)
+	if err != nil {
+		t.Fatalf("second custom channel must create, got %v", err)
+	}
+	if custom2 == uuid.Nil {
+		t.Fatal("nil custom channel id")
+	}
+	// derived kinds still dedupe
+	gen1, _ := e.chat.CreateChannel(ctx, oc, "general", "", uuid.Nil)
+	gen2, _ := e.chat.CreateChannel(ctx, oc, "general", "", uuid.Nil)
+	if gen1 != gen2 {
+		t.Fatal("general channel must dedupe to one row")
 	}
 }

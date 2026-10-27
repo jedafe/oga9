@@ -580,8 +580,8 @@ func (s *Service) TransitionMember(ctx context.Context, oc *OrgCtx, memberID uui
 				return err
 			}
 		}
-		// TODO: MemberDeceased → welfare bereavement-case candidate flags
-		// when §13 welfare lands (sourced event already carries the hook).
+		// MemberDeceased consumers live in welfare (MemberDeceasedConsumer —
+		// bereavement-case suggestion); the sourced event carries the hook.
 		if name := transitionEvent(from, to); name != "" {
 			return events.Emit(ctx, q, oc.TenantID, oc.OrgID, name, "organization_membership", memberID, oc.UserID, true,
 				map[string]any{"membership_id": memberID, "org_id": oc.OrgID, "user_id": userID, "from": from, "to": to})

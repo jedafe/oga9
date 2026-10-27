@@ -11,20 +11,28 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/hibiken/asynq"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jedafe/oga9/internal/analytics"
+	"github.com/jedafe/oga9/internal/assets"
+	"github.com/jedafe/oga9/internal/elections"
+	"github.com/jedafe/oga9/internal/integrations"
 	valkey "github.com/valkey-io/valkey-go"
 
 	"github.com/jedafe/oga9/internal/activities"
+	"github.com/jedafe/oga9/internal/ai"
 	"github.com/jedafe/oga9/internal/billing"
 	"github.com/jedafe/oga9/internal/chat"
 	"github.com/jedafe/oga9/internal/comms"
 	"github.com/jedafe/oga9/internal/db"
+	"github.com/jedafe/oga9/internal/entitlements"
 	"github.com/jedafe/oga9/internal/events"
 	"github.com/jedafe/oga9/internal/finance"
+	"github.com/jedafe/oga9/internal/governance"
 	"github.com/jedafe/oga9/internal/license"
 	"github.com/jedafe/oga9/internal/mailer"
 	"github.com/jedafe/oga9/internal/platform"
@@ -54,6 +62,30 @@ const (
 	TypeNotifDispatch    = "notifications:dispatch"
 	TypeNotifEmail       = "notifications:email"
 	TypeDocProcessUpload = "documents:process_upload"
+	// §16 governance
+	TypeTermTransitions   = "governance:term_transitions"
+	TypeHandoverReminders = "governance:handover_reminders"
+	// §18 assets
+	TypeAssetHandoverSweep = "assets:handover_sweep"
+	TypeMaintenanceDue     = "assets:maintenance_due"
+	// §22 ai
+	TypeAIAnswer        = "ai:answer"
+	TypeAIGenerateDraft = "ai:generate_draft"
+	TypeAIUsageRollup   = "ai:usage_rollup"
+	// §23 integrations
+	TypeWebhookProcess    = "integrations:webhook_process"
+	TypeJapaSyncPush      = "integrations:japa_sync_push"
+	TypeJapaSyncReconcile = "integrations:japa_sync_reconcile"
+	TypeIcsFeed           = "integrations:ics_feed"
+	// §21 elections
+	TypeElectionsOpenVoting  = "elections:open_voting"
+	TypeElectionsCloseVoting = "elections:close_voting"
+	TypeElectionsReminders   = "elections:reminders"
+	// §19 analytics
+	TypeRefreshSnapshots  = "analytics:refresh_snapshots"
+	TypeHealthScore       = "analytics:health_score"
+	TypeMonthlyReport     = "analytics:monthly_report"
+	TypeProjectionRebuild = "analytics:projection_rebuild"
 	// §24 chat & voice
 	TypePresenceSweep  = "chat:presence_sweep"
 	TypeRetentionSweep = "chat:retention_sweep"
@@ -151,8 +183,15 @@ type Deps struct {
 	Finance              *finance.Service
 	Activities           *activities.Service
 	Comms                *comms.Service
+	Ent                  *entitlements.Service
 	Chat                 *chat.Service
 	Platform             *platform.Service
+	Governance           *governance.Service
+	Analytics            *analytics.Service
+	Assets               *assets.Service
+	Elections            *elections.Service
+	Integrations         *integrations.Service
+	AI                   *ai.Service
 	VoiceRoomMaxAgeHours int
 	License              *license.Validator
 }
@@ -263,6 +302,11 @@ func RegisterSweeps(d Deps) {
 	// §24 chat & voice periodic jobs. Retention is daily per the catalog
 	// (low-tier work); stale voice rooms and the presence scan run per
 	// tick — both are cheap single queries.
+	// §14: enqueue-loss redrive for email-channel notification rows —
+	// the durable row is the record, a dropped task is re-sent.
+	OnTick(dailyGate(d.Valkey, "email_redrive", func(ctx context.Context) error {
+		return emailRedrive(d.Comms, d.Queue)(ctx)
+	}))
 	OnTick(dailyGate(d.Valkey, "chat_retention", func(ctx context.Context) error {
 		if d.Chat == nil {
 			return nil
@@ -288,6 +332,33 @@ func RegisterSweeps(d Deps) {
 		}
 		for _, id := range ids {
 			task, err := NewMemberImportTask(id)
+			if err != nil {
+				return err
+			}
+			if _, err := d.Queue.EnqueueContext(ctx, task); err != nil {
+				return err // leave the rest for the next pass
+			}
+		}
+		return nil
+	})
+	// §15 provision redrive — a worker that died mid-pipeline leaves the
+	// row 'processing' past its lease. The stored payload IS the original
+	// request; re-enqueue so the claim path resumes from its checkpoints
+	// (tenant → org → done). Runs per tick — cheap scan, almost always 0.
+	OnTick(func(ctx context.Context) error {
+		if d.Platform == nil || d.Queue == nil {
+			return nil
+		}
+		rows, err := d.Platform.StaleProvisions(ctx)
+		if err != nil {
+			return err
+		}
+		for _, row := range rows {
+			var in platform.ProvisionRequest
+			if json.Unmarshal(row.Payload, &in) != nil {
+				continue // unparseable intent — the row fails on next claim
+			}
+			task, err := NewProvisionTask(in)
 			if err != nil {
 				return err
 			}
@@ -343,7 +414,7 @@ func Handlers(d Deps) map[string]asynq.HandlerFunc {
 		}),
 		// §14 comms & documents fan-out (Rule 8) + upload validation.
 		TypeNotifDispatch:    notifDispatch(d.Comms, d.Queue),
-		TypeNotifEmail:       notifEmail(d.Mail, d.Pool),
+		TypeNotifEmail:       notifEmail(d.Mail, d.Pool, d.Ent),
 		TypeDocProcessUpload: docProcess(d.Comms),
 		// §24 chat & voice sweeps.
 		TypePresenceSweep:  presenceSweep(d.Valkey),
@@ -352,6 +423,32 @@ func Handlers(d Deps) map[string]asynq.HandlerFunc {
 		// Stubs — registered now (catalog-reserved), implemented when their
 		// sections land: license 14; provision 12; provider webhooks when
 		// gateways land (ADR-012 deferred surface).
+		// §16 governance — daily cadence (catalogued).
+		TypeTermTransitions:   termTransitions(d.Tenant),
+		TypeHandoverReminders: handoverReminders(d.Governance),
+		// §19 analytics — 15min snapshots, monthly score/report, on-demand rebuild.
+		TypeRefreshSnapshots:  refreshSnapshots(d.Analytics),
+		TypeHealthScore:       healthScore(d.Analytics),
+		TypeMonthlyReport:     monthlyReport(d.Analytics),
+		TypeProjectionRebuild: refreshSnapshots(d.Analytics),
+		// §18 assets — handover sweep (manual redrive; TermEnded consumer
+		// is the primary path), weekly maintenance-due notices.
+		TypeAssetHandoverSweep: assetHandoverSweep(d.Assets),
+		TypeMaintenanceDue:     maintenanceDue(d.Assets),
+		// §21 elections — date-driven voting windows, sweeps are idempotent.
+		TypeElectionsOpenVoting:  electionsOpen(d.Elections),
+		TypeElectionsCloseVoting: electionsClose(d.Elections),
+		TypeElectionsReminders:   electionsReminders(d.Elections),
+		// §23 integrations — webhook processing + japa sync cadence.
+		TypeWebhookProcess:    webhookProcess(d.Integrations),
+		TypeJapaSyncPush:      japaSyncPush(d.Integrations),
+		TypeJapaSyncReconcile: japaSyncReconcile(d.Integrations),
+		TypeIcsFeed:           icsFeed(d.Integrations),
+		// §22 ai — chat/draft are request-driven (handlers answer inline);
+		// the rollup computes the monthly meter on the low queue.
+		TypeAIAnswer:                aiAnswer(d.AI),
+		TypeAIGenerateDraft:         aiDraft(d.AI),
+		TypeAIUsageRollup:           aiUsageRollup(d.AI),
 		TypeLicenseReminder:         licenseReminder(d.License),
 		TypeTenantProvision:         tenantProvision(d.Platform),
 		TypeTenantExport:            tenantExport(d.Platform),
@@ -485,6 +582,9 @@ func retryDead(pool *pgxpool.Pool) asynq.HandlerFunc {
 func subscriptionSweep(b *billing.Service, queue *asynq.Client) asynq.HandlerFunc {
 	return func(ctx context.Context, t *asynq.Task) error {
 		if err := b.SweepStates(ctx); err != nil {
+			return err
+		}
+		if err := b.ExpireAddonSweep(ctx); err != nil {
 			return err
 		}
 		ids, err := b.StaleWebhookEvents(ctx)
@@ -628,10 +728,13 @@ func memberExport(svc *tenant.Service) asynq.HandlerFunc {
 	}
 }
 
-// NewDispatchTask — notifications:dispatch {announcement_id}: resolves the
-// audience snapshot into in_app notification rows (Rule 8 fan-out).
-func NewDispatchTask(announcementID uuid.UUID) (*asynq.Task, error) {
-	b, err := json.Marshal(map[string]string{"announcement_id": announcementID.String()})
+// NewDispatchTask — notifications:dispatch {announcement_id, email}:
+// resolves the audience snapshot into in_app notification rows (Rule 8
+// fan-out). allowEmail records the publisher's org.comms.broadcast grant
+// at publish time — the email channel only fans out for broadcast-capable
+// publishers.
+func NewDispatchTask(announcementID uuid.UUID, allowEmail bool) (*asynq.Task, error) {
+	b, err := json.Marshal(map[string]any{"announcement_id": announcementID.String(), "email": allowEmail})
 	if err != nil {
 		return nil, err
 	}
@@ -642,6 +745,7 @@ func notifDispatch(svc *comms.Service, queue *asynq.Client) asynq.HandlerFunc {
 	return func(ctx context.Context, t *asynq.Task) error {
 		var p struct {
 			AnnouncementID string `json:"announcement_id"`
+			Email          *bool  `json:"email"` // absent on pre-flag payloads → allow
 		}
 		if err := json.Unmarshal(t.Payload(), &p); err != nil {
 			return err
@@ -650,7 +754,8 @@ func notifDispatch(svc *comms.Service, queue *asynq.Client) asynq.HandlerFunc {
 		if err != nil {
 			return nil
 		}
-		targets, err := svc.DispatchAnnouncement(ctx, id)
+		allowEmail := p.Email == nil || *p.Email
+		targets, err := svc.DispatchAnnouncement(ctx, id, allowEmail)
 		if err != nil {
 			if errors.Is(err, comms.ErrNotFound) {
 				return nil // announcement retracted/deleted before dispatch
@@ -659,7 +764,8 @@ func notifDispatch(svc *comms.Service, queue *asynq.Client) asynq.HandlerFunc {
 		}
 		// Rule 8: email fan-out is fire-and-forget from the worker — one
 		// notifications:email per opted-in recipient (notification_id lets
-		// the sender stamp delivered_at).
+		// the sender stamp delivered_at). Failed enqueues are logged AND
+		// recovered by the stale-email redrive sweep — never swallowed.
 		subject, body := svc.EmailSubject(ctx, id), svc.EmailBody(ctx, id)
 		for _, tg := range targets {
 			b, err := json.Marshal(map[string]string{
@@ -671,16 +777,52 @@ func notifDispatch(svc *comms.Service, queue *asynq.Client) asynq.HandlerFunc {
 			if err != nil {
 				continue
 			}
-			_, _ = queue.EnqueueContext(ctx, asynq.NewTask(TypeNotifEmail, b,
-				asynq.Queue("default"), asynq.MaxRetry(5)))
+			if _, err := queue.EnqueueContext(ctx, asynq.NewTask(TypeNotifEmail, b,
+				asynq.Queue("default"), asynq.MaxRetry(5))); err != nil {
+				slog.Warn("email_fanout_enqueue", "notification_id", tg.NotificationID, "err", err)
+			}
+		}
+		return nil
+	}
+}
+
+// emailRedrive — channel='email' rows that never reached delivered_at
+// past the grace window (the enqueue died between commit and fan-out):
+// the notification row is durable, so the sweep re-enqueues the send
+// (idempotent — delivered_at already set means the row isn't stale).
+func emailRedrive(svc *comms.Service, queue *asynq.Client) func(context.Context) error {
+	return func(ctx context.Context) error {
+		if svc == nil || queue == nil {
+			return nil
+		}
+		rows, err := svc.StaleEmailRefs(ctx)
+		if err != nil {
+			return err
+		}
+		for _, r := range rows {
+			aid := uuid.UUID(r.RefID.Bytes)
+			b, err := json.Marshal(map[string]string{
+				"notification_id": uuid.UUID(r.ID.Bytes).String(),
+				"to":              r.Email,
+				"subject":         svc.EmailSubject(ctx, aid),
+				"body":            svc.EmailBody(ctx, aid),
+			})
+			if err != nil {
+				continue
+			}
+			if _, err := queue.EnqueueContext(ctx, asynq.NewTask(TypeNotifEmail, b,
+				asynq.Queue("default"), asynq.MaxRetry(5))); err != nil {
+				return err
+			}
 		}
 		return nil
 	}
 }
 
 // notifEmail — notifications:email: send, then stamp delivered_at on the
-// notification row (delivery tracking for the email channel).
-func notifEmail(m *mailer.Mailer, pool *pgxpool.Pool) asynq.HandlerFunc {
+// notification row (delivery tracking for the email channel). Each send
+// increments limit.messaging.monthly (§14 soft limit — warn at 80%).
+func notifEmail(m *mailer.Mailer, pool *pgxpool.Pool, ent *entitlements.Service) asynq.HandlerFunc {
 	q := db.New(pool)
 	return func(ctx context.Context, t *asynq.Task) error {
 		var p struct {
@@ -697,16 +839,30 @@ func notifEmail(m *mailer.Mailer, pool *pgxpool.Pool) asynq.HandlerFunc {
 			return err // asynq retries — delivered_at stays unset until success
 		}
 		if id, err := uuid.Parse(p.NotificationID); err == nil {
-			// stamp + NotificationDelivered in one tx (Rule 12). A stamp
-			// failure logs but does NOT retry — the mail already went out
-			// and a retry would double-send.
+			// stamp + NotificationDelivered + usage metering in one tx
+			// (Rule 12). A failure logs but does NOT retry — the mail
+			// already went out and a retry would double-send.
 			if tx, err := pool.Begin(ctx); err == nil {
 				tq := q.WithTx(tx)
 				if err := tq.MarkNotificationDelivered(ctx, pgtype.UUID{Bytes: id, Valid: true}); err == nil {
 					if n, err := tq.GetNotificationForDelivery(ctx, pgtype.UUID{Bytes: id, Valid: true}); err == nil {
-						_ = events.Emit(ctx, tq, uuid.UUID(n.TenantID.Bytes), uuid.UUID(n.OrganizationID.Bytes),
+						tid := uuid.UUID(n.TenantID.Bytes)
+						_ = events.Emit(ctx, tq, tid, uuid.UUID(n.OrganizationID.Bytes),
 							"NotificationDelivered", "notification", id, uuid.Nil, false,
 							map[string]any{"notification_id": id})
+						// §14: email broadcasts count against the monthly
+						// messaging soft limit (period = first of month).
+						period := time.Date(time.Now().Year(), time.Now().Month(), 1,
+							0, 0, 0, 0, time.UTC)
+						used, uerr := tq.AddUsage(ctx, db.AddUsageParams{
+							TenantID: n.TenantID, LimitKey: "limit.messaging.monthly",
+							Delta: 1, PeriodStart: pgtype.Date{Time: period, Valid: true}})
+						if uerr == nil && ent != nil {
+							if lim := ent.Limit(ctx, tid, "limit.messaging.monthly"); lim > 0 && used*100 >= lim*80 {
+								slog.Warn("messaging_soft_limit", "tenant_id", tid,
+									"used", used, "limit", lim)
+							}
+						}
 					}
 				}
 				if err := tx.Commit(ctx); err != nil {
@@ -875,5 +1031,354 @@ func tenantExport(svc *platform.Service) asynq.HandlerFunc {
 			return nil // malformed id — retrying won't help
 		}
 		return svc.RunTenantExport(ctx, id)
+	}
+}
+
+// termTransitions — governance:term_transitions (§16): ends terms whose
+// ends_at passed — the tenant service's close flow revokes appointments,
+// emits AppointmentEnded/TermEnded, and invalidates permission caches.
+func termTransitions(svc *tenant.Service) asynq.HandlerFunc {
+	return func(ctx context.Context, _ *asynq.Task) error {
+		if svc == nil {
+			return nil
+		}
+		n, err := svc.CloseExpiredTerms(ctx)
+		if err != nil {
+			return err
+		}
+		if n > 0 {
+			slog.Info("term_transitions", "closed", n)
+		}
+		return nil
+	}
+}
+
+// handoverReminders — governance:handover_reminders (§16): terms inside
+// the 14-day window get a handover snapshot generated + archived. The
+// service dedupes per term, so a re-run or a term-close generation can
+// never double-emit HandoverGenerated.
+func handoverReminders(svc *governance.Service) asynq.HandlerFunc {
+	return func(ctx context.Context, _ *asynq.Task) error {
+		if svc == nil {
+			return nil
+		}
+		terms, err := svc.TermsEndingSoon(ctx, 14)
+		if err != nil {
+			return err
+		}
+		for _, t := range terms {
+			orgID := uuid.UUID(t.OrganizationID.Bytes)
+			tid, err := svc.OrgTenant(ctx, orgID)
+			if err != nil {
+				return err
+			}
+			oc := &tenant.OrgCtx{OrgID: orgID, TenantID: tid}
+			if err := svc.ArchiveHandover(ctx, oc, uuid.UUID(t.ID.Bytes)); err != nil {
+				return err // deduped — safe to retry the whole task
+			}
+		}
+		return nil
+	}
+}
+
+// refreshSnapshots — analytics:refresh_snapshots / projection_rebuild
+// (§19): rebuild every live org's role snapshots from the projection +
+// section producers. Idempotent upserts — safe to re-drive.
+func refreshSnapshots(svc *analytics.Service) asynq.HandlerFunc {
+	return func(ctx context.Context, _ *asynq.Task) error {
+		if svc == nil {
+			return nil
+		}
+		n, err := svc.RefreshSnapshots(ctx)
+		if err != nil {
+			return err
+		}
+		if n > 0 {
+			slog.Info("refresh_snapshots", "orgs", n)
+		}
+		return nil
+	}
+}
+
+// healthScore — analytics:health_score (§19): monthly score + KPI
+// threshold evaluation per org.
+func healthScore(svc *analytics.Service) asynq.HandlerFunc {
+	return func(ctx context.Context, _ *asynq.Task) error {
+		if svc == nil {
+			return nil
+		}
+		n, err := svc.ComputeHealthScores(ctx)
+		if err != nil {
+			return err
+		}
+		if n > 0 {
+			slog.Info("health_score", "orgs", n)
+		}
+		return nil
+	}
+}
+
+// monthlyReport — analytics:monthly_report (§19): one run per org per
+// period (dedupe inside the service).
+func monthlyReport(svc *analytics.Service) asynq.HandlerFunc {
+	return func(ctx context.Context, _ *asynq.Task) error {
+		if svc == nil {
+			return nil
+		}
+		n, err := svc.MonthlyReports(ctx)
+		if err != nil {
+			return err
+		}
+		if n > 0 {
+			slog.Info("monthly_report", "runs", n)
+		}
+		return nil
+	}
+}
+
+// assetHandoverSweep — assets:handover_sweep (§18): manual redrive of the
+// term-close flag pass. Payload may carry {"term_id": "..."}; without one
+// the task no-ops (the TermEnded consumer is the primary path).
+func assetHandoverSweep(svc *assets.Service) asynq.HandlerFunc {
+	return func(ctx context.Context, t *asynq.Task) error {
+		if svc == nil {
+			return nil
+		}
+		var p struct {
+			TermID string `json:"term_id"`
+		}
+		if err := json.Unmarshal(t.Payload(), &p); err != nil || p.TermID == "" {
+			return nil
+		}
+		termID, err := uuid.Parse(p.TermID)
+		if err != nil {
+			return nil
+		}
+		n, err := svc.FlagUnreturned(ctx, termID)
+		if err != nil {
+			return err
+		}
+		if n > 0 {
+			slog.Info("asset_handover_sweep", "flagged", n)
+		}
+		return nil
+	}
+}
+
+// maintenanceDue — assets:maintenance_due (§18, weekly): custodians get a
+// MaintenanceDue notice inside a 7-day lookahead.
+func maintenanceDue(svc *assets.Service) asynq.HandlerFunc {
+	return func(ctx context.Context, _ *asynq.Task) error {
+		if svc == nil {
+			return nil
+		}
+		n, err := svc.MaintenanceDueSweep(ctx, 7)
+		if err != nil {
+			return err
+		}
+		if n > 0 {
+			slog.Info("maintenance_due", "records", n)
+		}
+		return nil
+	}
+}
+
+// electionsOpen/close/reminders — §21 window sweeps; all idempotent CAS
+// transitions (safe to re-drive).
+func electionsOpen(svc *elections.Service) asynq.HandlerFunc {
+	return func(ctx context.Context, _ *asynq.Task) error {
+		if svc == nil {
+			return nil
+		}
+		n, err := svc.OpenSweep(ctx)
+		if err != nil {
+			return err
+		}
+		if n > 0 {
+			slog.Info("elections_open", "transitions", n)
+		}
+		return nil
+	}
+}
+
+func electionsClose(svc *elections.Service) asynq.HandlerFunc {
+	return func(ctx context.Context, _ *asynq.Task) error {
+		if svc == nil {
+			return nil
+		}
+		n, err := svc.CloseSweep(ctx)
+		if err != nil {
+			return err
+		}
+		if n > 0 {
+			slog.Info("elections_close", "concluded", n)
+		}
+		return nil
+	}
+}
+
+func electionsReminders(svc *elections.Service) asynq.HandlerFunc {
+	return func(ctx context.Context, _ *asynq.Task) error {
+		if svc == nil {
+			return nil
+		}
+		n, err := svc.RemindersSweep(ctx)
+		if err != nil {
+			return err
+		}
+		if n > 0 {
+			slog.Info("elections_reminders", "emitted", n)
+		}
+		return nil
+	}
+}
+
+// webhookProcess — integrations:webhook_process (§23, critical): drains
+// unprocessed receipts (payload may carry a specific receipt_id).
+func webhookProcess(svc *integrations.Service) asynq.HandlerFunc {
+	return func(ctx context.Context, t *asynq.Task) error {
+		if svc == nil {
+			return nil
+		}
+		var p struct {
+			ReceiptID string `json:"receipt_id"`
+		}
+		_ = json.Unmarshal(t.Payload(), &p)
+		if p.ReceiptID != "" {
+			id, err := uuid.Parse(p.ReceiptID)
+			if err != nil {
+				return nil
+			}
+			return svc.ProcessReceipt(ctx, id)
+		}
+		return svc.ProcessQueuedReceipts(ctx)
+	}
+}
+
+// japaSyncPush — integrations:japa_sync_push (§23, default): drains
+// queued push jobs (transport lands when JEOS ingestion is spec'd; the
+// job records outcome either way).
+func japaSyncPush(svc *integrations.Service) asynq.HandlerFunc {
+	return func(ctx context.Context, _ *asynq.Task) error {
+		if svc == nil {
+			return nil
+		}
+		n, err := svc.PushSyncJobs(ctx)
+		if err != nil {
+			return err
+		}
+		if n > 0 {
+			slog.Info("japa_sync_push", "jobs", n)
+		}
+		return nil
+	}
+}
+
+// japaSyncReconcile — daily pull-fallback reconcile (§23).
+func japaSyncReconcile(svc *integrations.Service) asynq.HandlerFunc {
+	return func(ctx context.Context, _ *asynq.Task) error {
+		if svc == nil {
+			return nil
+		}
+		n, err := svc.Reconcile(ctx)
+		if err != nil {
+			return err
+		}
+		if n > 0 {
+			slog.Info("japa_sync_reconcile", "orgs", n)
+		}
+		return nil
+	}
+}
+
+// icsFeed — integrations:ics_feed (§23, low): registered cadence; feeds
+// render on demand.
+func icsFeed(svc *integrations.Service) asynq.HandlerFunc {
+	return func(ctx context.Context, _ *asynq.Task) error {
+		if svc == nil {
+			return nil
+		}
+		return svc.IcsFeedSweep(ctx)
+	}
+}
+
+// §22 ai — async answer/draft carry the asker's identity in payload;
+// the task rebuilds the OrgCtx server-side (Rule 24 — the ids resolve
+// from the tables, never from the payload's claims alone).
+func aiAnswer(svc *ai.Service) asynq.HandlerFunc {
+	return func(ctx context.Context, t *asynq.Task) error {
+		if svc == nil {
+			return nil
+		}
+		var p struct {
+			OrgID    string `json:"org_id"`
+			UserID   string `json:"user_id"`
+			Persona  string `json:"persona"`
+			Question string `json:"question"`
+			ConvID   string `json:"conversation_id"`
+		}
+		if err := json.Unmarshal(t.Payload(), &p); err != nil {
+			return err
+		}
+		oc, err := aiOrgCtx(ctx, svc, p.OrgID, p.UserID)
+		if err != nil {
+			return err
+		}
+		conv, _ := uuid.Parse(p.ConvID)
+		_, _, _, err = svc.Chat(ctx, oc, conv, p.Persona, p.Question)
+		return err
+	}
+}
+
+func aiDraft(svc *ai.Service) asynq.HandlerFunc {
+	return func(ctx context.Context, t *asynq.Task) error {
+		if svc == nil {
+			return nil
+		}
+		var p struct {
+			OrgID  string `json:"org_id"`
+			UserID string `json:"user_id"`
+			Kind   string `json:"kind"`
+			Prompt string `json:"prompt"`
+		}
+		if err := json.Unmarshal(t.Payload(), &p); err != nil {
+			return err
+		}
+		oc, err := aiOrgCtx(ctx, svc, p.OrgID, p.UserID)
+		if err != nil {
+			return err
+		}
+		_, err = svc.Draft(ctx, oc, p.Kind, p.Prompt)
+		return err
+	}
+}
+
+// aiOrgCtx rebuilds the request-time OrgCtx for a queued AI job — the
+// membership+tenant resolve from the tables (never the payload's word).
+func aiOrgCtx(ctx context.Context, svc *ai.Service, orgID, userID string) (*tenant.OrgCtx, error) {
+	o, err := uuid.Parse(orgID)
+	if err != nil {
+		return nil, fmt.Errorf("ai job: bad org_id")
+	}
+	u, err := uuid.Parse(userID)
+	if err != nil {
+		return nil, fmt.Errorf("ai job: bad user_id")
+	}
+	return svc.ResolveMember(ctx, o, u)
+}
+
+func aiUsageRollup(svc *ai.Service) asynq.HandlerFunc {
+	return func(ctx context.Context, _ *asynq.Task) error {
+		if svc == nil {
+			return nil
+		}
+		n, err := svc.UsageRollup(ctx)
+		if err != nil {
+			return err
+		}
+		if n > 0 {
+			slog.Info("ai_usage_rollup", "tenants", n)
+		}
+		return nil
 	}
 }

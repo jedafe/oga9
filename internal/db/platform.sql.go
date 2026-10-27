@@ -12,7 +12,8 @@ import (
 )
 
 const checkpointProvision = `-- name: CheckpointProvision :exec
-UPDATE tenant_provisions SET tenant_id = $2, owner_user_id = $3
+UPDATE tenant_provisions SET tenant_id = $2, owner_user_id = $3,
+  processing_started_at = now()
 WHERE request_id = $1
 `
 
@@ -30,19 +31,38 @@ func (q *Queries) CheckpointProvision(ctx context.Context, arg CheckpointProvisi
 	return err
 }
 
+const checkpointProvisionOrg = `-- name: CheckpointProvisionOrg :exec
+UPDATE tenant_provisions SET organization_id = $2, processing_started_at = now()
+WHERE request_id = $1
+`
+
+type CheckpointProvisionOrgParams struct {
+	RequestID      string      `json:"request_id"`
+	OrganizationID pgtype.UUID `json:"organization_id"`
+}
+
+// Second crash-safety checkpoint: the org bootstrap commits OUTSIDE the
+// provision tx, so record its id immediately — a crash before
+// FinishProvision must let a reclaim SKIP re-running CreateOrg (a re-run
+// dies on the slug conflict and can never complete).
+func (q *Queries) CheckpointProvisionOrg(ctx context.Context, arg CheckpointProvisionOrgParams) error {
+	_, err := q.db.Exec(ctx, checkpointProvisionOrg, arg.RequestID, arg.OrganizationID)
+	return err
+}
+
 const claimProvision = `-- name: ClaimProvision :one
 UPDATE tenant_provisions SET status='processing', completed_at=NULL, error=NULL,
   processing_started_at=now()
 WHERE request_id=$1 AND (status='failed'
   OR (status='processing'
-      AND COALESCE(processing_started_at, created_at) < now() - interval '10 minutes'))
+      AND COALESCE(processing_started_at, created_at) < now() - interval '30 minutes'))
 RETURNING id, request_id, tenant_id, organization_id, owner_user_id, error, status, created_at, completed_at, payload, processing_started_at
 `
 
 // atomic retry claim — 'failed' rows reclaim; 'processing' rows whose
-// lease is older than 10min reclaim too. processing_started_at stamps
-// each claim so staleness measures from the last claim, not row creation
-// (a live worker past the window is never reclaimed mid-run).
+// lease is older than 30min reclaim too. processing_started_at re-stamps
+// at every pipeline checkpoint so staleness measures from the last stage
+// commit, not row creation (a live worker mid-run is never reclaimed).
 func (q *Queries) ClaimProvision(ctx context.Context, requestID string) (TenantProvisions, error) {
 	row := q.db.QueryRow(ctx, claimProvision, requestID)
 	var i TenantProvisions
@@ -257,7 +277,7 @@ JOIN information_schema.constraint_column_usage ccu
 WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_schema = 'public'
   AND ccu.table_name IN (
     SELECT table_name FROM information_schema.columns
-    WHERE table_schema = 'public' AND column_name = 'organization_id')
+    WHERE table_schema = 'public' AND column_name = $1::text)
 ORDER BY 1
 `
 
@@ -268,12 +288,13 @@ type ExportChildFKsRow struct {
 	ParentCol   string `json:"parent_col"`
 }
 
-// org-scoped parents' children: rows keyed by FK to an org-scoped table
-// without carrying the scope column themselves (chat_messages.channel_id,
-// minutes.activity_id, document_versions.document_id, ...). Without this
-// pass the Rule-28 export silently drops them.
-func (q *Queries) ExportChildFKs(ctx context.Context) ([]ExportChildFKsRow, error) {
-	rows, err := q.db.Query(ctx, exportChildFKs)
+// scoped parents' children: rows keyed by FK to a scoped table without
+// carrying the scope column themselves (chat_messages.channel_id,
+// minutes.activity_id, user_role_assignments.role_id, ...). Run once per
+// scope column ('organization_id', 'tenant_id') — without these passes
+// the Rule-28 export silently drops unscoped join/child tables.
+func (q *Queries) ExportChildFKs(ctx context.Context, scopeCol string) ([]ExportChildFKsRow, error) {
+	rows, err := q.db.Query(ctx, exportChildFKs, scopeCol)
 	if err != nil {
 		return nil, err
 	}
@@ -444,6 +465,25 @@ func (q *Queries) FinishProvision(ctx context.Context, arg FinishProvisionParams
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const getOrgIDByTenantSlug = `-- name: GetOrgIDByTenantSlug :one
+SELECT id FROM organizations WHERE tenant_id = $1 AND slug = $2
+`
+
+type GetOrgIDByTenantSlugParams struct {
+	TenantID pgtype.UUID `json:"tenant_id"`
+	Slug     string      `json:"slug"`
+}
+
+// Reclaim adoption: organizations.slug is UNIQUE(tenant_id, slug), so a
+// row found here can only be the org THIS provision's crashed run
+// committed before it could checkpoint — never a foreign org.
+func (q *Queries) GetOrgIDByTenantSlug(ctx context.Context, arg GetOrgIDByTenantSlugParams) (pgtype.UUID, error) {
+	row := q.db.QueryRow(ctx, getOrgIDByTenantSlug, arg.TenantID, arg.Slug)
+	var id pgtype.UUID
+	err := row.Scan(&id)
+	return id, err
 }
 
 const getProvision = `-- name: GetProvision :one
@@ -677,25 +717,26 @@ func (q *Queries) ListFeatureFlags(ctx context.Context) ([]FeatureFlags, error) 
 }
 
 const listSubscriptions = `-- name: ListSubscriptions :many
-SELECT s.id, s.tenant_id, s.plan_slug, s.state, s.billing_term, s.trial_ends_at, s.current_period_end, s.grace_ends_at, s.cancelled_at, s.created_at, t.name AS tenant_name, t.slug AS tenant_slug FROM subscriptions s
+SELECT s.id, s.tenant_id, s.plan_slug, s.state, s.billing_term, s.trial_ends_at, s.current_period_end, s.grace_ends_at, s.cancelled_at, s.created_at, s.scheduled_plan_slug, t.name AS tenant_name, t.slug AS tenant_slug FROM subscriptions s
 JOIN tenants t ON t.id = s.tenant_id
 WHERE ($1::text = '' OR s.state = $1)
 ORDER BY s.created_at DESC LIMIT 200
 `
 
 type ListSubscriptionsRow struct {
-	ID               pgtype.UUID        `json:"id"`
-	TenantID         pgtype.UUID        `json:"tenant_id"`
-	PlanSlug         string             `json:"plan_slug"`
-	State            string             `json:"state"`
-	BillingTerm      string             `json:"billing_term"`
-	TrialEndsAt      pgtype.Timestamptz `json:"trial_ends_at"`
-	CurrentPeriodEnd pgtype.Timestamptz `json:"current_period_end"`
-	GraceEndsAt      pgtype.Timestamptz `json:"grace_ends_at"`
-	CancelledAt      pgtype.Timestamptz `json:"cancelled_at"`
-	CreatedAt        pgtype.Timestamptz `json:"created_at"`
-	TenantName       string             `json:"tenant_name"`
-	TenantSlug       string             `json:"tenant_slug"`
+	ID                pgtype.UUID        `json:"id"`
+	TenantID          pgtype.UUID        `json:"tenant_id"`
+	PlanSlug          string             `json:"plan_slug"`
+	State             string             `json:"state"`
+	BillingTerm       string             `json:"billing_term"`
+	TrialEndsAt       pgtype.Timestamptz `json:"trial_ends_at"`
+	CurrentPeriodEnd  pgtype.Timestamptz `json:"current_period_end"`
+	GraceEndsAt       pgtype.Timestamptz `json:"grace_ends_at"`
+	CancelledAt       pgtype.Timestamptz `json:"cancelled_at"`
+	CreatedAt         pgtype.Timestamptz `json:"created_at"`
+	ScheduledPlanSlug pgtype.Text        `json:"scheduled_plan_slug"`
+	TenantName        string             `json:"tenant_name"`
+	TenantSlug        string             `json:"tenant_slug"`
 }
 
 // ---------- subscriptions / plans ----------
@@ -719,6 +760,7 @@ func (q *Queries) ListSubscriptions(ctx context.Context, dollar_1 string) ([]Lis
 			&i.GraceEndsAt,
 			&i.CancelledAt,
 			&i.CreatedAt,
+			&i.ScheduledPlanSlug,
 			&i.TenantName,
 			&i.TenantSlug,
 		); err != nil {
@@ -908,7 +950,7 @@ func (q *Queries) MarkTenantExportFailed(ctx context.Context, arg MarkTenantExpo
 
 const overrideSubscription = `-- name: OverrideSubscription :execrows
 UPDATE subscriptions SET plan_slug = $3, state = $4,
-  grace_ends_at = COALESCE($5, grace_ends_at)
+  grace_ends_at = COALESCE($5, grace_ends_at), scheduled_plan_slug = NULL
 WHERE id = $1 AND tenant_id = $2
 `
 
@@ -920,6 +962,8 @@ type OverrideSubscriptionParams struct {
 	GraceEndsAt pgtype.Timestamptz `json:"grace_ends_at"`
 }
 
+// Operator override wins outright — a stale scheduled_plan_slug queued by
+// a self-serve downgrade must not fire later on top of this write.
 func (q *Queries) OverrideSubscription(ctx context.Context, arg OverrideSubscriptionParams) (int64, error) {
 	result, err := q.db.Exec(ctx, overrideSubscription,
 		arg.ID,
@@ -997,6 +1041,48 @@ func (q *Queries) SetTenantStatus(ctx context.Context, arg SetTenantStatusParams
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const staleProvisions = `-- name: StaleProvisions :many
+SELECT id, request_id, tenant_id, organization_id, owner_user_id, error, status, created_at, completed_at, payload, processing_started_at FROM tenant_provisions
+WHERE status = 'processing'
+  AND COALESCE(processing_started_at, created_at) < now() - interval '30 minutes'
+ORDER BY created_at LIMIT 100
+`
+
+// Rows whose worker died mid-pipeline: 'processing' past the claim lease.
+// The stored payload IS the retry unit — the redrive sweep re-enqueues
+// tenant:provision and the claim path resumes from the checkpoints.
+func (q *Queries) StaleProvisions(ctx context.Context) ([]TenantProvisions, error) {
+	rows, err := q.db.Query(ctx, staleProvisions)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []TenantProvisions
+	for rows.Next() {
+		var i TenantProvisions
+		if err := rows.Scan(
+			&i.ID,
+			&i.RequestID,
+			&i.TenantID,
+			&i.OrganizationID,
+			&i.OwnerUserID,
+			&i.Error,
+			&i.Status,
+			&i.CreatedAt,
+			&i.CompletedAt,
+			&i.Payload,
+			&i.ProcessingStartedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const upsertFeatureFlag = `-- name: UpsertFeatureFlag :exec

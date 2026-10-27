@@ -66,6 +66,16 @@ func (s *Service) SetActivityGate(fn func(ctx context.Context, orgID, activityID
 	s.activityGate = fn
 }
 
+// PaymentSnapshot is the Rule-26 read seam comms uses for ReceiptIssued
+// payloads — the finance module answers, comms never reads the table.
+func (s *Service) PaymentSnapshot(ctx context.Context, paymentID uuid.UUID) (membershipID uuid.UUID, amountMinor int64, currency string, ok bool) {
+	p, err := s.q.GetPaymentAny(ctx, toPg(paymentID))
+	if err != nil {
+		return uuid.Nil, 0, "", false
+	}
+	return uuid.UUID(p.MembershipID.Bytes), p.AmountMinor, p.Currency, true
+}
+
 func toPg(u uuid.UUID) pgtype.UUID   { return pgtype.UUID{Bytes: u, Valid: u != uuid.Nil} }
 func fromPg(u pgtype.UUID) uuid.UUID { return uuid.UUID(u.Bytes) }
 func pgText(s string) pgtype.Text    { return pgtype.Text{String: s, Valid: s != ""} }
@@ -1466,4 +1476,72 @@ func (s *Service) RevokeFine(ctx context.Context, orgID, memberID uuid.UUID, per
 	}); err != nil {
 		slog.Error("revoke_fine_failed", "org", orgID, "member", memberID, "period", period, "err", err)
 	}
+}
+
+// WelfareDisbursementConsumer — §17: BenefitDisbursed posts the debit
+// ledger entry (Rule 19 — never off-ledger). Idempotent by benefit-keyed
+// memo: the event is at-least-once (Rule 27).
+func (s *Service) WelfareDisbursementConsumer(ctx context.Context, q *db.Queries, e events.Event) error {
+	if e.Type != "BenefitDisbursed" {
+		return nil
+	}
+	benefitID, _ := e.Payload["benefit_id"].(string)
+	if benefitID == "" {
+		return nil
+	}
+	memo := "welfare-benefit:" + benefitID
+	exists, err := q.LedgerMemoExists(ctx, db.LedgerMemoExistsParams{
+		OrganizationID: toPg(e.OrganizationID), Memo: pgText(memo)})
+	if err != nil || exists {
+		return err
+	}
+	var amount float64
+	if v, ok := e.Payload["amount_minor"].(float64); ok {
+		amount = v
+	}
+	kind, _ := e.Payload["kind"].(string)
+	cur, _ := e.Payload["currency"].(string)
+	postedBy, _ := e.Payload["posted_by"].(string)
+	if kind != "cash" || amount <= 0 {
+		return nil // non-cash benefits (item/service/visit) post no ledger entry
+	}
+	pb, _ := uuid.Parse(postedBy)
+	_, err = q.PostLedgerEntry(ctx, db.PostLedgerEntryParams{
+		OrganizationID: toPg(e.OrganizationID), Direction: "debit", Account: "general",
+		AmountMinor: int64(amount), Currency: cur,
+		Memo: pgText(memo), PostedBy: toPg(pb)})
+	return err
+}
+
+// AssetDisposalConsumer — §18: a sold asset posts a credit ledger entry
+// (money in). Deduped on the asset-keyed memo — events are at-least-once.
+func (s *Service) AssetDisposalConsumer(ctx context.Context, q *db.Queries, e events.Event) error {
+	if e.Type != "AssetDisposed" {
+		return nil
+	}
+	assetID, _ := e.Payload["asset_id"].(string)
+	if assetID == "" {
+		return nil
+	}
+	memo := "asset-sale:" + assetID
+	exists, err := q.LedgerMemoExists(ctx, db.LedgerMemoExistsParams{
+		OrganizationID: toPg(e.OrganizationID), Memo: pgText(memo)})
+	if err != nil || exists {
+		return err
+	}
+	var amount float64
+	if v, ok := e.Payload["sold_amount_minor"].(float64); ok {
+		amount = v
+	}
+	if amount <= 0 {
+		return nil // disposal without sale posts nothing
+	}
+	cur, _ := e.Payload["currency"].(string)
+	postedBy, _ := e.Payload["posted_by"].(string)
+	pb, _ := uuid.Parse(postedBy)
+	_, err = q.PostLedgerEntry(ctx, db.PostLedgerEntryParams{
+		OrganizationID: toPg(e.OrganizationID), Direction: "credit", Account: "general",
+		AmountMinor: int64(amount), Currency: cur,
+		Memo: pgText(memo), PostedBy: toPg(pb)})
+	return err
 }

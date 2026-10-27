@@ -3,6 +3,399 @@
 All notable changes to the OGA9 platform. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 entries reference engineering phases in `.oos/roadmaps/ROADMAP-BACKEND.md`.
 
+## Phase 12–15 — Review fixes
+
+### Fixed — `tenant:provision` end-to-end break
+- `platform.Provision` created a bare tenant — no role-template clones, no
+  MVP app installs, no owner role grant — so the bootstrap's
+  administered-tenant gate (`HasTenantRole(org_admin)`) refused every real
+  run with `no_administered_tenant`; only stubbed-test provisions ever
+  succeeded. New `tenant.ScaffoldTenant` seam (Rule 26: tenant module owns
+  role/app rows) runs inside the provision tx: clone system roles +
+  permissions, install MVP apps, grant owner `org_admin`. Idempotent and
+  atomic with tenant+user+subscription.
+- `tenants.owner_org_id` now set after org bootstrap (was only set on the
+  self-serve `provision=true` path).
+- `TenantProvisioned` payload `plan_slug` corrected `"trial"` → `"starter"`
+  (the provisioned plan, not the lifecycle state).
+- `template` is now required in `POST /platform/tenants` — the previous
+  `"association"` default doesn't exist in `organization_templates` (7
+  seeded: union/social-club/alumni/cooperative/professional/religious/cda)
+  and would have failed at template lookup anyway.
+- Regression test `TestProvisionRealBootstrap` wires the real
+  `tenant.CreateOrg` bootstrap (all prior tests stubbed it).
+
+### Added — isolation coverage for post-MVP scoped tables (ADR-024)
+- `internal/isolation/phase15_test.go`: forged-OrgCtx cases for governance
+  (motions/votes), welfare (cases), analytics (report runs), assets,
+  projects, elections (incl. forged vote), integrations (connectors), and
+  ai (conversations/messages). ADR-024 requires an isolation test in the
+  same change as any new scope-columned table — 000170–000179 shipped
+  without them.
+
+### Added — add-on commerce (§07 surface, previously deferred)
+- 000180: `addon_catalog` + `tenant_addons` tables, seeded with the
+  catalogued addons (elections, ai-assistant, welfare-pro, multi-branch,
+  analytics-pro). Grant shape `{capabilities, limit_overrides,
+  limit_deltas}` — overrides take the greater value (-1 absorbs), deltas
+  stack (multi-branch's "+5 branches" is a delta, not an absolute).
+- Entitlement resolution now merges live addon grants (plan ∪ addons ∪
+  license) per §07 resolution order; `AddonSubscribed`/`AddonCancelled`/
+  `AddonExpired` flush the entitlement cache via the invalidate consumer.
+- Routes: `GET /billing/addons`, `POST /billing/addons/{slug}/subscribe`,
+  `POST /billing/addons/{slug}/cancel` (org.admin.billing, tenant resolved
+  server-side); `GET/POST/PATCH /platform/addons[/{slug}]`
+  (platform.plans.manage, audited).
+- Subscribe enforces `available_on_plans` eligibility against the tenant's
+  effective plan (restricted/cancelled resolve the starter floor, Rule 28);
+  the hourly billing sweep expires past-due addons and emits AddonExpired.
+
+### Spec sync (.oos)
+- §15 route table: `GET /platform/plans` split to `platform.plans.view`
+  (the catalogued read node — POST/PATCH stay `plans.manage`).
+- Roadmap: phases 14 (self-hosted packaging) and 15 (post-MVP domains)
+  marked complete — both are implemented, tested, and CI-covered.
+- Stale markers removed: members.go `MemberDeceased` TODO (the welfare
+  consumer is wired), ai.go "placeholder until the adapter lands" (the
+  OpenAI-compatible adapter ships in main).
+
+## Phase 15 — Post-MVP Domains
+
+### Added — 15.01 Governance (§16)
+- `internal/governance` service + `handler.GovernanceHandler`: motions →
+  resolutions, constitution versions, committee mandates, handover
+  report. Migration 000170 adds `motions`, `resolutions`,
+  `constitution_versions`, `committee_mandates` + the `governance`
+  `app_registry` row (`app.governance` entitlement, requires
+  organization_core+members).
+- Motions: mover = acting member, optional org-scoped seconder; state
+  CAS tabled/debated → voted. `RecordVote` gates on `EvaluateQuorum`
+  (activities seam) when the motion is meeting-bound and writes a
+  term-scoped resolution (Rule 21) + `ResolutionPassed`/
+  `ResolutionRejected` in the same tx.
+- Constitution: `AdoptConstitution` requires a passed/amended_passed
+  resolution reference; versions append (v1 → `ConstitutionAdopted`,
+  later → `ConstitutionAmended`), all readable.
+- Committee mandates bind to `org_units.type='committee'` only;
+  `MandateLimit` is the Rule-26 seam finance uses to enforce
+  `budget_limit_minor` once expenses carry committee links.
+- Handover report composes named sections through injected module seams
+  (`SetHandoverSection`) — action-items/custody/approvals/finances fill
+  in as those sections land; `ArchiveHandover` stores the JSON as an
+  `archive` document and emits `HandoverGenerated`, deduped per term.
+- Tasks: `governance:term_transitions` (@daily) closes expired terms via
+  `tenant.Service.CloseExpiredTerms` — full grant revocation + cache
+  invalidation with a system actor; `governance:handover_reminders`
+  (@daily) generates handovers for terms ending within 14 days.
+- Spec sync (.oos): §16 API table rewritten to the catalog's flat
+  `/orgs/{id}/…` shape (the `/governance/` prefix was never
+  implemented); catalog rows added for motions/resolutions/constitution/
+  mandates/handover.
+
+### Added — 15.02 Welfare (§17)
+- `internal/welfare` service + `handler.WelfareHandler`: case lifecycle
+  (requested → reviewing → approved/rejected → disbursed → closed),
+  cap-tiered approvals, visits + delegates, append-only case history.
+  Migration 000171 adds `welfare_cases`, `welfare_case_events`,
+  `welfare_approvals`, `welfare_visits`, `welfare_visit_delegates`,
+  `welfare_benefits` + the `welfare` `app_registry` row (`app.welfare`
+  entitlement, requires finance_lite).
+- Eligibility is rules-driven (Rule 23): `org.welfare.min_membership_days`,
+  `org.welfare.requires_good_standing`, `org.welfare.cap.{kind}_minor`,
+  `org.welfare.once_per.{kind}_days` — repeats inside a once-per window
+  are flagged in the case history, not auto-rejected.
+- Approval tiers: at/under `cap.{kind}_minor` one approval decides;
+  above cap two distinct approvers (EXCO-level). One-approver-one-
+  decision enforced; rejections close immediately.
+- Disburse: cash benefits require amount+currency and emit
+  `BenefitDisbursed` — `finance.WelfareDisbursementConsumer` posts the
+  debit `ledger_entries` row, deduped on a benefit-keyed memo
+  (`LedgerMemoExists`) since events are at-least-once.
+- `MemberDeceased` → `MemberDeceasedConsumer` auto-suggests a bereavement
+  case + `CondolenceRegistered`. `/me/welfare` lists the member's own
+  cases; `/orgs/{id}/welfare/policies` exposes the org.welfare.* rules
+  + case mix.
+
+### Added — 15.03 Analytics & Health (§19)
+- `internal/analytics` service + `handler.AnalyticsHandler`: role
+  dashboards served from `dashboard_snapshots` (never a per-request
+  domain scan — build-on-miss falls back to the 30d `domain_events`
+  projection), versioned health scores, report runs, consolidation.
+  Migration 000172 adds `health_scores`, `report_runs`,
+  `dashboard_snapshots`, `kpi_definitions` + the `analytics`
+  `app_registry` row (`app.analytics` entitlement, business tier).
+- `analytics:refresh_snapshots` (@every 15m, low) rebuilds all four role
+  snapshots per org via injected section producers + the event
+  projection, one `DashboardSnapshotRefreshed` per org.
+- `analytics:health_score` (monthly, low) computes the v1 weighted
+  formula (membership .3 / attendance .3 / finance .2 / engagement .2 —
+  recorded in `components` for transparency), upserts per
+  (org, period), emits `HealthScoreCalculated` + `KPIThresholdCrossed`
+  on `kpi_definitions` breaches.
+- `analytics:monthly_report` (monthly, low) generates one report per
+  org per period (deduped via `ReportRunExists`); `RunReport` archives
+  the JSON via the documents seam (`report` kind) → `report_runs`
+  `document_id` + `MonthlyReportGenerated`/`AnnualReportGenerated`.
+  `projection_rebuild` registered as an on-demand repair task.
+- Consolidation gates on `capability.consolidation` inside the service
+  → `capability_required` (spec test 4). `/me/analytics` resolves the
+  member's memberships via the tenant seam.
+- Catalog rows added for the six §19 routes.
+
+### Added — 15.04 Assets (§18) + Projects (§20)
+- `internal/assets` service + `handler.AssetsHandler`: asset registry
+  (10 categories), term-scoped custody assignments (Rule 21),
+  maintenance records with next_due, asset audits with findings, and
+  `digital_credentials` storing ownership references only — secrets
+  stay in the secrets manager via `vault_ref` (never plaintext).
+  Migration 000173 adds `assets`, `custody_assignments`,
+  `maintenance_records`, `asset_audits`, `digital_credentials` + the
+  `assets` `app_registry` row (requires governance).
+- Custody binds the org's current `term_id`; `TermEnded` →
+  `assets.TermEndedConsumer` flags unreturned custody via
+  `CustodyHandoverFlagged` (sourced → notifies the holder/incoming
+  EXCO). `assets:handover_sweep` registered (critical, manual redrive
+  by term_id); `assets:maintenance_due` weekly (low, Mon 06:00) emits
+  `MaintenanceDue` — new catalog event — to the custodian.
+- Disposal posts finance: `AssetDisposed` →
+  `finance.AssetDisposalConsumer` writes a credit `ledger_entries` row
+  when `sold_amount_minor > 0`, deduped by `asset-sale:{id}` memo.
+- `internal/projects` service + `handler.ProjectsHandler`: proposals
+  enter `proposed`; `Approve` requires a PASSED resolution in the same
+  org (`resolution_id` edge + `entity_links` `approved_by` — written
+  inline and re-derivable by the links consumer); transitions
+  start/resume/suspend/abandon with CAS guards; activation without the
+  approval edge → `resolution_required` (spec test 1).
+- Milestones carry weights — completion recomputes
+  `projects.progress_pct` (done/total); updates are evidence posts
+  gated by cadence flag `updates_stale` from
+  `org.projects.update_interval_days`; donors record
+  `payment_id` linkage (money stays on finance's ledger); `Close`
+  generates the completion report via the documents seam +
+  `archived_as` edge + `ProjectClosed`; `/graph` returns the
+  entity_links neighbourhood; `/directory/orgs/{slug}/projects` is the
+  public showcase (active+completed, no auth, directory rate limit).
+  Migration 000174 adds `projects`, `project_milestones`,
+  `project_updates`, `vendors`, `project_donors` + the `projects`
+  `app_registry` row.
+- `entity_links` rules extended: `ProjectApproved`→`approved_by`,
+  `MilestoneCompleted`→`part_of`, `ProjectClosed`→`archived_as`.
+- Catalog rows added for the ten §18 + twelve §20 routes; the
+  `MaintenanceDue` event registered in domain-events-catalog (sourced,
+  delivered via member_notify).
+
+### Added — 15.05 Elections (§21)
+- `internal/elections` service + `handler.ElectionsHandler`: election
+  lifecycle (setup → nominations → campaign → voting → concluded →
+  ratified|annulled) electing officers for the NEXT term. Migration
+  000175 adds `elections`, `candidates`, `ballots`, `votes` + the
+  `elections` `app_registry` row (`app.elections`, professional+).
+- Voter secrecy is structural: `ballots` proves participation
+  (UNIQUE per member → `already_voted`); `votes` carry no
+  member/ballot link at all — both written in one tx under an
+  election row lock (gap-free `cast_seq`). A test asserts the schema
+  has no correlatable column.
+- Eligibility computed, never stored: `eligibility` JSONB rules
+  (min_tenure_days, categories, requires_good_standing) enforced at
+  nominate AND cast → `not_eligible` (spec test 1).
+- Nomination/vet flows write `audit_events` per transition + every
+  ballot cast (§21 audit rule; `/audit` endpoint reads them back).
+- Ratify seats winners: `SetAppoint` seam → `AppointOfficer` for the
+  elected term at its starts_at — grants activate when the term
+  becomes current (Rule 21). Tied positions stay empty + audited.
+- Sweeps: `elections:open_voting`/`close_voting` (@every 15m, default)
+  drive window transitions (NominationsOpened/VotingOpened/
+  VotingClosed + ElectionConcluded); `elections:reminders` (@every 1h)
+  emits `ElectionReminder` — new catalog event, sourced for notify.
+
+### Added — 15.06 Integrations & JapaConnect (§23)
+- `internal/integrations` service + `handler.IntegrationsHandler`:
+  connectors registry (non-secret config + `credential_ref` only —
+  secrets resolve via a secrets-manager seam), signed webhook intake,
+  sync jobs, external_event_map dedupe, tenant API keys, ICS feed,
+  JapaConnect locator join. Migration 000176 adds `connectors`,
+  `webhook_receipts`, `sync_jobs`, `external_event_map`, `api_keys` +
+  the `integrations` `app_registry` row.
+- Webhooks follow Rule 9: verify signature (paystack HMAC-SHA512 /
+  flutterwave hash / generic HMAC-SHA256 via the provider connector's
+  `credential_ref`) → persist the raw receipt → return 200 fast;
+  `integrations:webhook_process` (critical, @every 1m) drains receipts
+  and emits `ExternalEventReceived`. Bad signatures are rejected AND
+  recorded (spec test 2).
+- `api_keys`: raw `oga9_*` keys returned once, SHA-256 hash stored.
+  `middleware.APIKeyAuth` resolves `X-API-Key`/`Bearer oga9_*` before
+  session auth — revoked or invalid keys 401 immediately (spec test 4);
+  `RequireAuth` short-circuits on a pre-resolved identity.
+- JapaConnect (ADR-021): `OrganizationPublished`/`OrganizationLocationUpdated`
+  → `JapaPushConsumer` dedupes via `external_event_map` and queues
+  `sync_jobs` for the `japaconnect` connector (`OrganizationSynced`);
+  `japa_sync_reconcile` (daily, low) catches listed orgs with no
+  mapping. `/directory/orgs/{slug}` exposes the opted-in profile;
+  `/directory/orgs/{slug}/join` lands locator referrals as membership
+  applications + `MembershipRequestReceived` with the japa identity.
+- `GET /orgs/{id}/calendar.ics` renders VCALENDAR via the activities
+  seam; `integrations:ics_feed` registered (low, daily).
+- Catalog rows added for the seven §23 routes.
+
+### Added — 15.07 AI Assistant (§22)
+- `internal/ai` service + `handler.AIHandler`: conversations (persona
+  per conversation), HITL generations, usage metering. Migration
+  000177 adds `ai_conversations`, `ai_messages`, `ai_generations`,
+  `ai_usage_log` + the `ai-assistant` `app_registry` row
+  (`app.ai_assistant` capability).
+- Provider + apply + limit are injected seams — the LLM adapter is
+  unspec'd, so the default provider returns a placeholder body with
+  empty `citations` until an adapter lands (Rule 29-style degradation;
+  §22 says context assembly + citations resolve through the seam).
+- Drafts are HITL only (§22): `ai_generations` hold the draft; AI never
+  writes domain tables. approve → the `applyFn` seam lands it →
+  `applied` + `AIDraftApplied` (re-review CAS-rejects).
+- Metering: `limit.ai.requests` per plan — quota check runs OUTSIDE the
+  state tx so a hard-stop `429 ai_quota_exceeded` still persists its
+  `AIQuotaExceeded` audit event (a rejected request rolls back nothing).
+- `ai:answer`/`generate_draft`/`usage_rollup` registered (default,
+  default, low) — rollup computes the monthly meter sweep.
+- Catalog rows added for the six §22 routes.
+
+### Fixed — third-pass (deep) review findings
+- **Vote-close race**: the voting-state check ran before the row lock —
+  a close landing mid-transaction could still write votes into a
+  concluded election. The locked row's state is now rechecked inside
+  the tx (`locked.State != 'voting' → bad_election_state`).
+- **Foreign-position nominations**: `Nominate` now validates the
+  position belongs to the election's org (same class of bug as the
+  earlier vote-position fix).
+- **LLM calls inside DB transactions**: `Chat`/`Draft` ran the provider
+  round-trip inside the state tx — a 60s call pins a pooled connection
+  per request. Provider calls now run before the tx opens.
+- **Live tally leak**: `Results` had no state guard — tallies were
+  visible DURING voting. Now requires `concluded|ratified`.
+- **Ballot showed non-vetted candidates**: nominated/disqualified/
+  withdrawn candidates appeared on the member ballot (vote insert
+  rejected them, but they shouldn't render). Ballot filters to vetted.
+- **Dead dues-standing check**: `requires_good_standing` re-tested
+  `lifecycle_state` (already checked) instead of `dues_standing` —
+  `GetMembershipByID` didn't even select the column. Now checks
+  `dues_standing != 'good'`.
+- **Malformed bodies**: webhook intake now `json.Valid`s the raw body
+  (400 instead of a jsonb-insert 500); election `eligibility` JSONB
+  fails closed instead of silently matching everyone.
+- **Disabled connector still delivered**: `deliverJob` now skips
+  disabled connectors instead of POSTing.
+- **Suspended member's queued AI job ran**: `ResolveMember` requires
+  `lifecycle_state = 'active'`.
+- **Window ordering**: `Schedule` rejects `opens >= closes` and
+  `nominations >= voting_opens` instead of writing incoherent windows.
+
+### Fixed — second-pass review findings
+- **Multi-seat tally** (§21): positions with `seats > 1` now seat the
+  top-N candidates by votes; a tie at the seat cutoff leaves that seat
+  unfilled + `ratify_tie` audit instead of an arbitrary winner.
+- **Sweep audit coverage**: the scheduled transitions
+  (nominations_opened / voting_opened / voting_closed) now write
+  `audit_events` with a null system actor — §21's "every state
+  transition audited" covers sweep-driven states too.
+- **Double-annul race**: `Annul` now honors the CAS row count — a
+  concurrent transition no longer emits a second `ElectionAnnulled`.
+- **Connector override order**: `ConnectorByKind` now prefers the
+  org-specific connector over the platform fallback.
+- **AI Messages org check**: reading a conversation via a different
+  org's route now 404s like `Chat` does.
+- **Election PATCH**: malformed bodies no longer silently 200.
+- **Draft without membership**: `Draft` rejects early with
+  `bad_value` instead of an FK violation 500.
+- **Referral expiry required**: `exp <= 0` now rejects — tokens must
+  carry a positive expiry per the §23 contract.
+
+### Fixed — residual review items
+- Japa referral token verified (§23 spec amended): LocatorJoin now
+  checks `base64url(json).base64url(hmac-sha256)` against the
+  japaconnect connector's `credential_ref` — a claimed `japa_subject`
+  without a proving token is rejected; no token lands a plain
+  application with no japa link. Committed to `.oos`.
+- `ai:answer`/`ai:generate_draft` are real handlers now: the payload
+  carries org+user ids, `ResolveMember` rebuilds the OrgCtx from the
+  membership/tenant tables (never payload claims, Rule 24), then calls
+  `Chat`/`Draft` — quota, events, and usage metering all apply.
+- Webhook intake verifies against EVERY enabled connector for the
+  provider — the connector whose secret verifies is the org
+  attribution (multi-org same-provider deployments no longer depend on
+  the first connector found).
+- Re-ratify is idempotent: `AppointmentExists` skips a winner already
+  seated for that term+position+member+scope, so a retry after a
+  crash-in-window doesn't hit the seat cap.
+
+### Fixed — deep review of phase 15 implementations
+- **Nil-ctx panic**: `/me/api-keys` + `/me/ai/usage` dereferenced
+  `middleware.OrgCtx` (nil on /me routes) — panic on session auth.
+  api_keys are now user-scoped (tenant NULL); `/me/ai/usage` resolves
+  via `middleware.UserID`. Side-effect: tenant keys that could never
+  authenticate (user NULL → no RequireAuth short-circuit) are gone.
+- **AI quota semantics inverted**: `lim <= 0 → ErrQuota` treated
+  unlimited (-1, entitlements convention) as quota-exceeded — paid
+  unlimited plans could never use AI. Now `-1` = unlimited,
+  `0` = no allowance.
+- **Dead Japa push**: `JapaPushConsumer` was never registered — the
+  `OrganizationPublished`/location push path never ran. Now
+  `dispatcher.Register("japa_sync", …)`.
+- **Sync jobs stuck**: `deliverJob` looked the connector up with a NULL
+  org predicate — org-scoped connectors never matched; queued jobs
+  would have looped forever. Now `ConnectorByID` (job carries the
+  provenance).
+- **Election isolation**: `eligibility` never checked membership org —
+  a foreign-org member was nominatable; `Vote` accepted arbitrary
+  `position_id` (a nil-candidate choice could vote another org's seat).
+  Both now scoped to the election's org.
+- **Event/cas correctness**: the scheduled nominations transition
+  emitted no `NominationsOpened`; all sweep + ratify transitions
+  ignored CAS row counts (double-emit on retries). Partial PATCH on
+  election dates overwrote unset windows — now COALESCE.
+- **Reminder spam**: `elections:reminders` re-emitted hourly per
+  election per day — now deduped via a domain_events guard (one per
+  election+state per day).
+- **Nested-tx consistency**: election ratification and AI draft apply
+  ran cross-module seam writes inside the caller's tx — an outer
+  rollback after an inner commit would strand seats/applied drafts.
+  Appointments apply before the ratify tx; draft apply lands between
+  the approve and applied txs.
+- **AI conversation scope**: continuing a conversation skipped the org
+  check — now `organization_id` must match the request's org ctx.
+- **Empty ICS**: `calendar.ics` had no data seam — now renders the
+  org's real activities as VEVENTs (escaping commas/semicolons/newlines).
+
+### Fixed — post-15 review items
+- Scoped election contests (§21): `candidates.scope_unit_id`
+  (migration 000179) — a nomination is for position + optional
+  branch/committee unit; at ratify the winner's scope maps to
+  `officer_appointments.branch_id|committee_id` (hq/null → org-wide).
+  Spec edit committed to `.oos`.
+- `credential_ref` is now a real secrets contract — `internal/secrets`
+  resolves `env:VAR` and `file:/path` schemes only; raw values are
+  rejected (secrets never in DB, §23).
+- Japa push transport (ADR-021): `sync_jobs` deliver via POST to the
+  connector's `config.locator_url` with `credential_ref` bearer auth —
+  outcome recorded + `SyncFailed` on transport errors.
+- AI provider is real (§22): `internal/ai.OpenAICompat` — any
+  OpenAI-compatible `/chat/completions` endpoint via
+  `OGA9_AI_PROVIDER_URL`/`OGA9_AI_API_KEY`/`OGA9_AI_MODEL` (Ollama,
+  vLLM, hosted). Unconfigured → `503 ai_unavailable` instead of fake
+  placeholder answers.
+- `.oos` catalog edits committed (route tables §16-§23, MaintenanceDue,
+  ElectionReminder, §15/§16/§21 spec sync).
+
+### Added — 15.08 Voice Rooms (§24 verification + closes)
+- §24's voice surface was already built (migration 000158,
+  `internal/chat/voice.go` — LiveKit seam, routes under
+  `comms_documents`); this round closes the gaps:
+- `voice-rooms` staged app registered in `app_registry` (migration
+  000178) per the section's app header.
+- The three §24 sweeps were handler-registered but never scheduled —
+  now: `chat:presence_sweep` (@every 5m, default),
+  `voice:room_sweep` (@every 15m, default — orphan 'live' rooms get
+  closed + `VoiceRoomEnded`), `chat:retention_sweep` (@daily, low).
+- `internal/chat/voice_test.go`: start → join token → end →
+  participant log + non-starter end → 403 + orphan sweep.
+
 ## Phase 14 — Self-Hosted Packaging (§09)
 
 - `Dockerfile`: multi-stage build → one `oga9:{version}` image serving
@@ -52,6 +445,78 @@ entries reference engineering phases in `.oos/roadmaps/ROADMAP-BACKEND.md`.
 - Catalog annotated: rows whose producer section isn't implemented are
   RESERVED names (`DocumentRetired`, `MessageSent`, and the rest of the
   post-MVP domains emit when their phase lands).
+
+### Fixed — Phase 12–14 review
+- `OGA9_EDITION` (`cloud`|`self_hosted`, default cloud): the production
+  `OGA9_LICENSE_SIGNING_KEY` requirement now applies to the cloud edition
+  only — a self-hosted deployment verifies licenses offline with the
+  public key and must never hold signing material; `LicenseSignKey` is
+  zeroed on `self_hosted` so `IssueLicense` fails closed even if a
+  platform route were reached. Fixes the bundle api crash-looping on
+  `config: OGA9_LICENSE_SIGNING_KEY must be set in production`.
+- Self-hosted licensing is now FUNCTIONAL, not decorative: the verified
+  license file feeds `entitlements.resolve` via `SetLicenseSource` —
+  `valid`/`grace` files merge their signed `{capabilities,limits}`
+  (greater-grant, `-1` absorbing); `expired`/`invalid`/`community`
+  resolve to the plan floor (§09 degrade path enforced, not just
+  logged). `license.File` parses the canonical `{capabilities,limits}`
+  shape (`EntitlementSet`); the file is re-read on cache miss, so a
+  replaced file takes effect within the 10min entitlement TTL. Periodic
+  pull-refresh of renewed files remains manual until a deployment
+  credential endpoint lands (noted).
+- `tenant:provision` fully resumable: `organization_id` checkpoints
+  right after the org bootstrap commits (crash window closed), and a
+  reclaim adopts an already-committed org via
+  `UNIQUE(tenant_id, slug)` lookup — the earlier orphan-org /
+  slug-conflict loop is impossible. New `StaleProvisions` tick sweep
+  re-enqueues rows stuck 'processing' past the lease from their stored
+  payload (import/export redrive parity).
+- §15 scheduled downgrades: `subscriptions.scheduled_plan_slug`
+  (000169). `ChangePlan` on an active sub queues a cheaper plan and
+  emits `PlanChangeScheduled` (catalogued) instead of applying now;
+  the sweep applies it at `current_period_end` then runs the state
+  transition; `Cancel` clears the pending plan; sidegrades/trials still
+  apply immediately.
+- Tenant export completeness: `ExportChildFKs` now runs a second pass
+  over tenant-scoped parents, so unscoped join tables like
+  `user_role_assignments` (member role grants) land in the Rule-28
+  export — merged conditions dump each child once.
+- Impersonation hardening: `reason` is required (support access needs a
+  recorded justification, Rule 10); targets holding ANY platform role
+  are refused (`impersonation_denied` 403 — support access never mints
+  platform privilege); a mint failure ends the support_sessions row so
+  no phantom banner session lingers; dead `ResolveImpersonation`
+  removed (TTL enforced via `user_sessions.expires_at`).
+- `SuspendTenant`/`ReinstateTenant` are idempotent — repeated calls
+  return success without duplicate audit rows or re-emitted events.
+- Isolation suite gains members + announcements cross-tenant cases
+  (forged OrgCtx cannot list or read foreign-org rows).
+- CI `selfhost-upgrade-test` now boots the actual bundle (compose up →
+  `/health` → teardown) — the boot-time config bug above is exactly the
+  class this step exists to catch.
+- Spec sync (.oos): `PlanChangeScheduled` registered in the domain
+  events catalog; §15 test scenario 4 reworded to §07's locked
+  starter-floor semantics for `restricted`.
+
+### Fixed — Phase 12–14 review, round 2
+- `ChangePlan` to the CURRENT plan now clears a pending scheduled
+  downgrade (emits `SubscriptionChanged` with `cleared_scheduled`) —
+  before, a "stay on this plan" call left the stale schedule to fire at
+  period end. `OverrideSubscription` also NULLs `scheduled_plan_slug` —
+  an operator override must not be undercut by a queued self-serve
+  downgrade later.
+- Impersonation platform-role check fails CLOSED — a query error denied
+  implicitly by `err == nil && plat` now returns the error instead of
+  minting an unchecked support session.
+- `tenant_provisions.payload` stores the full request including the
+  server-set `RequestedBy` — a sweep-redriven provision keeps the
+  original operator in its audit rows and `TenantProvisioned` event
+  (still excluded from intent comparison).
+- `RateLimitWrites` global write tier (non-GET/HEAD, 120/min per IP)
+  wired after the read tier — writes were previously unbounded except
+  the named buckets. Sync `GET .../export` now shares the platform
+  10/min bucket — a full-tenant inline dump shouldn't be free to spam.
+- `tenant:provision` rejects negative `trial_days`.
 
 ### Fixed — Phase 10–13 review, round 2
 - Test suite used a hardcoded `localhost:5434/oga9_test` DSN — switched

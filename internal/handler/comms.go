@@ -73,7 +73,11 @@ func (h *CommsHandler) CreateAnnouncement(w http.ResponseWriter, r *http.Request
 	}
 	if !req.Draft {
 		// Rule 8: fan-out is fire-and-forget — enqueue, never block.
-		if t, err := tasks.NewDispatchTask(id); err == nil {
+		// The email channel additionally requires org.comms.broadcast —
+		// the grant is recorded on the task so async dispatch can't
+		// re-derive it after the publisher's seats change.
+		broadcast := h.org.HasPermission(r.Context(), oc.UserID, oc.OrgID, "org.comms.broadcast")
+		if t, err := tasks.NewDispatchTask(id, broadcast); err == nil {
 			_, _ = h.queue.EnqueueContext(context.WithoutCancel(r.Context()), t)
 		}
 	}
@@ -94,7 +98,8 @@ func (h *CommsHandler) PublishAnnouncement(w http.ResponseWriter, r *http.Reques
 		commsErr(w, err)
 		return
 	}
-	if t, err := tasks.NewDispatchTask(aid); err == nil {
+	broadcast := h.org.HasPermission(r.Context(), oc.UserID, oc.OrgID, "org.comms.broadcast")
+	if t, err := tasks.NewDispatchTask(aid, broadcast); err == nil {
 		_, _ = h.queue.EnqueueContext(context.WithoutCancel(r.Context()), t)
 	}
 	httpx.WriteData(w, 200, map[string]any{"id": aid, "state": "published"})

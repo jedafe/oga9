@@ -16,6 +16,7 @@ services:
     image: oga9:${OGA9_VERSION:-latest}
     environment:
       OGA9_ENV: production
+      OGA9_EDITION: self_hosted
       OGA9_DATABASE_URL: postgres://oga9:${OGA9_DB_PASSWORD}@postgres:5432/oga9?sslmode=disable
       OGA9_VALKEY_ADDR: valkey:6379
       OGA9_JWT_SECRET: ${OGA9_JWT_SECRET:?set OGA9_JWT_SECRET}

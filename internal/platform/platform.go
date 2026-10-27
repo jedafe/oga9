@@ -28,21 +28,23 @@ import (
 )
 
 var (
-	ErrNotFound          = errors.New("not found")
-	ErrBadValue          = errors.New("bad value")
-	ErrProvisionConflict = errors.New("provision_in_progress")
-	ErrProvisionMismatch = errors.New("provision_intent_mismatch")
-	ErrSessionExpired    = errors.New("support_session_expired")
+	ErrNotFound            = errors.New("not found")
+	ErrBadValue            = errors.New("bad value")
+	ErrProvisionConflict   = errors.New("provision_in_progress")
+	ErrProvisionMismatch   = errors.New("provision_intent_mismatch")
+	ErrSessionExpired      = errors.New("support_session_expired")
+	ErrImpersonationDenied = errors.New("impersonation_denied")
 )
 
 func toPg(u uuid.UUID) pgtype.UUID   { return pgtype.UUID{Bytes: u, Valid: u != uuid.Nil} }
 func fromPg(u pgtype.UUID) uuid.UUID { return uuid.UUID(u.Bytes) }
 func pgText(s string) pgtype.Text    { return pgtype.Text{String: s, Valid: s != ""} }
 
-// intentPayload serializes the client-supplied fields — RequestedBy is
-// server-set and excluded from the intent comparison.
-func intentPayload(in ProvisionRequest) []byte {
-	in.RequestedBy = uuid.Nil
+// provisionPayload serializes the request for the durable row — including
+// the server-set RequestedBy, so a sweep-redriven run keeps the original
+// operator identity for audit/events. (RequestedBy is still excluded from
+// the intent COMPARISON — see sameIntent.)
+func provisionPayload(in ProvisionRequest) []byte {
 	b, _ := json.Marshal(in)
 	return b
 }
@@ -60,6 +62,15 @@ func sameIntent(stored []byte, in ProvisionRequest) bool {
 	prior.RequestedBy = uuid.Nil
 	want := in
 	want.RequestedBy = uuid.Nil
+	// TrialDays is *int64 — a struct == would compare pointer identity,
+	// so identical replays that set trial_days would false-mismatch.
+	if (prior.TrialDays == nil) != (want.TrialDays == nil) {
+		return false
+	}
+	if prior.TrialDays != nil && *prior.TrialDays != *want.TrialDays {
+		return false
+	}
+	prior.TrialDays, want.TrialDays = nil, nil
 	return prior == want
 }
 
@@ -68,10 +79,17 @@ func sameIntent(stored []byte, in ProvisionRequest) bool {
 // tables itself).
 type OrgBootstrap func(ctx context.Context, userID uuid.UUID, name, slug, templateSlug, orgType, country, city, billingEmail string, requestedTenant uuid.UUID) (uuid.UUID, error)
 
+// TenantScaffolder prepares the new tenant for its first org — role
+// templates + permission grants, MVP app installs, and the owner's
+// org_admin assignment. Wired to tenant.ScaffoldTenant (Rule 26: role and
+// app rows belong to the tenant module).
+type TenantScaffolder func(ctx context.Context, q *db.Queries, tenantID, ownerID uuid.UUID) error
+
 type Service struct {
 	pool      *pgxpool.Pool
 	q         *db.Queries
 	boot      OrgBootstrap
+	scaffold  TenantScaffolder
 	welcomeFn WelcomeMail
 	// sessionMinter mints the impersonation JWT — wired to
 	// auth.CreateSupportSession (Rule 26: platform never writes
@@ -88,8 +106,9 @@ func NewService(pool *pgxpool.Pool) *Service {
 	return &Service{pool: pool, q: db.New(pool), trial: 14}
 }
 
-func (s *Service) SetOrgBootstrap(fn OrgBootstrap) { s.boot = fn }
-func (s *Service) SetTrialDays(d int64)            { s.trial = d }
+func (s *Service) SetOrgBootstrap(fn OrgBootstrap)         { s.boot = fn }
+func (s *Service) SetTenantScaffolder(fn TenantScaffolder) { s.scaffold = fn }
+func (s *Service) SetTrialDays(d int64)                    { s.trial = d }
 
 func (s *Service) withTx(ctx context.Context, fn func(*db.Queries) error) error {
 	tx, err := s.pool.Begin(ctx)
@@ -127,19 +146,24 @@ type ProvisionRequest struct {
 // the tenant bootstrap → TenantProvisioned. Replays return recorded ids;
 // a failed run reclaims its row for retry.
 func (s *Service) Provision(ctx context.Context, in ProvisionRequest, actor uuid.UUID) (tenantID, orgID uuid.UUID, status string, err error) {
-	if in.RequestID == "" || in.TenantName == "" || in.TenantSlug == "" || in.OrgSlug == "" || in.OwnerName == "" || in.OwnerEmail == "" {
+	// Template is required — org_templates has no generic default (the
+	// seeded set is union/social-club/alumni/cooperative/professional/
+	// religious/cda), so the operator picks one explicitly, matching
+	// self-serve POST /orgs.
+	if in.RequestID == "" || in.TenantName == "" || in.TenantSlug == "" || in.OrgSlug == "" ||
+		in.OwnerName == "" || in.OwnerEmail == "" || in.Template == "" {
+		return uuid.Nil, uuid.Nil, "", ErrBadValue
+	}
+	if in.TrialDays != nil && *in.TrialDays < 0 {
 		return uuid.Nil, uuid.Nil, "", ErrBadValue
 	}
 	if in.Edition == "" {
 		in.Edition = "cloud"
 	}
-	if in.Template == "" {
-		in.Template = "association"
-	}
 	if in.OrgName == "" {
 		in.OrgName = in.TenantName
 	}
-	row, err := s.q.CreateProvision(ctx, db.CreateProvisionParams{RequestID: in.RequestID, Payload: intentPayload(in)})
+	row, err := s.q.CreateProvision(ctx, db.CreateProvisionParams{RequestID: in.RequestID, Payload: provisionPayload(in)})
 	var resumed *db.TenantProvisions
 	// ON CONFLICT DO NOTHING RETURNING emits no row → ErrNoRows is the
 	// conflict (claim) path, not a real error.
@@ -198,7 +222,18 @@ func (s *Service) Provision(ctx context.Context, in ProvisionRequest, actor uuid
 			if in.TrialDays != nil {
 				days = *in.TrialDays
 			}
-			return billing.ProvisionTrial(ctx, q, tenantID, actor, days)
+			if err := billing.ProvisionTrial(ctx, q, tenantID, actor, days); err != nil {
+				return err
+			}
+			// §15 scaffold: role templates + MVP apps + owner org_admin —
+			// without it the bootstrap's administered-tenant gate refuses
+			// the org and every provision dies at this stage.
+			if s.scaffold != nil {
+				if err := s.scaffold(ctx, q, tenantID, userID); err != nil {
+					return err
+				}
+			}
+			return nil
 		})
 	} // end fresh-provision tx
 	if err != nil {
@@ -222,26 +257,58 @@ func (s *Service) Provision(ctx context.Context, in ProvisionRequest, actor uuid
 	if resumed != nil && resumed.OrganizationID.Valid {
 		orgID = fromPg(resumed.OrganizationID) // org committed last run too
 	} else if s.boot != nil {
-		orgID, err = s.boot(ctx, userID, in.OrgName, in.OrgSlug, in.Template,
-			in.OrgType, in.Country, in.City, in.BillingEmail, tenantID)
-		if err != nil {
-			_, _ = s.q.FinishProvision(ctx, db.FinishProvisionParams{
-				RequestID: in.RequestID, Status: "failed",
-				TenantID: toPg(tenantID), OwnerUserID: toPg(userID), Error: pgText(err.Error())})
-			return tenantID, uuid.Nil, "failed", err
+		if resumed != nil {
+			// Adopt the org a crashed run committed before checkpointing
+			// (crash between boot commit and CheckpointProvisionOrg) —
+			// (tenant_id, slug) is unique so this is never a foreign org.
+			if id, e := s.q.GetOrgIDByTenantSlug(ctx, db.GetOrgIDByTenantSlugParams{
+				TenantID: toPg(tenantID), Slug: in.OrgSlug}); e == nil {
+				orgID = fromPg(id)
+			}
+		}
+		if orgID == uuid.Nil {
+			orgID, err = s.boot(ctx, userID, in.OrgName, in.OrgSlug, in.Template,
+				in.OrgType, in.Country, in.City, in.BillingEmail, tenantID)
+			if err != nil {
+				_, _ = s.q.FinishProvision(ctx, db.FinishProvisionParams{
+					RequestID: in.RequestID, Status: "failed",
+					TenantID: toPg(tenantID), OwnerUserID: toPg(userID), Error: pgText(err.Error())})
+				return tenantID, uuid.Nil, "failed", err
+			}
+			// Checkpoint the org id NOW — the bootstrap commits outside the
+			// provision tx, so a crash before FinishProvision would otherwise
+			// leave org_id NULL and a reclaim would re-run CreateOrg into a
+			// permanent slug-conflict loop.
+			if err := s.q.CheckpointProvisionOrg(ctx, db.CheckpointProvisionOrgParams{
+				RequestID: in.RequestID, OrganizationID: toPg(orgID)}); err != nil {
+				_, _ = s.q.FinishProvision(ctx, db.FinishProvisionParams{
+					RequestID: in.RequestID, Status: "failed",
+					TenantID: toPg(tenantID), OrganizationID: toPg(orgID),
+					OwnerUserID: toPg(userID), Error: pgText(err.Error())})
+				return tenantID, orgID, "failed", err
+			}
 		}
 	}
 	err = s.withTx(ctx, func(q *db.Queries) error {
+		if orgID != uuid.Nil {
+			// §15 backref: the self-serve path sets owner_org_id inside
+			// CreateOrg's provision branch; this path must do it here.
+			if err := q.SetTenantOwnerOrg(ctx, db.SetTenantOwnerOrgParams{
+				ID: toPg(tenantID), OwnerOrgID: toPg(orgID)}); err != nil {
+				return err
+			}
+		}
 		if _, err := q.FinishProvision(ctx, db.FinishProvisionParams{
 			RequestID: in.RequestID, Status: "done", TenantID: toPg(tenantID),
 			OrganizationID: toPg(orgID), OwnerUserID: toPg(userID)}); err != nil {
 			return err
 		}
 		// §15 ordering: org + subscription exist before TenantProvisioned.
+		// plan_slug is the provisioned plan (starter trial), not the state.
 		return events.Emit(ctx, q, tenantID, orgID, "TenantProvisioned",
 			"tenant", tenantID, actor, true,
 			map[string]any{"tenant_id": tenantID, "organization_id": orgID,
-				"owner_user_id": userID, "plan_slug": "trial"})
+				"owner_user_id": userID, "plan_slug": "starter"})
 	})
 	if err != nil {
 		_, _ = s.q.FinishProvision(ctx, db.FinishProvisionParams{
@@ -257,7 +324,25 @@ func (s *Service) Provision(ctx context.Context, in ProvisionRequest, actor uuid
 	return tenantID, orgID, "done", nil
 }
 
+// StaleProvisions feeds the tick redrive — rows stuck 'processing' past
+// the claim lease (worker died mid-pipeline). The redrive re-enqueues
+// tenant:provision from the stored payload.
+func (s *Service) StaleProvisions(ctx context.Context) ([]db.TenantProvisions, error) {
+	return s.q.StaleProvisions(ctx)
+}
+
 // ---------- tenants ----------
+
+// ProvisionStatus is the operator's view of a tenant:provision run —
+// the 202 from POST /platform/tenants becomes observable (done/failed/
+// processing + the created ids).
+func (s *Service) ProvisionStatus(ctx context.Context, requestID string) (*db.TenantProvisions, error) {
+	row, err := s.q.GetProvision(ctx, requestID)
+	if err != nil {
+		return nil, ErrNotFound
+	}
+	return &row, nil
+}
 
 func (s *Service) ListTenants(ctx context.Context, status string) ([]db.ListTenantsRow, error) {
 	return s.q.ListTenants(ctx, status)
@@ -278,12 +363,15 @@ func (s *Service) SuspendTenant(ctx context.Context, tenantID uuid.UUID, reason 
 		reason = "operator_suspend"
 	}
 	return s.withTx(ctx, func(q *db.Queries) error {
-		n, err := q.SetTenantStatus(ctx, db.SetTenantStatusParams{ID: toPg(tenantID), Status: "suspended"})
+		cur, err := q.GetTenantRow(ctx, toPg(tenantID))
 		if err != nil {
-			return err
-		}
-		if n == 0 {
 			return ErrNotFound
+		}
+		if cur.Status == "suspended" {
+			return nil // idempotent — a repeat suspend emits no duplicate event/audit
+		}
+		if _, err := q.SetTenantStatus(ctx, db.SetTenantStatusParams{ID: toPg(tenantID), Status: "suspended"}); err != nil {
+			return err
 		}
 		if err := s.audit(ctx, q, tenantID, actor, "tenant.suspend", "tenant", tenantID,
 			map[string]any{"reason": reason}); err != nil {
@@ -298,12 +386,15 @@ func (s *Service) SuspendTenant(ctx context.Context, tenantID uuid.UUID, reason 
 // Reinstate reverses a suspension back to active.
 func (s *Service) ReinstateTenant(ctx context.Context, tenantID uuid.UUID, actor uuid.UUID) error {
 	return s.withTx(ctx, func(q *db.Queries) error {
-		n, err := q.SetTenantStatus(ctx, db.SetTenantStatusParams{ID: toPg(tenantID), Status: "active"})
+		cur, err := q.GetTenantRow(ctx, toPg(tenantID))
 		if err != nil {
-			return err
-		}
-		if n == 0 {
 			return ErrNotFound
+		}
+		if cur.Status == "active" {
+			return nil // idempotent — nothing to reinstate
+		}
+		if _, err := q.SetTenantStatus(ctx, db.SetTenantStatusParams{ID: toPg(tenantID), Status: "active"}); err != nil {
+			return err
 		}
 		if err := s.audit(ctx, q, tenantID, actor, "tenant.reinstate", "tenant", tenantID, nil); err != nil {
 			return err
@@ -433,6 +524,9 @@ const impersonationTTL = 30 * time.Minute
 // failed audit write aborts). TTL is fixed at 30min per §15; the returned
 // session id is what the token layer embeds for the banner.
 func (s *Service) Impersonate(ctx context.Context, operatorID, tenantID uuid.UUID, targetEmail, reason, ip, ua string) (uuid.UUID, string, time.Time, error) {
+	if strings.TrimSpace(reason) == "" {
+		return uuid.Nil, "", time.Time{}, ErrBadValue // support access needs a recorded reason (Rule 10)
+	}
 	if _, err := s.q.GetTenantRow(ctx, toPg(tenantID)); err != nil {
 		return uuid.Nil, "", time.Time{}, ErrNotFound
 	}
@@ -446,6 +540,17 @@ func (s *Service) Impersonate(ctx context.Context, operatorID, tenantID uuid.UUI
 		UserID: u.ID, TenantID: toPg(tenantID)})
 	if err != nil || !ok {
 		return uuid.Nil, "", time.Time{}, ErrNotFound
+	}
+	// a target holding ANY platform role yields platform access to the
+	// impersonating operator — support access is scoped to tenant users
+	// (§09: never a universal bypass). Refuse, don't mint privilege.
+	// Fail CLOSED: a check error denies rather than mints unchecked power.
+	plat, err := s.q.UserHasAnyPlatformRole(ctx, u.ID)
+	if err != nil {
+		return uuid.Nil, "", time.Time{}, fmt.Errorf("platform_role_check: %w", err)
+	}
+	if plat {
+		return uuid.Nil, "", time.Time{}, ErrImpersonationDenied
 	}
 	expires := time.Now().Add(impersonationTTL)
 	var sid uuid.UUID
@@ -476,17 +581,13 @@ func (s *Service) Impersonate(ctx context.Context, operatorID, tenantID uuid.UUI
 		return uuid.Nil, "", time.Time{}, errors.New("session minter not wired")
 	}
 	token, _, err := s.sessionFn(ctx, sid, fromPg(u.ID), impersonationTTL, ip, ua)
-	return sid, token, expires, err
-}
-
-// ResolveImpersonation returns the live session — expired/ended rows
-// resolve to ErrSessionExpired so the 30min TTL is enforced at read time.
-func (s *Service) ResolveImpersonation(ctx context.Context, sid uuid.UUID) (*db.SupportSessions, error) {
-	ss, err := s.q.GetSupportSession(ctx, toPg(sid))
 	if err != nil {
-		return nil, ErrSessionExpired
+		// don't leave a live support_sessions row for a token that was
+		// never minted — the banner would show a phantom session.
+		_, _ = s.q.EndSupportSession(ctx, toPg(sid))
+		return uuid.Nil, "", time.Time{}, err
 	}
-	return &ss, nil
+	return sid, token, expires, nil
 }
 
 func (s *Service) EndImpersonation(ctx context.Context, sid, actor uuid.UUID) error {
@@ -513,7 +614,7 @@ func (s *Service) EndImpersonation(ctx context.Context, sid, actor uuid.UUID) er
 			map[string]any{"session_id": sid}); err != nil {
 			return err
 		}
-		return s.audit(ctx, q, uuid.Nil, actor, "impersonation.end", "support_session", sid, nil)
+		return s.audit(ctx, q, fromPg(ss.TenantID), actor, "impersonation.end", "support_session", sid, nil)
 	})
 }
 
@@ -649,40 +750,56 @@ func (s *Service) buildExport(ctx context.Context, tenantID uuid.UUID) ([]byte, 
 			tnTables[tbl] = rows
 		}
 	}
-	// children keyed by FK to an org-scoped parent (chat_messages,
-	// minutes, attendances, document_versions, ...) — they carry no scope
-	// column, so they're joined through the parent's org instead. FKs to
-	// different org parents OR together (a sponsor edge kept by either side).
-	childFKs, err := s.q.ExportChildFKs(ctx)
-	if err != nil {
-		return nil, err
-	}
-	grouped := map[string][]db.ExportChildFKsRow{}
-	for _, fk := range childFKs {
-		grouped[fk.ChildTable] = append(grouped[fk.ChildTable], fk)
-	}
-	for tbl, fks := range grouped {
-		if _, already := orgTables[tbl]; already || !validIdent.MatchString(tbl) {
-			continue
+	// children keyed by FK to a scoped parent — they carry no scope column
+	// themselves, so they're joined through the parent's scope instead.
+	// Two passes: org-scoped parents ($1; chat_messages.channel_id,
+	// minutes.activity_id, document_versions.document_id, ...) and
+	// tenant-scoped parents ($2; user_role_assignments.role_id →
+	// user_roles.tenant_id, children of organizations.id, ...). FKs to
+	// different parents OR together (an edge kept by either side).
+	conds := map[string][]string{}
+	orgChild := map[string]bool{}
+	for _, pass := range []struct {
+		col  string
+		cond string // %s = child col, parent col, parent table
+		org  bool
+	}{
+		{"organization_id", "t.%s IN (SELECT %s FROM %s WHERE organization_id = ANY($1))", true},
+		{"tenant_id", "t.%s IN (SELECT %s FROM %s WHERE tenant_id = ANY($2))", false},
+	} {
+		fks, err := s.q.ExportChildFKs(ctx, pass.col)
+		if err != nil {
+			return nil, err
 		}
-		var conds []string
 		for _, fk := range fks {
-			if !validIdent.MatchString(fk.ChildCol) || !validIdent.MatchString(fk.ParentTable) || !validIdent.MatchString(fk.ParentCol) {
+			if !validIdent.MatchString(fk.ChildTable) || !validIdent.MatchString(fk.ChildCol) ||
+				!validIdent.MatchString(fk.ParentTable) || !validIdent.MatchString(fk.ParentCol) {
 				continue
 			}
-			conds = append(conds, fmt.Sprintf("t.%s IN (SELECT %s FROM %s WHERE organization_id = ANY($1))",
+			conds[fk.ChildTable] = append(conds[fk.ChildTable], fmt.Sprintf(pass.cond,
 				fk.ChildCol, `"`+fk.ParentCol+`"`, `"`+fk.ParentTable+`"`))
+			if pass.org {
+				orgChild[fk.ChildTable] = true
+			}
 		}
-		if len(conds) == 0 {
-			continue
+	}
+	for tbl, cs := range conds {
+		_, inOrg := orgTables[tbl]
+		_, inTn := tnTables[tbl]
+		if inOrg || inTn || len(cs) == 0 {
+			continue // directly scoped — already dumped
 		}
 		var b []byte
 		if err := s.pool.QueryRow(ctx, fmt.Sprintf(
 			`SELECT COALESCE(jsonb_agg(t),'[]'::jsonb) FROM %s t WHERE %s`,
-			`"`+tbl+`"`, strings.Join(conds, " OR ")), orgArr).Scan(&b); err != nil {
+			`"`+tbl+`"`, strings.Join(cs, " OR ")), orgArr, tnArr).Scan(&b); err != nil {
 			return nil, fmt.Errorf("export %s: %w", tbl, err)
 		}
-		orgTables[tbl] = b
+		if orgChild[tbl] {
+			orgTables[tbl] = b
+		} else {
+			tnTables[tbl] = b
+		}
 	}
 	users, err := s.q.ExportTenantUsers(ctx, toPg(tenantID))
 	if err != nil {

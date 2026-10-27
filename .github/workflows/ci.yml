@@ -122,3 +122,26 @@ jobs:
           docker run --rm --network host             -v "$PWD/db/migrations:/migrations:ro"             migrate/migrate:v4.18.3             -path /migrations             -database "postgres://oga9:oga9@localhost:5432/oga9?sslmode=disable"             up
       - name: image builds (oga9:{version})
         run: docker build -t oga9:ci-test .
+      # §14.04 release validation: the bundle must actually BOOT — a
+      # config/env mismatch (e.g. a control-plane-only required var)
+      # crashes the api on install and nothing else here would catch it.
+      - name: self-host bundle boots (install path)
+        working-directory: deploy/selfhost
+        run: |
+          cp .env.example .env
+          sed -i "s|^OGA9_VERSION=.*|OGA9_VERSION=ci-test|" .env
+          sed -i "s|^OGA9_JWT_SECRET=.*|OGA9_JWT_SECRET=$(openssl rand -hex 32)|" .env
+          sed -i "s|^OGA9_DB_PASSWORD=.*|OGA9_DB_PASSWORD=$(openssl rand -hex 16)|" .env
+          echo "OGA9_MIGRATIONS_DIR=$GITHUB_WORKSPACE/db/migrations" >> .env
+          printf '{}' > license.json
+          docker compose --env-file .env up -d
+          for i in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:8080/health && exit 0
+            sleep 2
+          done
+          docker compose --env-file .env logs api
+          exit 1
+      - name: teardown
+        if: always()
+        working-directory: deploy/selfhost
+        run: docker compose --env-file .env down -v --remove-orphans || true

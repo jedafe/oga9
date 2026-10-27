@@ -109,6 +109,26 @@ func (q *Queries) DocumentVersions(ctx context.Context, documentID pgtype.UUID) 
 	return items, nil
 }
 
+const dropLatestVersion = `-- name: DropLatestVersion :one
+DELETE FROM document_versions WHERE document_id = $1 AND version = $2
+RETURNING storage_key
+`
+
+type DropLatestVersionParams struct {
+	DocumentID pgtype.UUID `json:"document_id"`
+	Version    int32       `json:"version"`
+}
+
+// documents:process_upload recovery — a poisoned new version drops its
+// version row and reverts the head to the previous version instead of
+// deleting the whole document (good v1 survives a bad v2).
+func (q *Queries) DropLatestVersion(ctx context.Context, arg DropLatestVersionParams) (string, error) {
+	row := q.db.QueryRow(ctx, dropLatestVersion, arg.DocumentID, arg.Version)
+	var storage_key string
+	err := row.Scan(&storage_key)
+	return storage_key, err
+}
+
 const getDocument = `-- name: GetDocument :one
 SELECT id, organization_id, kind, title, storage_key, visibility, unit_id, version, uploaded_by, created_at, deleted_at FROM documents WHERE id = $1 AND organization_id = $2 AND deleted_at IS NULL
 `
@@ -180,6 +200,23 @@ func (q *Queries) InsertVersionRow(ctx context.Context, arg InsertVersionRowPara
 		arg.CreatedBy,
 	)
 	return err
+}
+
+const latestVersionRow = `-- name: LatestVersionRow :one
+SELECT version, storage_key FROM document_versions
+WHERE document_id = $1 ORDER BY version DESC LIMIT 1
+`
+
+type LatestVersionRowRow struct {
+	Version    int32  `json:"version"`
+	StorageKey string `json:"storage_key"`
+}
+
+func (q *Queries) LatestVersionRow(ctx context.Context, documentID pgtype.UUID) (LatestVersionRowRow, error) {
+	row := q.db.QueryRow(ctx, latestVersionRow, documentID)
+	var i LatestVersionRowRow
+	err := row.Scan(&i.Version, &i.StorageKey)
+	return i, err
 }
 
 const listDocuments = `-- name: ListDocuments :many
@@ -260,32 +297,39 @@ func (q *Queries) PatchDocument(ctx context.Context, arg PatchDocumentParams) (i
 }
 
 const publicDocuments = `-- name: PublicDocuments :many
-SELECT d.id, d.organization_id, d.kind, d.title, d.storage_key, d.visibility, d.unit_id, d.version, d.uploaded_by, d.created_at, d.deleted_at FROM documents d JOIN organizations o ON o.id = d.organization_id
-WHERE o.slug = $1 AND d.visibility = 'public' AND d.deleted_at IS NULL
+SELECT d.id, d.kind, d.title, d.version, d.created_at
+FROM documents d JOIN organizations o ON o.id = d.organization_id
+WHERE o.slug = $1 AND o.is_public_listed AND o.deleted_at IS NULL
+  AND d.visibility = 'public' AND d.deleted_at IS NULL
 ORDER BY d.created_at DESC
 `
 
-func (q *Queries) PublicDocuments(ctx context.Context, slug string) ([]Documents, error) {
+type PublicDocumentsRow struct {
+	ID        pgtype.UUID        `json:"id"`
+	Kind      string             `json:"kind"`
+	Title     string             `json:"title"`
+	Version   int32              `json:"version"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
+}
+
+// directory surface honors the same opt-in as /apply: an org that never
+// listed itself exposes no public docs listing (§03 opt-in). Slim
+// projection — storage_key is internal, never shipped to anonymous clients.
+func (q *Queries) PublicDocuments(ctx context.Context, slug string) ([]PublicDocumentsRow, error) {
 	rows, err := q.db.Query(ctx, publicDocuments, slug)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var items []Documents
+	var items []PublicDocumentsRow
 	for rows.Next() {
-		var i Documents
+		var i PublicDocumentsRow
 		if err := rows.Scan(
 			&i.ID,
-			&i.OrganizationID,
 			&i.Kind,
 			&i.Title,
-			&i.StorageKey,
-			&i.Visibility,
-			&i.UnitID,
 			&i.Version,
-			&i.UploadedBy,
 			&i.CreatedAt,
-			&i.DeletedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -295,6 +339,24 @@ func (q *Queries) PublicDocuments(ctx context.Context, slug string) ([]Documents
 		return nil, err
 	}
 	return items, nil
+}
+
+const revertDocumentHead = `-- name: RevertDocumentHead :exec
+UPDATE documents SET version = version - 1, storage_key = $3
+WHERE id = $1 AND organization_id = $2 AND deleted_at IS NULL
+`
+
+type RevertDocumentHeadParams struct {
+	ID             pgtype.UUID `json:"id"`
+	OrganizationID pgtype.UUID `json:"organization_id"`
+	StorageKey     string      `json:"storage_key"`
+}
+
+// point the head back at a surviving version row (called after
+// DropLatestVersion; the caller passes the previous version's key).
+func (q *Queries) RevertDocumentHead(ctx context.Context, arg RevertDocumentHeadParams) error {
+	_, err := q.db.Exec(ctx, revertDocumentHead, arg.ID, arg.OrganizationID, arg.StorageKey)
+	return err
 }
 
 const softDeleteDocument = `-- name: SoftDeleteDocument :execrows

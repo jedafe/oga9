@@ -437,17 +437,21 @@ func (q *Queries) GetMembership(ctx context.Context, arg GetMembershipParams) (G
 }
 
 const getMembershipByID = `-- name: GetMembershipByID :one
-SELECT id, organization_id, user_id, member_no, category, lifecycle_state
+SELECT id, organization_id, user_id, member_no, category, lifecycle_state,
+  dues_standing, joined_at, created_at
 FROM organization_memberships WHERE id = $1
 `
 
 type GetMembershipByIDRow struct {
-	ID             pgtype.UUID `json:"id"`
-	OrganizationID pgtype.UUID `json:"organization_id"`
-	UserID         pgtype.UUID `json:"user_id"`
-	MemberNo       pgtype.Text `json:"member_no"`
-	Category       string      `json:"category"`
-	LifecycleState string      `json:"lifecycle_state"`
+	ID             pgtype.UUID        `json:"id"`
+	OrganizationID pgtype.UUID        `json:"organization_id"`
+	UserID         pgtype.UUID        `json:"user_id"`
+	MemberNo       pgtype.Text        `json:"member_no"`
+	Category       string             `json:"category"`
+	LifecycleState string             `json:"lifecycle_state"`
+	DuesStanding   string             `json:"dues_standing"`
+	JoinedAt       pgtype.Timestamptz `json:"joined_at"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
 }
 
 func (q *Queries) GetMembershipByID(ctx context.Context, id pgtype.UUID) (GetMembershipByIDRow, error) {
@@ -460,6 +464,9 @@ func (q *Queries) GetMembershipByID(ctx context.Context, id pgtype.UUID) (GetMem
 		&i.MemberNo,
 		&i.Category,
 		&i.LifecycleState,
+		&i.DuesStanding,
+		&i.JoinedAt,
+		&i.CreatedAt,
 	)
 	return i, err
 }

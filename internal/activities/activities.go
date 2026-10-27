@@ -844,6 +844,18 @@ func (s *Service) ActivityInOrg(ctx context.Context, orgID, activityID uuid.UUID
 	return err == nil
 }
 
+// ActivitySnapshot is the Rule-26 read seam comms uses for
+// MeetingReminderDue payloads — the activities module answers, comms
+// never reads the table.
+func (s *Service) ActivitySnapshot(ctx context.Context, activityID uuid.UUID) (orgID uuid.UUID, title string, unitID uuid.UUID, startsAt time.Time, ok bool) {
+	a, err := s.q.GetActivityAny(ctx, toPg(activityID))
+	if err != nil {
+		return uuid.Nil, "", uuid.Nil, time.Time{}, false
+	}
+	return uuid.UUID(a.OrganizationID.Bytes), a.Title,
+		uuid.UUID(a.UnitID.Bytes), a.StartsAt.Time, true
+}
+
 // parseTimeOfDay validates "HH:MM" and returns the offset into the day.
 func parseTimeOfDay(s string) (time.Duration, error) {
 	t, err := time.Parse("15:04", s)

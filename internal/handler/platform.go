@@ -46,6 +46,8 @@ func platErr(w http.ResponseWriter, err error) {
 		httpx.WriteErr(w, 409, "provision_intent_mismatch", "request_id was used with a different request body")
 	case errors.Is(err, platform.ErrSessionExpired):
 		httpx.WriteErr(w, 404, "support_session_expired", "session expired or already ended")
+	case errors.Is(err, platform.ErrImpersonationDenied):
+		httpx.WriteErr(w, 403, "impersonation_denied", "target holds platform privileges — support access is tenant-scoped")
 	default:
 		log.Printf("platform: %v", err) // detail stays server-side
 		httpx.WriteErr(w, 500, "internal_error", "request failed")
@@ -62,7 +64,7 @@ func (h *PlatformHandler) CreateTenant(w http.ResponseWriter, r *http.Request) {
 		platErr(w, platform.ErrBadValue)
 		return
 	}
-	if in.RequestID == "" || in.TenantSlug == "" || in.OrgSlug == "" || in.OwnerEmail == "" {
+	if in.RequestID == "" || in.TenantSlug == "" || in.OrgSlug == "" || in.OwnerEmail == "" || in.Template == "" {
 		// request_id is the idempotency key — a missing one can never
 		// provision; reject up front instead of queuing a doomed task.
 		platErr(w, platform.ErrBadValue)
@@ -79,6 +81,18 @@ func (h *PlatformHandler) CreateTenant(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httpx.WriteData(w, 202, map[string]any{"request_id": in.RequestID, "status": "processing"})
+}
+
+// ProvisionStatus — GET /platform/provisions/{request_id}: the operator
+// polls the 202's request_id for done/failed/processing (§15 pipeline
+// observability — the durable row is the record).
+func (h *PlatformHandler) ProvisionStatus(w http.ResponseWriter, r *http.Request) {
+	row, err := h.svc.ProvisionStatus(r.Context(), chi.URLParam(r, "request_id"))
+	if err != nil {
+		platErr(w, err)
+		return
+	}
+	httpx.WriteData(w, 200, row)
 }
 
 func (h *PlatformHandler) Tenants(w http.ResponseWriter, r *http.Request) {

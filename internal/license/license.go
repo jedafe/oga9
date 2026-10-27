@@ -129,22 +129,31 @@ func (v *Validator) Check() (Status, *File, error) {
 	return StatusExpired, &f, nil
 }
 
-// Entitlement reads a capability/limit from the license entitlements —
-// the offline mirror of the entitlement service on self-host.
-func (f *File) Entitlement(key string) (int64, bool) {
-	var ents map[string]any
-	if json.Unmarshal(f.Entitlements, &ents) != nil {
-		return 0, false
+// EntitlementSet decodes the signed {capabilities,limits} grant — the same
+// shape billing stores on licenses rows and LicenseFile ships. This is the
+// offline mirror of the entitlement service merge on self-host (Rule 29).
+func (f *File) EntitlementSet() (capabilities []string, limits map[string]int64) {
+	var le struct {
+		Capabilities []string         `json:"capabilities"`
+		Limits       map[string]int64 `json:"limits"`
 	}
-	switch v := ents[key].(type) {
-	case float64:
-		return int64(v), true
-	case bool:
-		if v {
+	if json.Unmarshal(f.Entitlements, &le) != nil {
+		return nil, nil
+	}
+	return le.Capabilities, le.Limits
+}
+
+// Entitlement reads a single capability/limit from the signed file —
+// limits answer first, then capabilities (a granted cap reads as 1).
+func (f *File) Entitlement(key string) (int64, bool) {
+	caps, limits := f.EntitlementSet()
+	if v, ok := limits[key]; ok {
+		return v, true
+	}
+	for _, c := range caps {
+		if c == key {
 			return 1, true
 		}
-		return 0, true
-	default:
-		return 0, false
 	}
+	return 0, false
 }

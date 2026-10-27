@@ -17,8 +17,32 @@ SELECT * FROM tenant_provisions WHERE request_id = $1;
 -- Crash-safety checkpoint: record tenant/user ids the moment the first
 -- provision tx commits, so a stale-lease reclaim RESUMES instead of
 -- re-running the fresh tx into a slug conflict + orphan tenant.
-UPDATE tenant_provisions SET tenant_id = $2, owner_user_id = $3
+UPDATE tenant_provisions SET tenant_id = $2, owner_user_id = $3,
+  processing_started_at = now()
 WHERE request_id = $1;
+
+-- name: CheckpointProvisionOrg :exec
+-- Second crash-safety checkpoint: the org bootstrap commits OUTSIDE the
+-- provision tx, so record its id immediately — a crash before
+-- FinishProvision must let a reclaim SKIP re-running CreateOrg (a re-run
+-- dies on the slug conflict and can never complete).
+UPDATE tenant_provisions SET organization_id = $2, processing_started_at = now()
+WHERE request_id = $1;
+
+-- name: GetOrgIDByTenantSlug :one
+-- Reclaim adoption: organizations.slug is UNIQUE(tenant_id, slug), so a
+-- row found here can only be the org THIS provision's crashed run
+-- committed before it could checkpoint — never a foreign org.
+SELECT id FROM organizations WHERE tenant_id = $1 AND slug = $2;
+
+-- name: StaleProvisions :many
+-- Rows whose worker died mid-pipeline: 'processing' past the claim lease.
+-- The stored payload IS the retry unit — the redrive sweep re-enqueues
+-- tenant:provision and the claim path resumes from the checkpoints.
+SELECT * FROM tenant_provisions
+WHERE status = 'processing'
+  AND COALESCE(processing_started_at, created_at) < now() - interval '30 minutes'
+ORDER BY created_at LIMIT 100;
 
 -- name: FinishProvision :execrows
 UPDATE tenant_provisions SET status = $2, tenant_id = $3,
@@ -60,8 +84,10 @@ WHERE ($1::text = '' OR s.state = $1)
 ORDER BY s.created_at DESC LIMIT 200;
 
 -- name: OverrideSubscription :execrows
+-- Operator override wins outright — a stale scheduled_plan_slug queued by
+-- a self-serve downgrade must not fire later on top of this write.
 UPDATE subscriptions SET plan_slug = $3, state = $4,
-  grace_ends_at = COALESCE($5, grace_ends_at)
+  grace_ends_at = COALESCE($5, grace_ends_at), scheduled_plan_slug = NULL
 WHERE id = $1 AND tenant_id = $2;
 
 -- name: UpsertPlan :one
@@ -145,14 +171,14 @@ WHERE ss.target_user_id = $1 AND ss.expires_at > now() AND ss.ended_at IS NULL;
 
 -- name: ClaimProvision :one
 -- atomic retry claim — 'failed' rows reclaim; 'processing' rows whose
--- lease is older than 10min reclaim too. processing_started_at stamps
--- each claim so staleness measures from the last claim, not row creation
--- (a live worker past the window is never reclaimed mid-run).
+-- lease is older than 30min reclaim too. processing_started_at re-stamps
+-- at every pipeline checkpoint so staleness measures from the last stage
+-- commit, not row creation (a live worker mid-run is never reclaimed).
 UPDATE tenant_provisions SET status='processing', completed_at=NULL, error=NULL,
   processing_started_at=now()
 WHERE request_id=$1 AND (status='failed'
   OR (status='processing'
-      AND COALESCE(processing_started_at, created_at) < now() - interval '10 minutes'))
+      AND COALESCE(processing_started_at, created_at) < now() - interval '30 minutes'))
 RETURNING *;
 
 -- name: UserInTenant :one
@@ -213,10 +239,11 @@ SELECT COALESCE(jsonb_agg(j), '[]'::jsonb)::text FROM (
 SELECT to_jsonb(t)::text FROM tenants t WHERE t.id = $1;
 
 -- name: ExportChildFKs :many
--- org-scoped parents' children: rows keyed by FK to an org-scoped table
--- without carrying the scope column themselves (chat_messages.channel_id,
--- minutes.activity_id, document_versions.document_id, ...). Without this
--- pass the Rule-28 export silently drops them.
+-- scoped parents' children: rows keyed by FK to a scoped table without
+-- carrying the scope column themselves (chat_messages.channel_id,
+-- minutes.activity_id, user_role_assignments.role_id, ...). Run once per
+-- scope column ('organization_id', 'tenant_id') — without these passes
+-- the Rule-28 export silently drops unscoped join/child tables.
 SELECT DISTINCT
   kcu.table_name::text  AS child_table,
   kcu.column_name::text AS child_col,
@@ -230,7 +257,7 @@ JOIN information_schema.constraint_column_usage ccu
 WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_schema = 'public'
   AND ccu.table_name IN (
     SELECT table_name FROM information_schema.columns
-    WHERE table_schema = 'public' AND column_name = 'organization_id')
+    WHERE table_schema = 'public' AND column_name = sqlc.arg(scope_col)::text)
 ORDER BY 1;
 
 -- name: ExportTenantUserNotifications :one

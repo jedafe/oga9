@@ -90,9 +90,26 @@ func (s *Service) insertDoc(ctx context.Context, oc *tenant.OrgCtx, kind, title,
 		if err != nil {
 			return err
 		}
-		return events.Emit(ctx, q, oc.TenantID, oc.OrgID, "DocumentUploaded",
+		// v1 is a real version too — without its row the original blob is
+		// orphaned the moment v2 bumps documents.storage_key (§14: prior
+		// versions stay retrievable).
+		if err := q.InsertVersionRow(ctx, db.InsertVersionRowParams{
+			DocumentID: row.ID, Version: 1, StorageKey: key,
+			CreatedBy: toPg(oc.MembershipID)}); err != nil {
+			return err
+		}
+		if err := events.Emit(ctx, q, oc.TenantID, oc.OrgID, "DocumentUploaded",
 			"document", fromPg(row.ID), oc.UserID, false,
-			map[string]any{"document_id": fromPg(row.ID), "kind": kind, "title": title})
+			map[string]any{"document_id": fromPg(row.ID), "kind": kind, "title": title}); err != nil {
+			return err
+		}
+		if kind == "policy" {
+			// §14 catalog: publishing a policy document is its own event.
+			return events.Emit(ctx, q, oc.TenantID, oc.OrgID, "PolicyPublished",
+				"document", fromPg(row.ID), oc.UserID, true,
+				map[string]any{"document_id": fromPg(row.ID)})
+		}
+		return nil
 	})
 	return fromPg(row.ID), err
 }
@@ -201,16 +218,21 @@ func (s *Service) PatchDocument(ctx context.Context, oc *tenant.OrgCtx, did uuid
 	})
 }
 
-// Archive soft-deletes (Rule 11 — blob stays for the erasure task).
+// Archive soft-deletes (Rule 11 — blob stays for the erasure task) and
+// emits DocumentRetired in the same tx (Rule 12; §10 catalog).
 func (s *Service) Archive(ctx context.Context, oc *tenant.OrgCtx, did uuid.UUID) error {
-	n, err := s.q.SoftDeleteDocument(ctx, db.SoftDeleteDocumentParams{ID: toPg(did), OrganizationID: toPg(oc.OrgID)})
-	if err != nil {
-		return err
-	}
-	if n == 0 {
-		return ErrNotFound
-	}
-	return nil
+	return s.withTx(ctx, func(q *db.Queries) error {
+		n, err := q.SoftDeleteDocument(ctx, db.SoftDeleteDocumentParams{ID: toPg(did), OrganizationID: toPg(oc.OrgID)})
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return ErrNotFound
+		}
+		return events.Emit(ctx, q, oc.TenantID, oc.OrgID, "DocumentRetired",
+			"document", did, oc.UserID, false,
+			map[string]any{"document_id": did})
+	})
 }
 
 // NewVersion writes a new blob, bumps documents.version, and records the
@@ -251,13 +273,14 @@ func (s *Service) Versions(ctx context.Context, oc *tenant.OrgCtx, did uuid.UUID
 	return s.q.DocumentVersions(ctx, toPg(did))
 }
 
-func (s *Service) PublicDocs(ctx context.Context, slug string) ([]db.Documents, error) {
+func (s *Service) PublicDocs(ctx context.Context, slug string) ([]db.PublicDocumentsRow, error) {
 	return s.q.PublicDocuments(ctx, slug)
 }
 
 // ProcessUpload is the documents:process_upload body: the blob must exist
-// and be non-empty; a bad upload soft-deletes the row instead of serving
-// a broken key. (Thumbnails land with imgproxy.)
+// and be non-empty; a bad upload is REMOVED, never served — at v1 that's
+// the whole document, at v2+ only the bad version (the head reverts to
+// the previous version row, so a poisoned v2 can't kill a good v1).
 func (s *Service) ProcessUpload(ctx context.Context, docID uuid.UUID) error {
 	d, err := s.q.GetDocumentAny(ctx, toPg(docID))
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -281,11 +304,30 @@ func (s *Service) ProcessUpload(ctx context.Context, docID uuid.UUID) error {
 	defer rc.Close()
 	head := make([]byte, 512)
 	n, _ := rc.Read(head)
-	if executable(head[:n], http.DetectContentType(head[:n])) {
+	if !executable(head[:n], http.DetectContentType(head[:n])) {
+		return nil
+	}
+	badKey := d.StorageKey
+	if d.Version > 1 {
+		// drop the offending version row, revert the head to the
+		// surviving latest version — the prior version stays retrievable.
+		if _, err := s.q.DropLatestVersion(ctx, db.DropLatestVersionParams{
+			DocumentID: d.ID, Version: d.Version}); err != nil {
+			return err
+		}
+		prev, err := s.q.LatestVersionRow(ctx, d.ID)
+		if err != nil {
+			return err
+		}
+		if err := s.q.RevertDocumentHead(ctx, db.RevertDocumentHeadParams{
+			ID: d.ID, OrganizationID: d.OrganizationID, StorageKey: prev.StorageKey}); err != nil {
+			return err
+		}
+	} else {
 		_, _ = s.q.SoftDeleteDocument(ctx, db.SoftDeleteDocumentParams{
 			ID: d.ID, OrganizationID: d.OrganizationID})
-		_ = s.store.Remove(ctx, d.StorageKey)
 	}
+	_ = s.store.Remove(ctx, badKey)
 	return nil
 }
 

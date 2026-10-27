@@ -17,6 +17,7 @@ import (
 
 type Config struct {
 	Env                  string
+	Edition              string // cloud|self_hosted — §09 one codebase, two editions
 	DatabaseURL          string
 	ValkeyAddr           string
 	JWTSecret            string
@@ -31,9 +32,13 @@ type Config struct {
 	LiveKitAPISecret     string
 	VoiceJoinWindowSec   int
 	VoiceRoomMaxAgeHours int
-	TrialDays            int // §15 default provision trial length (operator may override per request)
-	SessionTTL           time.Duration
-	OutboxInterval       time.Duration // events:dispatch_outbox cadence (§05)
+	// §22 ai — OpenAI-compatible provider endpoint (empty = unavailable).
+	AIProviderURL   string
+	AIProviderKey   string
+	AIProviderModel string
+	TrialDays       int // §15 default provision trial length (operator may override per request)
+	SessionTTL      time.Duration
+	OutboxInterval  time.Duration // events:dispatch_outbox cadence (§05)
 	// §08 job queue cadences
 	SchedulerTickInterval   time.Duration // scheduler:tick cron driver
 	RetryDeadInterval       time.Duration // events:retry_dead DLQ re-drive
@@ -71,6 +76,7 @@ func Load() (*Config, error) {
 	var errs []error
 	cfg := &Config{
 		Env:                     env("OGA9_ENV", "development"),
+		Edition:                 env("OGA9_EDITION", "cloud"),
 		DatabaseURL:             reqEnv(&errs, "OGA9_DATABASE_URL"),
 		ValkeyAddr:              reqEnv(&errs, "OGA9_VALKEY_ADDR"),
 		JWTSecret:               reqEnv(&errs, "OGA9_JWT_SECRET"),
@@ -86,6 +92,9 @@ func Load() (*Config, error) {
 		LiveKitAPISecret:        env("OGA9_LIVEKIT_API_SECRET", ""),
 		VoiceJoinWindowSec:      envInt(&errs, "OGA9_VOICE_JOIN_WINDOW_SEC", 300),
 		VoiceRoomMaxAgeHours:    envInt(&errs, "OGA9_VOICE_ROOM_MAX_AGE_HOURS", 12),
+		AIProviderURL:           env("OGA9_AI_PROVIDER_URL", ""),
+		AIProviderKey:           env("OGA9_AI_API_KEY", ""),
+		AIProviderModel:         env("OGA9_AI_MODEL", "llama3"),
 		TrialDays:               envInt(&errs, "OGA9_TRIAL_DAYS", 14),
 		LicenseFile:             env("OGA9_LICENSE_FILE", ""),
 		LicensePublicKey:        env("OGA9_LICENSE_PUBLIC_KEY", ""),
@@ -122,12 +131,24 @@ func Load() (*Config, error) {
 	}
 	cfg.DataKey = dataKey(env("OGA9_DATA_ENCRYPTION_KEY", ""), cfg.JWTSecret)
 	cfg.LicenseSignKey = licenseSeed(env("OGA9_LICENSE_SIGNING_KEY", ""), cfg.JWTSecret)
+	if cfg.Edition == "self_hosted" {
+		// defense in depth (Rule 29): even if an env var were set, a
+		// self-hosted deployment never signs — IssueLicense fails
+		// license_signing_unconfigured.
+		cfg.LicenseSignKey = nil
+	}
 	cfg.WebhookSecret = []byte(env("OGA9_BILLING_WEBHOOK_SECRET", "")) // empty → endpoint rejects providers
+	if cfg.Edition != "cloud" && cfg.Edition != "self_hosted" {
+		errs = append(errs, fmt.Errorf("OGA9_EDITION must be cloud or self_hosted, got %q", cfg.Edition))
+	}
 	if cfg.JWTSecret == "change-me" && cfg.Env == "production" {
 		errs = append(errs, errors.New("OGA9_JWT_SECRET must be set in production"))
 	}
-	if cfg.Env == "production" && env("OGA9_LICENSE_SIGNING_KEY", "") == "" {
-		errs = append(errs, errors.New("OGA9_LICENSE_SIGNING_KEY must be set in production"))
+	// The signing key is control-plane material (§09): only the cloud
+	// edition signs licenses. A self-hosted deployment must NEVER hold it —
+	// it verifies the signed file offline with the public key (Rule 29).
+	if cfg.Env == "production" && cfg.Edition == "cloud" && env("OGA9_LICENSE_SIGNING_KEY", "") == "" {
+		errs = append(errs, errors.New("OGA9_LICENSE_SIGNING_KEY must be set in production (cloud edition)"))
 	}
 	if cfg.JWTSecret == "" {
 		errs = append(errs, errors.New("OGA9_JWT_SECRET is empty"))

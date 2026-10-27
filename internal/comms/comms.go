@@ -36,6 +36,20 @@ type Service struct {
 	store      *storage.Store
 	limitFn    func(ctx context.Context, tenantID uuid.UUID, key string) int64
 	fallbackMB int64 // used when no plan limit resolves (dev/new plans)
+	// Rule-26 read seams — comms never reads activities/finance tables;
+	// the owning modules answer through these (wired in main).
+	activityInfo func(ctx context.Context, activityID uuid.UUID) (orgID uuid.UUID, title string, unitID uuid.UUID, startsAt time.Time, ok bool)
+	paymentInfo  func(ctx context.Context, paymentID uuid.UUID) (membershipID uuid.UUID, amountMinor int64, currency string, ok bool)
+}
+
+// SetActivityInfo wires the activities snapshot seam (Rule 26).
+func (s *Service) SetActivityInfo(fn func(ctx context.Context, activityID uuid.UUID) (orgID uuid.UUID, title string, unitID uuid.UUID, startsAt time.Time, ok bool)) {
+	s.activityInfo = fn
+}
+
+// SetPaymentInfo wires the finance snapshot seam (Rule 26).
+func (s *Service) SetPaymentInfo(fn func(ctx context.Context, paymentID uuid.UUID) (membershipID uuid.UUID, amountMinor int64, currency string, ok bool)) {
+	s.paymentInfo = fn
 }
 
 // SetLimitFn wires the entitlement-limit lookup (Rule 25) — upload size
@@ -218,10 +232,12 @@ type EmailTarget struct {
 
 // DispatchAnnouncement is the notifications:dispatch worker body: resolve
 // the audience snapshot, gate per-user on preferences, insert in_app rows
-// (deduped — a retried fan-out never double-notifies). Returns the
-// notification-id+address pairs the worker fans out as notifications:email
-// tasks (Rule 8).
-func (s *Service) DispatchAnnouncement(ctx context.Context, announcementID uuid.UUID) ([]EmailTarget, error) {
+// (deduped — a retried fan-out never double-notifies). allowEmail is the
+// publisher's org.comms.broadcast grant recorded at publish time — the
+// email channel fans out only for broadcast-capable publishers (§14 node).
+// Returns the notification-id+address pairs the worker fans out as
+// notifications:email tasks (Rule 8).
+func (s *Service) DispatchAnnouncement(ctx context.Context, announcementID uuid.UUID, allowEmail bool) ([]EmailTarget, error) {
 	a, err := s.q.GetAnnouncement(ctx, toPg(announcementID))
 	if err != nil {
 		return nil, ErrNotFound
@@ -243,26 +259,51 @@ func (s *Service) DispatchAnnouncement(ctx context.Context, announcementID uuid.
 	if err != nil {
 		return nil, err
 	}
-	var tenantID uuid.UUID
-	if t, err := s.q.GetOrgTenantID(ctx, a.OrganizationID); err == nil {
-		tenantID = fromPg(t)
+	userIDs := make([]pgtype.UUID, len(users))
+	for i, r := range users {
+		userIDs[i] = r.UserID
 	}
-	sent := 0
+	// batch the per-recipient lookups — 2 queries, not 5·N inside the tx.
+	prefs, err := s.q.NotifPrefsForUsers(ctx, db.NotifPrefsForUsersParams{
+		Kind: "announcement", Column2: userIDs})
+	if err != nil {
+		return nil, err
+	}
+	existing, err := s.q.NotifExistingByRef(ctx, db.NotifExistingByRefParams{
+		Kind: "announcement", RefID: a.ID, Column3: userIDs})
+	if err != nil {
+		return nil, err
+	}
+	// absent pref row = enabled (NotificationWanted semantics).
+	prefOn := map[[2]string]bool{}
+	for _, p := range prefs {
+		key := [2]string{uuid.UUID(p.UserID.Bytes).String(), p.Channel}
+		prefOn[key] = p.Enabled
+	}
+	haveInApp := map[string]bool{}
+	var emailRow map[string]db.NotifExistingByRefRow = map[string]db.NotifExistingByRefRow{}
+	for _, n := range existing {
+		uid := uuid.UUID(n.UserID.Bytes).String()
+		if n.Channel == "in_app" {
+			haveInApp[uid] = true
+		} else if n.Channel == "email" {
+			emailRow[uid] = n
+		}
+	}
+	tenantID, err := func() (uuid.UUID, error) {
+		t, err := s.q.GetOrgTenantID(ctx, a.OrganizationID)
+		return fromPg(t), err
+	}()
+	if err != nil {
+		return nil, err
+	}
 	emails := make([]EmailTarget, 0, len(users))
 	err = s.withTx(ctx, func(q *db.Queries) error {
 		for _, r := range users {
-			ok, err := q.NotificationWanted(ctx, db.NotificationWantedParams{
-				UserID: r.UserID, Kind: "announcement", Channel: "in_app"})
-			if err != nil {
-				return err
-			}
-			if b, isBool := ok.(bool); isBool && !b {
+			uid := uuid.UUID(r.UserID.Bytes).String()
+			if off, set := prefOn[[2]string{uid, "in_app"}]; set && !off {
 				// in_app off — email may still be on; handled below
-			} else {
-				if exists, err := q.NotificationExists(ctx, db.NotificationExistsParams{
-					UserID: r.UserID, Kind: "announcement", RefID: a.ID, Channel: "in_app"}); err == nil && exists {
-					goto emailCheck // already notified in_app — still allow email
-				}
+			} else if !haveInApp[uid] {
 				if _, err := q.CreateNotification(ctx, db.CreateNotificationParams{
 					UserID: r.UserID, OrganizationID: a.OrganizationID, Kind: "announcement",
 					Title: a.Title, Body: pgtype.Text{String: a.Body, Valid: true},
@@ -270,51 +311,48 @@ func (s *Service) DispatchAnnouncement(ctx context.Context, announcementID uuid.
 					RefID:   a.ID, Channel: "in_app"}); err != nil {
 					return err
 				}
-				sent++
 			}
-		emailCheck:
+			if !allowEmail {
+				continue // announce != broadcast: in_app only (§14 nodes)
+			}
 			// email channel is a separate preference — opted-in members get
 			// a notifications:email fan-out (delivered_at set by the sender).
-			ew, err := q.NotificationWanted(ctx, db.NotificationWantedParams{
-				UserID: r.UserID, Kind: "announcement", Channel: "email"})
+			if off, set := prefOn[[2]string{uid, "email"}]; set && !off || r.Email == "" {
+				continue
+			}
+			// a channel='email' row tracks delivery — delivered_at is
+			// stamped by the notifications:email worker after send.
+			if row, ok := emailRow[uid]; ok {
+				if !row.DeliveredAt.Valid {
+					// row exists but the email task never landed/succeeded —
+					// re-enqueue with the REAL id so delivery still tracks.
+					emails = append(emails, EmailTarget{NotificationID: fromPg(row.ID), To: r.Email})
+				}
+				continue
+			}
+			row, err := q.CreateNotification(ctx, db.CreateNotificationParams{
+				UserID: r.UserID, OrganizationID: a.OrganizationID, Kind: "announcement",
+				Title: a.Title, Body: pgtype.Text{String: a.Body, Valid: true},
+				RefType: pgtype.Text{String: "announcement", Valid: true},
+				RefID:   a.ID, Channel: "email"})
 			if err != nil {
 				return err
 			}
-			if b, isBool := ew.(bool); isBool && b && r.Email != "" {
-				// a channel='email' row tracks delivery — delivered_at is
-				// stamped by the notifications:email worker after send.
-				var nid pgtype.UUID
-				state, err := q.GetNotificationChannel(ctx, db.GetNotificationChannelParams{
-					UserID: r.UserID, Kind: "announcement", RefID: a.ID, Channel: "email"})
-				switch {
-				case errors.Is(err, pgx.ErrNoRows):
-					// fresh recipient — create the tracking row + enqueue.
-					row, err := q.CreateNotification(ctx, db.CreateNotificationParams{
-						UserID: r.UserID, OrganizationID: a.OrganizationID, Kind: "announcement",
-						Title: a.Title, Body: pgtype.Text{String: a.Body, Valid: true},
-						RefType: pgtype.Text{String: "announcement", Valid: true},
-						RefID:   a.ID, Channel: "email"})
-					if err != nil {
-						return err
-					}
-					nid = row.ID
-				case err != nil:
-					return err
-				case !state.DeliveredAt.Valid:
-					// row exists but the email task never landed/succeeded —
-					// re-enqueue with the REAL id so delivery still tracks.
-					nid = state.ID
-				}
-				if nid.Valid {
-					emails = append(emails, EmailTarget{NotificationID: fromPg(nid), To: r.Email})
-				}
-			}
+			emails = append(emails, EmailTarget{NotificationID: fromPg(row.ID), To: r.Email})
 		}
 		return events.Emit(ctx, q, tenantID, fromPg(a.OrganizationID), "BroadcastQueued",
 			"announcement", fromPg(a.ID), uuid.Nil, false,
-			map[string]any{"announcement_id": fromPg(a.ID), "recipients": sent})
+			map[string]any{"announcement_id": fromPg(a.ID), "recipients": len(users)})
 	})
 	return emails, err
+}
+
+// StaleEmailRefs — channel='email' rows that never reached delivered_at
+// past the grace window (enqueue loss / worker died between commit and
+// fan-out). The redrive sweep re-enqueues them; the row is durable so
+// nothing is lost (Rule 27).
+func (s *Service) StaleEmailRefs(ctx context.Context) ([]db.StaleEmailNotificationsRow, error) {
+	return s.q.StaleEmailNotifications(ctx)
 }
 
 func textPtr(s *string) pgtype.Text { // nil → invalid (keep existing)
@@ -347,8 +385,13 @@ func (s *Service) EmailBody(ctx context.Context, announcementID uuid.UUID) strin
 // MinutesArchived. Payload-driven: the event carries body/title/unit —
 // this module never reads activities tables (Rule 26).
 func (s *Service) MinutesArchivedConsumer(ctx context.Context, q *db.Queries, e events.Event) error {
-	if e.Type != "MinutesApproved" || s.store == nil {
+	if e.Type != "MinutesApproved" {
 		return nil
+	}
+	if s.store == nil {
+		// a nil store is a wiring bug — fail loudly (retry→DLQ) rather
+		// than silently dropping approved minutes.
+		return errors.New("comms: store not wired")
 	}
 	mid := e.AggregateID
 	if v, ok := e.Payload["minutes_id"].(string); ok {
@@ -388,6 +431,10 @@ func (s *Service) MinutesArchivedConsumer(ctx context.Context, q *db.Queries, e 
 		StorageKey: key, Visibility: "members",
 		UnitID: unit, UploadedBy: approver})
 	if err != nil {
+		return err
+	}
+	if err := q.InsertVersionRow(ctx, db.InsertVersionRowParams{
+		DocumentID: row.ID, Version: 1, StorageKey: key, CreatedBy: approver}); err != nil {
 		return err
 	}
 	return events.Emit(ctx, q, e.TenantID, e.OrganizationID, "MinutesArchived",
@@ -482,23 +529,23 @@ func (s *Service) EventNotifyConsumer(ctx context.Context, q *db.Queries, e even
 	case "MeetingReminderDue":
 		// fan out to the meeting's audience (unit-scoped or org-wide).
 		v, ok := e.Payload["activity_id"].(string)
-		if !ok {
+		if !ok || s.activityInfo == nil {
 			return nil
 		}
 		aid, err := uuid.Parse(v)
 		if err != nil {
 			return nil
 		}
-		a, err := q.GetActivityAny(ctx, toPg(aid))
-		if err != nil {
+		orgID, title, unitID, startsAt, ok := s.activityInfo(ctx, aid)
+		if !ok {
 			return nil
 		}
 		users, err := q.MeetingAudienceUserIDs(ctx, db.MeetingAudienceUserIDsParams{
-			OrganizationID: a.OrganizationID, Column2: a.UnitID})
+			OrganizationID: toPg(orgID), Column2: toPg(unitID)})
 		if err != nil {
 			return err
 		}
-		body := fmt.Sprintf("%s starts %s", a.Title, a.StartsAt.Time.Format("2006-01-02 15:04"))
+		body := fmt.Sprintf("%s starts %s", title, startsAt.Format("2006-01-02 15:04"))
 		for _, uid := range users {
 			// ref = event id: a rescheduled meeting re-arms the reminder and
 			// its new event must notify again (activity-ref would suppress it).
@@ -510,25 +557,25 @@ func (s *Service) EventNotifyConsumer(ctx context.Context, q *db.Queries, e even
 		return nil
 	case "ReceiptIssued":
 		v, ok := e.Payload["payment_id"].(string)
-		if !ok {
+		if !ok || s.paymentInfo == nil {
 			return nil
 		}
 		pid, err := uuid.Parse(v)
 		if err != nil {
 			return nil
 		}
-		p, err := q.GetPaymentAny(ctx, toPg(pid))
-		if err != nil {
+		memberID, amount, currency, ok := s.paymentInfo(ctx, pid)
+		if !ok {
 			return nil // payment row gone
 		}
-		m, err := q.GetMembershipByID(ctx, p.MembershipID)
+		m, err := q.GetMembershipByID(ctx, toPg(memberID))
 		if err != nil {
 			return nil
 		}
 		return s.notifyOnce(ctx, q, e, fromPg(m.UserID), "payment_receipt",
 			"Payment receipt issued",
-			fmt.Sprintf("%d %s confirmed", p.AmountMinor, p.Currency),
-			"payment", p.ID)
+			fmt.Sprintf("%d %s confirmed", amount, currency),
+			"payment", toPg(pid))
 	case "MinutesApproved":
 		// approved minutes are org-visible governance — notify the roster.
 		var ref pgtype.UUID

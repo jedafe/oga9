@@ -185,6 +185,10 @@ func (s *Service) CreateTerm(ctx context.Context, oc *OrgCtx, label string, star
 // AppointOfficer — term-scoped appointment (Rule 21). Emits LeaderAppointed
 // (catalogued) and invalidates the appointee's perm cache (Rule 6).
 func (s *Service) AppointOfficer(ctx context.Context, oc *OrgCtx, termID, positionID, memberID, branchID, committeeID uuid.UUID, startsAt time.Time) (uuid.UUID, error) {
+	// starts_at is a DATE column — normalize to UTC so the written date
+	// matches CURRENT_DATE comparisons (ScopedPositionNodes); a host-local
+	// datetime can otherwise store "tomorrow" and defer the grants.
+	startsAt = startsAt.UTC()
 	var id uuid.UUID
 	var appointee uuid.UUID
 	err := s.withTx(ctx, func(q *db.Queries) error {
@@ -322,6 +326,56 @@ func (s *Service) CloseTerm(ctx context.Context, oc *OrgCtx, termID uuid.UUID) e
 		s.InvalidatePermCache(ctx, u, oc.OrgID)
 	}
 	return err
+}
+
+// CloseExpiredTerms is the governance:term_transitions sweep work (§16):
+// terms whose ends_at passed but are still 'current' get the full close
+// treatment — appointments ended, grants revoked, caches invalidated —
+// with a system actor (no OrgCtx exists outside a request).
+func (s *Service) CloseExpiredTerms(ctx context.Context) (int, error) {
+	rows, err := s.q.ExpiredCurrentTerms(ctx)
+	if err != nil {
+		return 0, err
+	}
+	var closed int
+	for _, t := range rows {
+		orgID, termID := fromPg(t.OrganizationID), fromPg(t.ID)
+		tenantID, err := s.q.OrgTenantID(ctx, t.OrganizationID)
+		if err != nil {
+			return closed, err
+		}
+		var appointees []uuid.UUID
+		err = s.withTx(ctx, func(q *db.Queries) error {
+			if _, err := q.CloseTerm(ctx, db.CloseTermParams{ID: t.ID, OrgID: t.OrganizationID}); err != nil {
+				return err
+			}
+			ended, err := q.EndTermAppointments(ctx, t.ID)
+			if err != nil {
+				return err
+			}
+			for _, ap := range ended {
+				m, err := q.GetMembershipByID(ctx, ap.MemberID)
+				if err != nil {
+					return err
+				}
+				appointees = append(appointees, fromPg(m.UserID))
+				if err := events.Emit(ctx, q, fromPg(tenantID), orgID, "AppointmentEnded", "officer_appointment", fromPg(ap.ID), uuid.Nil, true,
+					map[string]any{"appointment_id": fromPg(ap.ID), "term_id": termID, "org_id": orgID}); err != nil {
+					return err
+				}
+			}
+			return events.Emit(ctx, q, fromPg(tenantID), orgID, "TermEnded", "term", termID, uuid.Nil, true,
+				map[string]any{"term_id": termID, "org_id": orgID, "reason": "expired"})
+		})
+		if err != nil {
+			return closed, err
+		}
+		for _, u := range appointees {
+			s.InvalidatePermCache(ctx, u, orgID)
+		}
+		closed++
+	}
+	return closed, nil
 }
 
 // AddCommitteeMember / RemoveCommitteeMember — Rule 6 triggers.

@@ -44,6 +44,17 @@ var linkRules = map[string][]linkRule{
 	"MinutesArchived": {
 		{SourceType: "minutes", TargetType: "document", TargetKey: "document_id", Rel: "archived_as"},
 	},
+	// §20 projects: the approval edge → the passed resolution; milestones
+	// roll up to their project; the close archives the completion report.
+	"ProjectApproved": {
+		{SourceType: "project", TargetType: "resolution", TargetKey: "resolution_id", Rel: "approved_by"},
+	},
+	"MilestoneCompleted": {
+		{SourceType: "milestone", TargetType: "project", TargetKey: "project_id", Rel: "part_of"},
+	},
+	"ProjectClosed": {
+		{SourceType: "project", TargetType: "document", TargetKey: "document_id", Rel: "archived_as"},
+	},
 }
 
 // EntityLinksConsumer writes edges for events matching linkRules. Writes

@@ -36,7 +36,7 @@ func TestCheckRoundTrip(t *testing.T) {
 		want  Status
 	}{
 		{"valid", &File{DeploymentID: "dep-1", Edition: "business",
-			Entitlements: json.RawMessage(`{"app.events_meetings":1,"limit.storage.mb":10240}`),
+			Entitlements: json.RawMessage(`{"capabilities":["app.events_meetings"],"limits":{"limit.storage.mb":10240}}`),
 			ExpiresAt:    time.Now().Add(72 * time.Hour)}, 30, StatusValid},
 		{"grace", &File{DeploymentID: "dep-1", Edition: "business",
 			ExpiresAt: time.Now().Add(-24 * time.Hour)}, 30, StatusGrace},
@@ -91,7 +91,7 @@ func TestCheckTamperedAndMissing(t *testing.T) {
 }
 
 func TestEntitlement(t *testing.T) {
-	f := &File{Entitlements: json.RawMessage(`{"limit.storage.mb":10240,"app.events_meetings":true}`)}
+	f := &File{Entitlements: json.RawMessage(`{"capabilities":["app.events_meetings"],"limits":{"limit.storage.mb":10240}}`)}
 	if v, ok := f.Entitlement("limit.storage.mb"); !ok || v != 10240 {
 		t.Fatalf("limit: %v %v", v, ok)
 	}
