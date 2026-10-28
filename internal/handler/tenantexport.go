@@ -85,7 +85,7 @@ func (h *TenantExportHandler) Create(w http.ResponseWriter, r *http.Request) {
 		PostState          string `json:"post_state"`
 		ExportPassphrase   string `json:"export_passphrase"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
 		httpx.WriteErr(w, 400, "invalid_json", "request body is not valid JSON")
 		return
 	}

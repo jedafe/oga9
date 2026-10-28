@@ -197,14 +197,19 @@ func (s *Service) buildBundle(ctx context.Context, tenantID uuid.UUID, opts Expo
 	if json.Unmarshal(json.RawMessage(inbound), &inb) == nil && len(inb) > 0 {
 		w.AddDroppedExternal("organization_relationships(inbound)", json.RawMessage(inbound))
 	}
-	// blob files referenced by storage_key/file_key columns.
+	// blob files referenced by storage_key/file_key columns — Stat gives
+	// the tar header its size so content streams through.
 	if s.store != nil {
 		for _, key := range collectBlobKeys(d.tnTables, d.orgTables) {
-			rc, err := s.store.Open(ctx, key)
+			size, err := s.store.Stat(ctx, key)
 			if err != nil {
 				continue // blob missing — rows still reference the key
 			}
-			_ = w.AddBlob(key, rc)
+			rc, err := s.store.Open(ctx, key)
+			if err != nil {
+				continue
+			}
+			_ = w.AddBlob(key, size, rc)
 			rc.Close()
 		}
 	}

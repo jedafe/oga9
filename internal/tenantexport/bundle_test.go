@@ -26,7 +26,7 @@ func buildTestBundle(t *testing.T, priv ed25519.PrivateKey) []byte {
 	if err := w.AddJSONL("organizations", json.RawMessage(`[{"id":"a"},{"id":"b"}]`)); err != nil {
 		t.Fatal(err)
 	}
-	if err := w.AddBlob("blobkey", bytes.NewReader([]byte("blob-content"))); err != nil {
+	if err := w.AddBlob("blobkey", 12, bytes.NewReader([]byte("blob-content"))); err != nil {
 		t.Fatal(err)
 	}
 	w.AddDroppedExternal("organization_relationships", json.RawMessage(`[{"related_org_id":"ext"}]`))

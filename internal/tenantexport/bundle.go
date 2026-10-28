@@ -109,13 +109,21 @@ func (w *Writer) AddJSONL(table string, rows json.RawMessage) error {
 	return w.add("data/"+table+".jsonl", buf, len(objs))
 }
 
-// AddBlob writes a blob-storage object as files/<key>.
-func (w *Writer) AddBlob(key string, r io.Reader) error {
-	data, err := io.ReadAll(r)
-	if err != nil {
+// AddBlob writes a blob-storage object as files/<key>, streaming the
+// content through the sha256 — large blobs never buffer in memory.
+func (w *Writer) AddBlob(key string, size int64, r io.Reader) error {
+	path := "files/" + key
+	h := sha256.New()
+	if err := w.tw.WriteHeader(&tar.Header{Name: path, Mode: 0o644, Size: size}); err != nil {
 		return err
 	}
-	return w.add("files/"+key, data, 0)
+	if _, err := io.Copy(w.tw, io.TeeReader(r, h)); err != nil {
+		return err
+	}
+	w.manifest.Entries = append(w.manifest.Entries, ManifestEntry{
+		Path: path, SHA256: hex.EncodeToString(h.Sum(nil)), Bytes: size,
+	})
+	return nil
 }
 
 // AddDroppedExternal records rows excluded for cross-tenant integrity.

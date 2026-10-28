@@ -12,6 +12,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/ed25519"
 	"encoding/hex"
@@ -167,11 +168,7 @@ func runImport(args []string) error {
 			log.Printf("skip %s — table not present in this schema version", table)
 			return nil
 		}
-		data, err := io.ReadAll(r)
-		if err != nil {
-			return err
-		}
-		n, err := insertJSONL(ctx, tx, table, data, colSets[table])
+		n, err := insertJSONL(ctx, tx, table, r, colSets[table])
 		inserted[table] += n
 		return err
 	})
@@ -188,6 +185,14 @@ func runImport(args []string) error {
 	if _, err := tx.Exec(ctx,
 		"UPDATE domain_events SET published_at = now() WHERE published_at IS NULL"); err != nil {
 		return err
+	}
+	if m.IncludeCredentials {
+		var mfa int
+		_ = tx.QueryRow(ctx,
+			"SELECT count(*) FROM users WHERE mfa_secret IS NOT NULL").Scan(&mfa)
+		if mfa > 0 {
+			log.Printf("warning: %d users carry MFA secrets — they only decrypt under the source install's OGA9_DATA_ENCRYPTION_KEY; use the same key here or affected users must reset MFA", mfa)
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return err
@@ -260,7 +265,8 @@ func listTables(ctx context.Context, tx pgx.Tx) (map[string]bool, map[string]map
 // rows actually carry — a credential-free projection omits columns like
 // password_hash on purpose, and explicit NULLs would defeat NOT NULL
 // defaults (mfa_recovery_codes …) or violate constraints outright.
-func insertJSONL(ctx context.Context, tx pgx.Tx, table string, data []byte, cols map[string]bool) (int64, error) {
+// Rows stream line-by-line — a table file is never held whole in memory.
+func insertJSONL(ctx context.Context, tx pgx.Tx, table string, data io.Reader, cols map[string]bool) (int64, error) {
 	var batch []json.RawMessage
 	var total int64
 	flush := func() error {
@@ -305,8 +311,10 @@ func insertJSONL(ctx context.Context, tx pgx.Tx, table string, data []byte, cols
 		batch = batch[:0]
 		return nil
 	}
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
+	sc := bufio.NewScanner(data)
+	sc.Buffer(make([]byte, 1<<20), 64<<20)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
 		if line == "" {
 			continue
 		}
@@ -316,6 +324,9 @@ func insertJSONL(ctx context.Context, tx pgx.Tx, table string, data []byte, cols
 				return total, err
 			}
 		}
+	}
+	if err := sc.Err(); err != nil {
+		return total, err
 	}
 	return total, flush()
 }
