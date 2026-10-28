@@ -70,7 +70,7 @@ func TestCustodyTermFlag(t *testing.T) {
 	ctx := context.Background()
 	oc, termID := mk(t, pool)
 
-	aid, err := svc.Register(ctx, oc, "vehicle", "Bus", "", "LAG-123", "", time.Time{}, 0, "NGN", uuid.Nil)
+	aid, err := svc.Register(ctx, oc, "vehicle", "Bus", "", "LAG-123", "", time.Time{}, 0, "NGN", uuid.Nil, oc.MembershipID, uuid.Nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -104,7 +104,7 @@ func TestDisposeSale(t *testing.T) {
 	ctx := context.Background()
 	oc, _ := mk(t, pool)
 
-	aid, err := svc.Register(ctx, oc, "equipment", "Generator", "", "", "", time.Time{}, 0, "NGN", uuid.Nil)
+	aid, err := svc.Register(ctx, oc, "equipment", "Generator", "", "", "", time.Time{}, 0, "NGN", uuid.Nil, oc.MembershipID, uuid.Nil)
 	if err != nil {
 		t.Fatal(err)
 	}

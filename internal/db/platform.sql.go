@@ -220,7 +220,7 @@ const createTenantRow = `-- name: CreateTenantRow :one
 INSERT INTO tenants (name, slug, billing_email, edition, status)
 VALUES ($1, $2, $3,
         $4, 'trial')
-RETURNING id, name, slug, billing_email, edition, status, owner_org_id, created_at
+RETURNING id, name, slug, billing_email, edition, status, owner_org_id, created_at, invoice_no_seq
 `
 
 type CreateTenantRowParams struct {
@@ -247,6 +247,7 @@ func (q *Queries) CreateTenantRow(ctx context.Context, arg CreateTenantRowParams
 		&i.Status,
 		&i.OwnerOrgID,
 		&i.CreatedAt,
+		&i.InvoiceNoSeq,
 	)
 	return i, err
 }
@@ -467,6 +468,17 @@ func (q *Queries) FinishProvision(ctx context.Context, arg FinishProvisionParams
 	return result.RowsAffected(), nil
 }
 
+const getFeatureFlag = `-- name: GetFeatureFlag :one
+SELECT enabled FROM feature_flags WHERE key = $1
+`
+
+func (q *Queries) GetFeatureFlag(ctx context.Context, key string) (bool, error) {
+	row := q.db.QueryRow(ctx, getFeatureFlag, key)
+	var enabled bool
+	err := row.Scan(&enabled)
+	return enabled, err
+}
+
 const getOrgIDByTenantSlug = `-- name: GetOrgIDByTenantSlug :one
 SELECT id FROM organizations WHERE tenant_id = $1 AND slug = $2
 `
@@ -576,7 +588,7 @@ func (q *Queries) GetTenantExportByID(ctx context.Context, id pgtype.UUID) (Tena
 }
 
 const getTenantRow = `-- name: GetTenantRow :one
-SELECT id, name, slug, billing_email, edition, status, owner_org_id, created_at FROM tenants WHERE id = $1
+SELECT id, name, slug, billing_email, edition, status, owner_org_id, created_at, invoice_no_seq FROM tenants WHERE id = $1
 `
 
 func (q *Queries) GetTenantRow(ctx context.Context, id pgtype.UUID) (Tenants, error) {
@@ -591,6 +603,7 @@ func (q *Queries) GetTenantRow(ctx context.Context, id pgtype.UUID) (Tenants, er
 		&i.Status,
 		&i.OwnerOrgID,
 		&i.CreatedAt,
+		&i.InvoiceNoSeq,
 	)
 	return i, err
 }
@@ -775,7 +788,7 @@ func (q *Queries) ListSubscriptions(ctx context.Context, dollar_1 string) ([]Lis
 }
 
 const listTenants = `-- name: ListTenants :many
-SELECT t.id, t.name, t.slug, t.billing_email, t.edition, t.status, t.owner_org_id, t.created_at, s.plan_slug, s.state AS subscription_state,
+SELECT t.id, t.name, t.slug, t.billing_email, t.edition, t.status, t.owner_org_id, t.created_at, t.invoice_no_seq, s.plan_slug, s.state AS subscription_state,
        (SELECT count(*) FROM organizations o WHERE o.tenant_id = t.id AND o.deleted_at IS NULL) AS org_count
 FROM tenants t
 LEFT JOIN LATERAL (
@@ -796,6 +809,7 @@ type ListTenantsRow struct {
 	Status            string             `json:"status"`
 	OwnerOrgID        pgtype.UUID        `json:"owner_org_id"`
 	CreatedAt         pgtype.Timestamptz `json:"created_at"`
+	InvoiceNoSeq      int64              `json:"invoice_no_seq"`
 	PlanSlug          string             `json:"plan_slug"`
 	SubscriptionState string             `json:"subscription_state"`
 	OrgCount          int64              `json:"org_count"`
@@ -822,6 +836,7 @@ func (q *Queries) ListTenants(ctx context.Context, dollar_1 string) ([]ListTenan
 			&i.Status,
 			&i.OwnerOrgID,
 			&i.CreatedAt,
+			&i.InvoiceNoSeq,
 			&i.PlanSlug,
 			&i.SubscriptionState,
 			&i.OrgCount,

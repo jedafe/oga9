@@ -120,6 +120,12 @@ jobs:
       - name: upgrade (re-run migrate — must no-op, not fail)
         run: |
           docker run --rm --network host             -v "$PWD/db/migrations:/migrations:ro"             migrate/migrate:v4.18.3             -path /migrations             -database "postgres://oga9:oga9@localhost:5432/oga9?sslmode=disable"             up
+      # §09 release discipline: rollback must be real — every .down.sql
+      # reverses cleanly on the bundled migrate path.
+      - name: rollback (migrate down -all → up again)
+        run: |
+          docker run --rm --network host             -v "$PWD/db/migrations:/migrations:ro"             migrate/migrate:v4.18.3             -path /migrations             -database "postgres://oga9:oga9@localhost:5432/oga9?sslmode=disable"             down -all
+          docker run --rm --network host             -v "$PWD/db/migrations:/migrations:ro"             migrate/migrate:v4.18.3             -path /migrations             -database "postgres://oga9:oga9@localhost:5432/oga9?sslmode=disable"             up
       - name: image builds (oga9:{version})
         run: docker build -t oga9:ci-test .
       # §14.04 release validation: the bundle must actually BOOT — a

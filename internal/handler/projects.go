@@ -36,6 +36,13 @@ func projectErr(w http.ResponseWriter, err error) {
 	default:
 		log.Printf("projects: %v", err)
 		httpx.WriteErr(w, 500, "internal_error", "request failed")
+
+	case errors.Is(err, projects.ErrOverBudget):
+		httpx.WriteErr(w, 409, "over_project_budget", "spend exceeds the project budget")
+	case errors.Is(err, projects.ErrOverMandate):
+		httpx.WriteErr(w, 409, "over_mandate_limit", "spend exceeds the committee mandate")
+	case errors.Is(err, projects.ErrBadPayment):
+		httpx.WriteErr(w, 422, "payment_not_found", "payment must be a real confirmed payment")
 	}
 }
 
@@ -119,6 +126,29 @@ func (h *ProjectsHandler) Transition(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httpx.WriteData(w, 200, map[string]any{"done": true})
+}
+
+type approveReq struct {
+	ResolutionID uuid.UUID `json:"resolution_id"`
+}
+
+// Approve — POST /projects/{pid}/approve: dedicated resolution-gate
+// route; takes resolution_id directly (no redundant action field).
+func (h *ProjectsHandler) Approve(w http.ResponseWriter, r *http.Request) {
+	pid, ok := projectID(w, r)
+	if !ok {
+		return
+	}
+	var req approveReq
+	if err := httpx.Decode(w, r, &req); err != nil || req.ResolutionID == uuid.Nil {
+		httpx.WriteErr(w, 400, "validation_failed", "resolution_id required")
+		return
+	}
+	if err := h.svc.Approve(r.Context(), middleware.OrgCtx(r.Context()), pid, req.ResolutionID); err != nil {
+		projectErr(w, err)
+		return
+	}
+	httpx.WriteData(w, 200, map[string]any{"approved": true})
 }
 
 type milestoneReq struct {
@@ -304,4 +334,70 @@ func (h *ProjectsHandler) PublicProjects(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	httpx.WriteData(w, 200, rows)
+}
+
+// RecordSpend — POST /projects/{pid}/spend: posts a project expense to
+// finance (never off-ledger); committee-owned projects are capped by the
+// committee_mandates budget_limit (§16).
+func (h *ProjectsHandler) RecordSpend(w http.ResponseWriter, r *http.Request) {
+	pid, err := uuid.Parse(chi.URLParam(r, "project_id"))
+	if err != nil {
+		httpx.WriteErr(w, 400, "invalid_id", "malformed identifier")
+		return
+	}
+	var req struct {
+		AmountMinor int64  `json:"amount_minor"`
+		Currency    string `json:"currency"`
+		Memo        string `json:"memo"`
+	}
+	if err := httpx.Decode(w, r, &req); err != nil || req.AmountMinor <= 0 || req.Currency == "" {
+		httpx.WriteErr(w, 400, "validation_failed", "amount_minor and currency required")
+		return
+	}
+	id, err := h.svc.RecordSpend(r.Context(), middleware.OrgCtx(r.Context()), pid,
+		req.AmountMinor, req.Currency, req.Memo)
+	if err != nil {
+		projectErr(w, err)
+		return
+	}
+	httpx.WriteData(w, 201, map[string]any{"expense_id": id})
+}
+
+// SetBudget — POST /projects/{pid}/budget (org.projects.manage).
+func (h *ProjectsHandler) SetBudget(w http.ResponseWriter, r *http.Request) {
+	pid, err := uuid.Parse(chi.URLParam(r, "project_id"))
+	if err != nil {
+		httpx.WriteErr(w, 400, "invalid_id", "malformed identifier")
+		return
+	}
+	var req struct {
+		AmountMinor int64  `json:"amount_minor"`
+		Currency    string `json:"currency"`
+		Note        string `json:"note"`
+	}
+	if err := httpx.Decode(w, r, &req); err != nil || req.AmountMinor <= 0 || req.Currency == "" {
+		httpx.WriteErr(w, 400, "validation_failed", "amount_minor and currency required")
+		return
+	}
+	id, err := h.svc.SetBudget(r.Context(), middleware.OrgCtx(r.Context()), pid, req.AmountMinor, req.Currency, req.Note)
+	if err != nil {
+		projectErr(w, err)
+		return
+	}
+	httpx.WriteData(w, 201, map[string]any{"budget_id": id})
+}
+
+// GetBudget — GET /projects/{pid}/budget: budget + live spend/remaining.
+func (h *ProjectsHandler) GetBudget(w http.ResponseWriter, r *http.Request) {
+	pid, err := uuid.Parse(chi.URLParam(r, "project_id"))
+	if err != nil {
+		httpx.WriteErr(w, 400, "invalid_id", "malformed identifier")
+		return
+	}
+	out, err := h.svc.Budget(r.Context(), middleware.OrgCtx(r.Context()), pid)
+	if err != nil {
+		projectErr(w, err)
+		return
+	}
+	httpx.WriteData(w, 200, out)
 }

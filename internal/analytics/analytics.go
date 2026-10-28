@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -51,6 +52,14 @@ type Service struct {
 	archiveFn func(ctx context.Context, oc *tenant.OrgCtx, title string, r io.Reader) (uuid.UUID, error)
 	capFn     func(ctx context.Context, tenantID uuid.UUID, capability string) bool
 	myFn      func(ctx context.Context, userID uuid.UUID) (any, error)
+	// permFn resolves the viewer's dashboard role from their permission
+	// nodes — a ?role= query param must never pick another seat's view
+	// (§19: content filtered by the viewer's permissions; Rule 24).
+	permFn func(ctx context.Context, userID, orgID uuid.UUID, node string) bool
+	// docFn streams a report's stored artifact (Rule 26 — documents owns
+	// the blob); branchFn produces the per-branch roll-up blocks.
+	docFn    func(ctx context.Context, oc *tenant.OrgCtx, docID uuid.UUID) (io.ReadCloser, string, error)
+	branchFn func(ctx context.Context, oc *tenant.OrgCtx) ([]map[string]any, error)
 }
 
 func NewService(pool *pgxpool.Pool) *Service {
@@ -70,6 +79,35 @@ func (s *Service) SetArchive(fn func(context.Context, *tenant.OrgCtx, string, io
 
 func (s *Service) SetCapability(fn func(context.Context, uuid.UUID, string) bool) { s.capFn = fn }
 func (s *Service) SetMe(fn func(context.Context, uuid.UUID) (any, error))         { s.myFn = fn }
+func (s *Service) SetPermissions(fn func(context.Context, uuid.UUID, uuid.UUID, string) bool) {
+	s.permFn = fn
+}
+
+// SetDocArtifact wires the documents download seam — the run row's
+// document_id resolves to a real artifact stream.
+func (s *Service) SetDocArtifact(fn func(context.Context, *tenant.OrgCtx, uuid.UUID) (io.ReadCloser, string, error)) {
+	s.docFn = fn
+}
+
+// SetBranches wires the per-branch roll-up producer (§19 consolidated).
+func (s *Service) SetBranches(fn func(context.Context, *tenant.OrgCtx) ([]map[string]any, error)) {
+	s.branchFn = fn
+}
+
+// DownloadReport — the artifact stream for a run row: resolves the stored
+// document through the documents seam; falls back to the run row JSON when
+// the document module is unwired (self-host minimal builds).
+func (s *Service) DownloadReport(ctx context.Context, oc *tenant.OrgCtx, rid uuid.UUID) (io.ReadCloser, string, error) {
+	run, err := s.q.GetReportRun(ctx, db.GetReportRunParams{ID: toPg(rid), OrganizationID: toPg(oc.OrgID)})
+	if err != nil {
+		return nil, "", ErrNotFound
+	}
+	if s.docFn == nil || !run.DocumentID.Valid {
+		raw, _ := json.Marshal(run)
+		return io.NopCloser(strings.NewReader(string(raw))), "report.json", nil
+	}
+	return s.docFn(ctx, oc, uuid.UUID(run.DocumentID.Bytes))
+}
 
 func (s *Service) withTx(ctx context.Context, fn func(*db.Queries) error) error {
 	tx, err := s.pool.Begin(ctx)
@@ -85,19 +123,47 @@ func (s *Service) withTx(ctx context.Context, fn func(*db.Queries) error) error 
 
 // ---------- dashboard snapshots ----------
 
-// Dashboard serves the async snapshot for the viewer's role — §19:
-// dashboards never scan domain tables per-request. A missing snapshot
-// falls back to the 30d event projection (cheap aggregate, not a scan).
-func (s *Service) Dashboard(ctx context.Context, oc *tenant.OrgCtx, role string) (json.RawMessage, error) {
+// roleFor resolves the viewer's dashboard role server-side from their
+// permission nodes (§19 role-resolved). Highest seat wins.
+func (s *Service) roleFor(ctx context.Context, oc *tenant.OrgCtx) string {
+	if s.permFn != nil {
+		switch {
+		case s.permFn(ctx, oc.UserID, oc.OrgID, "org.governance.appointments.manage"):
+			return "president"
+		case s.permFn(ctx, oc.UserID, oc.OrgID, "org.finance.payments.approve"):
+			return "treasurer"
+		case s.permFn(ctx, oc.UserID, oc.OrgID, "org.minutes.approve"):
+			return "secretary"
+		}
+	}
+	return "member"
+}
+
+// Dashboard serves the async snapshot for the viewer's resolved role —
+// §19: dashboards never scan domain tables per-request, and the role is
+// derived from permissions, never a request parameter. A missing
+// snapshot falls back to the 30d event projection (cheap aggregate).
+func (s *Service) Dashboard(ctx context.Context, oc *tenant.OrgCtx) (json.RawMessage, error) {
+	role := s.roleFor(ctx, oc)
 	if row, err := s.q.GetSnapshot(ctx, db.GetSnapshotParams{
 		OrganizationID: toPg(oc.OrgID), Role: role}); err == nil {
 		return row.Snapshot, nil
 	}
-	snap, err := s.snapshot(ctx, oc, role)
+	// cold-start: no per-request domain scans (§19) — serve the 30d
+	// domain_events projection only; section producers fill in at the
+	// next 15min snapshot refresh.
+	counts, err := s.q.EventCounts30d(ctx, toPg(oc.OrgID))
 	if err != nil {
 		return nil, err
 	}
-	return json.Marshal(snap)
+	events := map[string]int64{}
+	for _, c := range counts {
+		events[c.EventType] = c.N
+	}
+	return json.Marshal(map[string]any{
+		"role": role, "org_id": oc.OrgID, "generated_at": time.Now().UTC(),
+		"events_30d": events, "sections": map[string]any{},
+	})
 }
 
 // snapshot composes one role's view: the 30d domain-event projection
@@ -331,9 +397,17 @@ func (s *Service) RunReport(ctx context.Context, oc *tenant.OrgCtx, kind, period
 			return err
 		}
 		rid = fromPg(id)
-		ev := "MonthlyReportGenerated"
-		if kind == reportAnnual {
+		// only the two catalogued report events exist — custom/handover
+		// runs record the row without a mislabeled event name.
+		var ev string
+		switch kind {
+		case reportMonthly:
+			ev = "MonthlyReportGenerated"
+		case reportAnnual:
 			ev = "AnnualReportGenerated"
+		}
+		if ev == "" {
+			return nil
 		}
 		return events.Emit(ctx, q, oc.TenantID, oc.OrgID, ev,
 			"report_run", rid, oc.UserID, false,
@@ -381,8 +455,9 @@ func (s *Service) Consolidated(ctx context.Context, oc *tenant.OrgCtx) (any, err
 	if s.capFn != nil && !s.capFn(ctx, oc.TenantID, "capability.consolidation") {
 		return nil, ErrCapability
 	}
-	// Roll up the four role snapshots + health — per-branch expansion lands
-	// with the consolidation read models.
+	// Roll up the four role snapshots + health + the per-branch blocks
+	// the wired producer supplies (§19: consolidation IS the multi-branch
+	// roll-up — the branch seam is the point of this route).
 	out := map[string]any{"org_id": oc.OrgID, "roles": map[string]json.RawMessage{}}
 	roles := out["roles"].(map[string]json.RawMessage)
 	for _, role := range snapshotRoles {
@@ -393,6 +468,13 @@ func (s *Service) Consolidated(ctx context.Context, oc *tenant.OrgCtx) (any, err
 	}
 	if h, err := s.q.LatestHealthScore(ctx, toPg(oc.OrgID)); err == nil {
 		out["health"] = map[string]any{"score": h.Score, "period": h.Period}
+	}
+	if s.branchFn != nil {
+		branches, err := s.branchFn(ctx, oc)
+		if err != nil {
+			return nil, err
+		}
+		out["branches"] = branches
 	}
 	return out, nil
 }

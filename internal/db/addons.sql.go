@@ -11,9 +11,28 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const activateTenantAddon = `-- name: ActivateTenantAddon :execrows
+UPDATE tenant_addons SET state = 'active'
+WHERE tenant_id = $1 AND addon_slug = $2 AND state = 'pending'
+`
+
+type ActivateTenantAddonParams struct {
+	TenantID  pgtype.UUID `json:"tenant_id"`
+	AddonSlug string      `json:"addon_slug"`
+}
+
+// webhook settlement: pending → active (CAS; replay is a no-op).
+func (q *Queries) ActivateTenantAddon(ctx context.Context, arg ActivateTenantAddonParams) (int64, error) {
+	result, err := q.db.Exec(ctx, activateTenantAddon, arg.TenantID, arg.AddonSlug)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const cancelTenantAddon = `-- name: CancelTenantAddon :execrows
 UPDATE tenant_addons SET state = 'cancelled', cancelled_at = now()
-WHERE tenant_id = $1 AND addon_slug = $2 AND state IN ('trialing','active')
+WHERE tenant_id = $1 AND addon_slug = $2 AND state IN ('trialing','active','pending')
 `
 
 type CancelTenantAddonParams struct {
@@ -31,7 +50,7 @@ func (q *Queries) CancelTenantAddon(ctx context.Context, arg CancelTenantAddonPa
 
 const expireTenantAddon = `-- name: ExpireTenantAddon :execrows
 UPDATE tenant_addons SET state = 'expired'
-WHERE id = $1 AND state IN ('trialing','active')
+WHERE id = $1 AND state IN ('trialing','active','pending')
 `
 
 func (q *Queries) ExpireTenantAddon(ctx context.Context, id pgtype.UUID) (int64, error) {
@@ -193,7 +212,7 @@ func (q *Queries) ListAddonCatalogActive(ctx context.Context) ([]AddonCatalog, e
 
 const listExpiringAddons = `-- name: ListExpiringAddons :many
 SELECT id, tenant_id, addon_slug FROM tenant_addons
-WHERE state IN ('trialing','active') AND expires_at IS NOT NULL AND expires_at < now()
+WHERE state IN ('trialing','active','pending') AND expires_at IS NOT NULL AND expires_at < now()
 `
 
 type ListExpiringAddonsRow struct {
@@ -274,10 +293,10 @@ func (q *Queries) ListTenantAddons(ctx context.Context, tenantID pgtype.UUID) ([
 
 const subscribeTenantAddon = `-- name: SubscribeTenantAddon :one
 INSERT INTO tenant_addons (tenant_id, addon_slug, state, billing_term, expires_at)
-VALUES ($1::uuid, $2, 'active',
-        $3, $4::timestamptz)
+VALUES ($1::uuid, $2, $3,
+        $4, $5::timestamptz)
 ON CONFLICT (tenant_id, addon_slug) DO UPDATE SET
-  state = 'active', billing_term = EXCLUDED.billing_term,
+  state = EXCLUDED.state, billing_term = EXCLUDED.billing_term,
   expires_at = EXCLUDED.expires_at, cancelled_at = NULL, started_at = now()
 RETURNING id, tenant_id, addon_slug, state, billing_term, started_at, expires_at, cancelled_at
 `
@@ -285,6 +304,7 @@ RETURNING id, tenant_id, addon_slug, state, billing_term, started_at, expires_at
 type SubscribeTenantAddonParams struct {
 	TenantID    pgtype.UUID        `json:"tenant_id"`
 	AddonSlug   string             `json:"addon_slug"`
+	State       string             `json:"state"`
 	BillingTerm string             `json:"billing_term"`
 	ExpiresAt   pgtype.Timestamptz `json:"expires_at"`
 }
@@ -294,6 +314,7 @@ func (q *Queries) SubscribeTenantAddon(ctx context.Context, arg SubscribeTenantA
 	row := q.db.QueryRow(ctx, subscribeTenantAddon,
 		arg.TenantID,
 		arg.AddonSlug,
+		arg.State,
 		arg.BillingTerm,
 		arg.ExpiresAt,
 	)

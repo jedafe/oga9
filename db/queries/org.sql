@@ -204,14 +204,73 @@ VALUES (sqlc.arg(organization_id), sqlc.arg(entity_type), sqlc.arg(name), sqlc.a
         sqlc.arg(sort_order), sqlc.arg(visibility), sqlc.arg(source))
 RETURNING id;
 
--- name: CreateCustomField :exec
+-- name: CreateCustomField :one
 INSERT INTO custom_fields (group_id, organization_id, entity_type, key, label, help_text,
-                           kind, required, options, sort_order, visibility, source)
+                           kind, required, options, validation, sort_order, visibility, source)
 VALUES (sqlc.arg(group_id), sqlc.arg(organization_id), sqlc.arg(entity_type), sqlc.arg(key),
         sqlc.arg(label), sqlc.arg(help_text), sqlc.arg(kind), sqlc.arg(required),
-        sqlc.arg(options), sqlc.arg(sort_order), sqlc.arg(visibility), sqlc.arg(source));
+        sqlc.arg(options), sqlc.arg(validation)::jsonb, sqlc.arg(sort_order), sqlc.arg(visibility), sqlc.arg(source))
+RETURNING id;
 
 -- name: ListPublicOrgs :many
 SELECT id, name, slug, org_type, country_code, city
 FROM organizations WHERE is_public_listed = true AND deleted_at IS NULL
 ORDER BY name LIMIT 100;
+
+-- name: ListFieldGroups :many
+SELECT * FROM custom_field_groups WHERE organization_id = $1
+  AND ($2::text = '' OR entity_type = $2) ORDER BY sort_order, name;
+
+-- name: UpdateFieldGroup :one
+UPDATE custom_field_groups SET name = $3, sort_order = $4,
+  visibility = COALESCE(sqlc.narg(visibility)::text, visibility)
+WHERE id = $1 AND organization_id = $2 RETURNING id, entity_type;
+
+-- name: DeleteFieldGroup :execrows
+DELETE FROM custom_field_groups WHERE id = $1 AND organization_id = $2;
+
+-- name: ListFields :many
+SELECT * FROM custom_fields WHERE organization_id = $1 AND retired_at IS NULL
+  AND ($2::text = '' OR entity_type = $2) ORDER BY sort_order, key;
+
+-- name: UpdateField :one
+UPDATE custom_fields SET group_id = sqlc.narg(group_id)::uuid, label = sqlc.arg(label),
+  help_text = sqlc.narg(help_text)::text, required = sqlc.arg(required),
+  options = sqlc.narg(options)::jsonb, validation = sqlc.arg(validation)::jsonb,
+  sort_order = sqlc.arg(sort_order),
+  visibility = COALESCE(sqlc.narg(visibility)::text, visibility)
+WHERE id = sqlc.arg(id) AND organization_id = sqlc.arg(organization_id)
+  AND retired_at IS NULL
+RETURNING id, entity_type;
+
+-- name: RetireField :execrows
+-- retire, never hard-delete: CASCADE on custom_field_values would drop data
+UPDATE custom_fields SET retired_at = now()
+WHERE id = $1 AND organization_id = $2 AND retired_at IS NULL;
+
+-- name: GetFieldByKey :one
+SELECT * FROM custom_fields WHERE organization_id = $1 AND entity_type = $2 AND key = $3 AND retired_at IS NULL;
+
+-- name: UpsertFieldValue :one
+INSERT INTO custom_field_values (field_id, organization_id, entity_id, value)
+VALUES (sqlc.arg(field_id), sqlc.arg(organization_id), sqlc.arg(entity_id), sqlc.arg(value))
+ON CONFLICT (field_id, entity_id) DO UPDATE SET value = EXCLUDED.value, updated_at = now()
+RETURNING id;
+
+-- name: GetField :one
+SELECT * FROM custom_fields WHERE id = $1 AND organization_id = $2 AND retired_at IS NULL;
+
+-- name: ListFieldValues :many
+SELECT cfv.field_id, cfv.entity_id, cfv.value, cfv.updated_at
+FROM custom_field_values cfv
+JOIN custom_fields cf ON cf.id = cfv.field_id AND cf.retired_at IS NULL
+WHERE cfv.organization_id = $1 AND cfv.entity_id = $2 AND cf.entity_type = $3;
+
+-- name: SetOrgDescription :execrows
+UPDATE organizations SET description = $2 WHERE id = $1 AND deleted_at IS NULL;
+
+-- name: SetCustomDomain :execrows
+UPDATE organizations SET custom_domain = $2 WHERE id = $1 AND deleted_at IS NULL;
+
+-- name: OrgByCustomDomain :one
+SELECT slug FROM organizations WHERE lower(custom_domain) = lower($1) AND deleted_at IS NULL;

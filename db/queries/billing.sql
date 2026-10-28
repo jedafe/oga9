@@ -5,7 +5,7 @@ SELECT slug, label, price_monthly_minor, price_annual_minor, currency, sort
 FROM plans WHERE is_public ORDER BY sort;
 
 -- name: GetPlan :one
-SELECT slug, price_monthly_minor, price_annual_minor, is_public
+SELECT slug, price_monthly_minor, price_annual_minor, currency, is_public
 FROM plans WHERE slug = $1;
 
 -- name: GetPlanCapabilities :many
@@ -224,3 +224,43 @@ UNION ALL
 SELECT 'limit.branches', count(*)::bigint
 FROM org_units u JOIN organizations o ON o.id = u.organization_id
 WHERE o.tenant_id = $1 AND u.type IN ('hq','branch','chapter');
+
+-- name: UpsertUsageMeter :exec
+-- ai:usage_rollup sync target — overwrite (rollup is authoritative).
+INSERT INTO usage_meters (tenant_id, limit_key, used, period_start)
+VALUES ($1, $2, $3, $4)
+ON CONFLICT (tenant_id, limit_key, period_start) DO UPDATE SET used = EXCLUDED.used;
+
+-- name: NextInvoiceNumber :one
+UPDATE tenants SET invoice_no_seq = invoice_no_seq + 1
+WHERE id = $1 RETURNING invoice_no_seq;
+
+-- name: CreatePlatformInvoice :one
+INSERT INTO platform_invoices (tenant_id, subscription_id, addon_slug, number,
+  amount_minor, currency, state, period_start, period_end)
+VALUES (sqlc.arg(tenant_id), sqlc.narg(subscription_id)::uuid, sqlc.narg(addon_slug)::text,
+  sqlc.arg(number), sqlc.arg(amount_minor), sqlc.arg(currency), sqlc.arg(state),
+  sqlc.narg(period_start)::timestamptz, sqlc.narg(period_end)::timestamptz)
+RETURNING *;
+
+-- name: ListPlatformInvoices :many
+SELECT * FROM platform_invoices WHERE tenant_id = $1
+  AND ($2::text = '' OR state = $2)
+ORDER BY issued_at DESC LIMIT $3 OFFSET $4;
+
+-- name: CountPlatformInvoices :one
+SELECT count(*) FROM platform_invoices WHERE tenant_id = $1
+  AND ($2::text = '' OR state = $2);
+
+-- name: MarkPlatformInvoicesPaid :execrows
+-- provider settlement marks the tenant's issued invoices paid — scoped
+-- to a subscription and/or addon so unrelated issued rows stand.
+UPDATE platform_invoices SET state = 'paid', paid_at = now()
+WHERE tenant_id = $1 AND state = 'issued'
+  AND (sqlc.narg(subscription_id)::uuid IS NULL OR subscription_id = sqlc.narg(subscription_id)::uuid)
+  AND (sqlc.narg(addon_slug)::text IS NULL OR addon_slug = sqlc.narg(addon_slug)::text);
+
+-- name: VoidAddonIssuedInvoice :exec
+-- pending-addon cancel voids its unsettled invoice.
+UPDATE platform_invoices SET state = 'void'
+WHERE tenant_id = $1 AND addon_slug = $2 AND state = 'issued';

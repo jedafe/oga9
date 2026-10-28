@@ -215,6 +215,34 @@ func (q *Queries) GetMandate(ctx context.Context, unitID pgtype.UUID) (Committee
 	return i, err
 }
 
+const getMandateScoped = `-- name: GetMandateScoped :one
+SELECT cm.org_unit_id, cm.mandate, cm.reports_to, cm.budget_limit_minor, cm.currency, cm.active FROM committee_mandates cm
+JOIN org_units u ON u.id = cm.org_unit_id
+WHERE cm.org_unit_id = $1::uuid
+  AND u.organization_id = $2::uuid
+`
+
+type GetMandateScopedParams struct {
+	UnitID pgtype.UUID `json:"unit_id"`
+	OrgID  pgtype.UUID `json:"org_id"`
+}
+
+// org-scoped variant for request paths — a foreign-org unit id must not
+// resolve a mandate (Rule 24).
+func (q *Queries) GetMandateScoped(ctx context.Context, arg GetMandateScopedParams) (CommitteeMandates, error) {
+	row := q.db.QueryRow(ctx, getMandateScoped, arg.UnitID, arg.OrgID)
+	var i CommitteeMandates
+	err := row.Scan(
+		&i.OrgUnitID,
+		&i.Mandate,
+		&i.ReportsTo,
+		&i.BudgetLimitMinor,
+		&i.Currency,
+		&i.Active,
+	)
+	return i, err
+}
+
 const getMotion = `-- name: GetMotion :one
 SELECT id, organization_id, activity_id, mover_id, seconder_id, title, body, state, created_at FROM motions
 WHERE id = $1::uuid AND organization_id = $2::uuid
@@ -270,6 +298,18 @@ func (q *Queries) GetResolution(ctx context.Context, arg GetResolutionParams) (R
 		&i.CreatedAt,
 	)
 	return i, err
+}
+
+const handoverCompletedExists = `-- name: HandoverCompletedExists :one
+SELECT EXISTS(SELECT 1 FROM domain_events
+  WHERE event_type = 'HandoverCompleted' AND aggregate_id = $1) AS e
+`
+
+func (q *Queries) HandoverCompletedExists(ctx context.Context, aggregateID pgtype.UUID) (bool, error) {
+	row := q.db.QueryRow(ctx, handoverCompletedExists, aggregateID)
+	var e bool
+	err := row.Scan(&e)
+	return e, err
 }
 
 const handoverGeneratedExists = `-- name: HandoverGeneratedExists :one

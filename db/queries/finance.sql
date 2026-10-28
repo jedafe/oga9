@@ -156,11 +156,12 @@ SELECT * FROM obligations WHERE membership_id = $1
 -- name: CreatePayment :one
 INSERT INTO payments (organization_id, membership_id, obligation_id, amount_minor,
   currency, channel, external_ref, benefit_member_id, drive_id, activity_id,
-  idempotency_key, claim_id, recorded_by)
+  idempotency_key, claim_id, recorded_by, invoice_id)
 VALUES (sqlc.arg(organization_id), sqlc.arg(membership_id), sqlc.arg(obligation_id),
   sqlc.arg(amount_minor), sqlc.arg(currency), sqlc.arg(channel), sqlc.arg(external_ref),
   sqlc.arg(benefit_member_id), sqlc.arg(drive_id), sqlc.narg(activity_id)::uuid,
-  sqlc.arg(idempotency_key), sqlc.arg(claim_id), sqlc.arg(recorded_by))
+  sqlc.arg(idempotency_key), sqlc.arg(claim_id), sqlc.arg(recorded_by),
+  sqlc.narg(invoice_id)::uuid)
 ON CONFLICT (idempotency_key) DO NOTHING
 RETURNING *;
 
@@ -211,10 +212,11 @@ FROM payments p WHERE p.organization_id = $1;
 -- ---------- ledger (append-only) ----------
 -- name: PostLedgerEntry :one
 INSERT INTO ledger_entries (organization_id, payment_id, reversal_of, direction,
-  account, amount_minor, currency, memo, posted_by)
+  account, amount_minor, currency, memo, posted_by, budget_line_id, expense_id)
 VALUES (sqlc.arg(organization_id), sqlc.arg(payment_id), sqlc.arg(reversal_of),
   sqlc.arg(direction), sqlc.arg(account), sqlc.arg(amount_minor), sqlc.arg(currency),
-  sqlc.arg(memo), sqlc.arg(posted_by))
+  sqlc.arg(memo), sqlc.arg(posted_by), sqlc.narg(budget_line_id)::uuid,
+  sqlc.narg(expense_id)::uuid)
 RETURNING *;
 
 -- name: LedgerMemoExists :one
@@ -313,10 +315,12 @@ WHERE state = 'open' AND closes_at < now();
 -- ---------- claims ----------
 -- name: CreateClaim :one
 INSERT INTO payment_claims (organization_id, membership_id, drive_id, obligation_id,
-  amount_minor, currency, channel, external_ref, receipt_media_id, note, hide_contributor)
+  amount_minor, currency, channel, external_ref, receipt_media_id, note, hide_contributor,
+  idempotency_key)
 VALUES (sqlc.arg(organization_id), sqlc.arg(membership_id), sqlc.arg(drive_id),
   sqlc.arg(obligation_id), sqlc.arg(amount_minor), sqlc.arg(currency), sqlc.arg(channel),
-  sqlc.arg(external_ref), sqlc.arg(receipt_media_id), sqlc.arg(note), sqlc.arg(hide_contributor))
+  sqlc.arg(external_ref), sqlc.arg(receipt_media_id), sqlc.arg(note), sqlc.arg(hide_contributor),
+  sqlc.narg(idempotency_key)::text)
 ON CONFLICT (membership_id, external_ref) WHERE external_ref IS NOT NULL AND state <> 'rejected' DO NOTHING
 RETURNING *;
 
@@ -495,3 +499,33 @@ WHERE ct.id = o.contribution_type_id AND ct.key = 'fine'
   AND o.membership_id = $1 AND o.organization_id = $2
   AND o.period_label = $3 AND o.status IN ('open','partially_paid','overdue')
 RETURNING o.id;
+
+-- name: LedgerDebitsByMemoPrefix :one
+-- §16 committee-mandate enforcement: cumulative committee-tagged spend.
+SELECT COALESCE(sum(amount_minor),0)::bigint AS total FROM ledger_entries
+WHERE organization_id = $1 AND direction = 'debit' AND memo LIKE $2 || '%';
+
+-- name: PendingClaimsForOrg :many
+-- §16 handover section: claims still awaiting officer review.
+SELECT * FROM payment_claims WHERE organization_id = $1 AND state = 'pending'
+ORDER BY created_at;
+
+-- name: LedgerDebitsForProject :one
+-- §20 budget check: cumulative spend tagged 'project:{id}' in the memo.
+SELECT COALESCE(sum(amount_minor),0)::bigint FROM ledger_entries
+WHERE organization_id = $1 AND direction = 'debit' AND memo LIKE '%project:' || $2;
+
+-- name: ListLedgerEntriesPaged :many
+SELECT * FROM ledger_entries WHERE organization_id = $1
+  AND ($2::text = '' OR account = $2)
+ORDER BY posted_at DESC LIMIT $3 OFFSET $4;
+
+-- name: CountLedgerEntries :one
+SELECT count(*) FROM ledger_entries WHERE organization_id = $1
+  AND ($2::text = '' OR account = $2);
+
+-- name: ClaimByIdempotencyKey :one
+SELECT * FROM payment_claims WHERE organization_id = $1 AND idempotency_key = $2;
+
+-- name: ClaimOrgForIdempotencyKey :one
+SELECT organization_id FROM payment_claims WHERE idempotency_key = $1;

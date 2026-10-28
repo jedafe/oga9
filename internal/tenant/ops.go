@@ -38,6 +38,14 @@ var committeeRoles = map[string]bool{"chairperson": true, "secretary": true, "me
 
 // Slugs are URL-path segments (directory, admin.{org}.host routing) —
 // lowercase alnum + interior hyphens only.
+// reservedSlugs — platform surface names an org slug must never claim;
+// {slug}.{base} routing would otherwise shadow control/API/docs hosts.
+var reservedSlugs = map[string]bool{
+	"app": true, "admin": true, "control": true, "api": true,
+	"www": true, "docs": true, "mail": true, "status": true,
+	"support": true, "help": true, "billing": true,
+}
+
 func validSlug(s string) bool {
 	if s == "" || len(s) > 63 {
 		return false
@@ -293,6 +301,10 @@ func (s *Service) UpdateOrgProfile(ctx context.Context, oc *OrgCtx, name, countr
 	if name == "" {
 		return ErrBadValue
 	}
+	before, err := s.GetOrg(ctx, oc.OrgID)
+	if err != nil {
+		return err
+	}
 	return s.withTx(ctx, func(q *db.Queries) error {
 		if _, err := q.UpdateOrgProfile(ctx, db.UpdateOrgProfileParams{
 			ID: toPg(oc.OrgID), Name: name, CountryCode: pgText(country),
@@ -300,8 +312,30 @@ func (s *Service) UpdateOrgProfile(ctx context.Context, oc *OrgCtx, name, countr
 		}); err != nil {
 			return err
 		}
-		return events.Emit(ctx, q, oc.TenantID, oc.OrgID, "OrganizationSettingChanged", "organization", oc.OrgID, oc.UserID, false,
-			map[string]any{"org_id": oc.OrgID, "organization_id": oc.OrgID, "profile": true})
+		if err := events.Emit(ctx, q, oc.TenantID, oc.OrgID, "OrganizationSettingChanged", "organization", oc.OrgID, oc.UserID, false,
+			map[string]any{"org_id": oc.OrgID, "organization_id": oc.OrgID, "profile": true}); err != nil {
+			return err
+		}
+		// ADR-021 japa sync triggers: newly published orgs +
+		// geo changes on already-listed orgs land as domain events
+		// (the integrations consumer syncs is_public_listed orgs only).
+		if listed && !before.PublicListed {
+			if err := events.Emit(ctx, q, oc.TenantID, oc.OrgID, "OrganizationPublished",
+				"organization", oc.OrgID, oc.UserID, false,
+				map[string]any{"org_id": oc.OrgID, "oga9_org_id": oc.OrgID,
+					"geo": map[string]any{"country": country, "city": city}}); err != nil {
+				return err
+			}
+		} else if listed && before.PublicListed &&
+			(before.City != city || before.CountryCode != country) {
+			if err := events.Emit(ctx, q, oc.TenantID, oc.OrgID, "OrganizationLocationUpdated",
+				"organization", oc.OrgID, oc.UserID, false,
+				map[string]any{"org_id": oc.OrgID,
+					"geo": map[string]any{"country": country, "city": city}}); err != nil {
+				return err
+			}
+		}
+		return nil
 	})
 }
 
@@ -457,21 +491,11 @@ func (s *Service) AcceptInvitation(ctx context.Context, userID uuid.UUID, token 
 			}); err != nil {
 				return err
 			}
-			// Invited members are org-vouched — the member role lands on
-			// accept even at 'applied' (office still requires 'active' via
-			// the appointment/committee guards; application-path members
-			// gain it at activation).
-			var grantedBy pgtype.UUID
-			if mb, err := q.GetMembershipByID(ctx, inv.InvitedBy); err == nil {
-				grantedBy = mb.UserID
-			} else if err != pgx.ErrNoRows {
-				return err
-			}
-			if err := q.AssignRoleBySlug(ctx, db.AssignRoleBySlugParams{
-				UserID: toPg(userID), TenantID: tenantID, GrantedBy: grantedBy, Slug: "member",
-			}); err != nil {
-				return err
-			}
+			// The member role lands at 'active' via TransitionMember — the
+			// same point the application path grants it. An invite is the
+			// org's vouch for INTAKE, not for member permissions: at
+			// 'applied' the member resolves OrgCtx but holds no nodes until
+			// an officer completes the lifecycle (ADR-014, one pipeline).
 		} else {
 			switch m.LifecycleState {
 			case "expelled":

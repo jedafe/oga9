@@ -61,10 +61,12 @@ func (s *Service) withTx(ctx context.Context, fn func(*db.Queries) error) error 
 
 // ---------- registry ----------
 
-// Register — §18: every asset enters the registry; custody follows.
+// Register — §18: every asset enters the registry WITH a custodian
+// (member XOR unit) — custody binds the current term in the same tx
+// (Rule 21), so no asset can exist without a holder.
 func (s *Service) Register(ctx context.Context, oc *tenant.OrgCtx, category, name, description,
 	identifier, condition string, acquiredAt time.Time, costMinor int64, currency string,
-	unitID uuid.UUID) (uuid.UUID, error) {
+	unitID, holderMember, holderUnit uuid.UUID) (uuid.UUID, error) {
 	if !assetCategories[category] || name == "" {
 		return uuid.Nil, ErrBadValue
 	}
@@ -73,6 +75,24 @@ func (s *Service) Register(ctx context.Context, oc *tenant.OrgCtx, category, nam
 	}
 	if !assetConditions[condition] {
 		return uuid.Nil, ErrBadValue
+	}
+	if (holderMember == uuid.Nil) == (holderUnit == uuid.Nil) {
+		return uuid.Nil, ErrCustodian // §18: exactly one custodian kind
+	}
+	if holderMember != uuid.Nil {
+		m, err := s.q.GetMembershipByID(ctx, toPg(holderMember))
+		if err != nil || fromPg(m.OrganizationID) != oc.OrgID {
+			return uuid.Nil, ErrNotFound
+		}
+	}
+	for _, u := range []uuid.UUID{unitID, holderUnit} {
+		if u == uuid.Nil {
+			continue
+		}
+		if _, err := s.q.GetCommitteeUnit(ctx, db.GetCommitteeUnitParams{
+			ID: toPg(u), OrganizationID: toPg(oc.OrgID)}); err != nil {
+			return uuid.Nil, ErrNotFound // owning/holding unit must be of this org
+		}
 	}
 	var id uuid.UUID
 	err := s.withTx(ctx, func(q *db.Queries) error {
@@ -85,9 +105,25 @@ func (s *Service) Register(ctx context.Context, oc *tenant.OrgCtx, category, nam
 			return err
 		}
 		id = fromPg(aid)
-		return events.Emit(ctx, q, oc.TenantID, oc.OrgID, "AssetRegistered",
+		termID, err := q.CurrentTermID(ctx, toPg(oc.OrgID)) // custody binds the term
+		if err != nil {
+			return ErrBadState
+		}
+		cid, err := q.AssignCustody(ctx, db.AssignCustodyParams{
+			AssetID: aid, HolderMemberID: toPg(holderMember), HolderUnitID: toPg(holderUnit),
+			TermID: termID, AssignedBy: toPg(oc.MembershipID)})
+		if err != nil {
+			return err
+		}
+		if err := events.Emit(ctx, q, oc.TenantID, oc.OrgID, "AssetRegistered",
 			"asset", id, oc.UserID, true,
-			map[string]any{"asset_id": id, "category": category, "name": name})
+			map[string]any{"asset_id": id, "category": category, "name": name}); err != nil {
+			return err
+		}
+		return events.Emit(ctx, q, oc.TenantID, oc.OrgID, "AssetAssigned",
+			"asset", id, oc.UserID, true,
+			map[string]any{"asset_id": id, "custody_id": fromPg(cid),
+				"holder_member_id": holderMember, "holder_unit_id": holderUnit})
 	})
 	return id, err
 }
@@ -143,6 +179,20 @@ func (s *Service) Assign(ctx context.Context, oc *tenant.OrgCtx, aid,
 	if (holderMember == uuid.Nil) == (holderUnit == uuid.Nil) {
 		return uuid.Nil, ErrCustodian // exactly one holder kind
 	}
+	// the custodian must belong to THIS org — a foreign member/unit id
+	// would hand cross-org custody.
+	if holderMember != uuid.Nil {
+		m, err := s.q.GetMembershipByID(ctx, toPg(holderMember))
+		if err != nil || fromPg(m.OrganizationID) != oc.OrgID {
+			return uuid.Nil, ErrNotFound
+		}
+	}
+	if holderUnit != uuid.Nil {
+		if _, err := s.q.GetCommitteeUnit(ctx, db.GetCommitteeUnitParams{
+			ID: toPg(holderUnit), OrganizationID: toPg(oc.OrgID)}); err != nil {
+			return uuid.Nil, ErrNotFound
+		}
+	}
 	var id uuid.UUID
 	err = s.withTx(ctx, func(q *db.Queries) error {
 		// close any still-open custody before reassignment
@@ -153,7 +203,10 @@ func (s *Service) Assign(ctx context.Context, oc *tenant.OrgCtx, aid,
 		} else if !errors.Is(err, pgx.ErrNoRows) {
 			return err
 		}
-		termID, _ := q.CurrentTermID(ctx, toPg(oc.OrgID)) // custody binds the term
+		termID, err := q.CurrentTermID(ctx, toPg(oc.OrgID)) // custody binds the term
+		if err != nil {
+			return ErrBadState // no current term — custody can't bind (Rule 21)
+		}
 		cid, err := q.AssignCustody(ctx, db.AssignCustodyParams{
 			AssetID: a.ID, HolderMemberID: toPg(holderMember), HolderUnitID: toPg(holderUnit),
 			TermID: termID, AssignedBy: toPg(oc.MembershipID)})
@@ -272,20 +325,40 @@ func (s *Service) ListAudits(ctx context.Context, oc *tenant.OrgCtx) ([]db.Asset
 	return s.q.ListAudits(ctx, toPg(oc.OrgID))
 }
 
-// CompleteAudit — findings land; missing items stay visible in findings
-// until a follow-up audit (test 4: state completes with findings).
+// CompleteAudit — findings land; §18 test 4: an audit that found missing
+// items records them but stays OPEN (flagged for follow-up), so
+// AssetAuditCompleted only emits on a clean completion.
 func (s *Service) CompleteAudit(ctx context.Context, oc *tenant.OrgCtx, auditID uuid.UUID, findings json.RawMessage) error {
 	a, err := s.q.GetAudit(ctx, db.GetAuditParams{ID: toPg(auditID), OrganizationID: toPg(oc.OrgID)})
 	if err != nil {
 		return ErrNotFound
 	}
+	var items []struct {
+		Finding string `json:"finding"`
+	}
+	_ = json.Unmarshal(findings, &items)
+	hasMissing := false
+	for _, f := range items {
+		if f.Finding == "missing" {
+			hasMissing = true
+			break
+		}
+	}
+	state := "completed"
+	if hasMissing {
+		state = "open" // findings recorded, audit stays open for follow-up
+	}
 	return s.withTx(ctx, func(q *db.Queries) error {
-		n, err := q.CompleteAudit(ctx, db.CompleteAuditParams{ID: a.ID, Findings: findings})
+		n, err := q.CompleteAudit(ctx, db.CompleteAuditParams{
+			ID: a.ID, Findings: findings, State: state})
 		if err != nil {
 			return err
 		}
 		if n == 0 {
 			return ErrBadState // already completed
+		}
+		if hasMissing {
+			return nil // findings recorded, state stays open — no completion event
 		}
 		return events.Emit(ctx, q, oc.TenantID, oc.OrgID, "AssetAuditCompleted",
 			"asset_audit", fromPg(a.ID), oc.UserID, false,
@@ -335,6 +408,13 @@ func (s *Service) FlagUnreturned(ctx context.Context, termID uuid.UUID) (int, er
 			if err != nil {
 				return err
 			}
+			// at-least-once dedupe: a retry after partial failure must not
+			// re-flag (and re-notify) custody already flagged.
+			if flagged, err := q.CustodyFlagged(ctx, c.ID); err != nil {
+				return err
+			} else if flagged {
+				return nil
+			}
 			return events.Emit(ctx, q, fromPg(tid), fromPg(c.OrganizationID),
 				"CustodyHandoverFlagged", "custody_assignment", fromPg(c.ID), uuid.Nil, true,
 				map[string]any{"custody_id": fromPg(c.ID), "asset_id": fromPg(c.AssetID),
@@ -364,6 +444,11 @@ func (s *Service) TermEndedConsumer(ctx context.Context, q *db.Queries, e events
 		return err
 	}
 	for _, c := range rows {
+		if flagged, err := q.CustodyFlagged(ctx, c.ID); err != nil {
+			return err
+		} else if flagged {
+			continue // at-least-once: already flagged by a prior delivery
+		}
 		if err := events.Emit(ctx, q, e.TenantID, fromPg(c.OrganizationID),
 			"CustodyHandoverFlagged", "custody_assignment", fromPg(c.ID), uuid.Nil, true,
 			map[string]any{"custody_id": fromPg(c.ID), "asset_id": fromPg(c.AssetID),
@@ -406,4 +491,9 @@ func (s *Service) MaintenanceDueSweep(ctx context.Context, windowDays int) (int,
 		n++
 	}
 	return n, nil
+}
+
+// OpenCustody — §16 handover section: custody rows still open in the org.
+func (s *Service) OpenCustody(ctx context.Context, oc *tenant.OrgCtx) ([]db.CustodyAssignments, error) {
+	return s.q.OpenCustodyForOrg(ctx, toPg(oc.OrgID))
 }

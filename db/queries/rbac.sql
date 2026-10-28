@@ -177,3 +177,18 @@ WHERE position_id = sqlc.arg(position_id)::uuid AND term_id = sqlc.arg(term_id):
 UPDATE terms SET is_current = false
 WHERE organization_id = sqlc.arg(org_id)::uuid AND is_current
 RETURNING id;
+
+-- name: IsExecutivePositionHolder :one
+-- §10 field visibility 'exco': an ACTIVE appointment (Rule 21) to an
+-- is_executive position — precise exco resolution, not committee
+-- membership or a generic officer node.
+SELECT EXISTS (SELECT 1 FROM officer_appointments oa
+  JOIN org_positions p ON p.id = oa.position_id AND p.is_executive
+  JOIN terms t ON t.id = oa.term_id AND t.is_current
+  WHERE oa.organization_id = $1 AND oa.member_id = $2
+    AND (oa.ends_at IS NULL OR oa.ends_at >= CURRENT_DATE));
+
+-- name: GetPositionSeatsForUpdate :one
+-- seat-cap enforcement: lock the position row inside the appoint tx so
+-- concurrent appointments can't both pass under the cap.
+SELECT seats FROM org_positions WHERE id = $1 FOR UPDATE;

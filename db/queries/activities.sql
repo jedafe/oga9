@@ -281,3 +281,10 @@ WHERE action_items.id = $1 AND state IN ('open','overdue')
 
 -- name: GetMinute :one
 SELECT * FROM minutes WHERE id = $1;
+
+-- name: OpenActionItemsForOrg :many
+-- §16 handover section: every still-open/overdue item across the org's activities.
+SELECT i.* FROM action_items i
+JOIN activities a ON a.id = i.activity_id
+WHERE a.organization_id = $1 AND i.state IN ('open','overdue')
+ORDER BY i.due_date NULLS LAST;

@@ -92,6 +92,33 @@ func (q *Queries) AddCaseEvent(ctx context.Context, arg AddCaseEventParams) (pgt
 	return id, err
 }
 
+const addPendingBenefit = `-- name: AddPendingBenefit :one
+INSERT INTO welfare_benefits (case_id, kind, amount_minor, currency)
+VALUES ($1::uuid, $2, $3,
+  $4)
+RETURNING id
+`
+
+type AddPendingBenefitParams struct {
+	CaseID      pgtype.UUID `json:"case_id"`
+	Kind        string      `json:"kind"`
+	AmountMinor pgtype.Int8 `json:"amount_minor"`
+	Currency    pgtype.Text `json:"currency"`
+}
+
+// §17 approve-time expense request: pending until MarkBenefitDisbursed.
+func (q *Queries) AddPendingBenefit(ctx context.Context, arg AddPendingBenefitParams) (pgtype.UUID, error) {
+	row := q.db.QueryRow(ctx, addPendingBenefit,
+		arg.CaseID,
+		arg.Kind,
+		arg.AmountMinor,
+		arg.Currency,
+	)
+	var id pgtype.UUID
+	err := row.Scan(&id)
+	return id, err
+}
+
 const addVisitDelegate = `-- name: AddVisitDelegate :exec
 INSERT INTO welfare_visit_delegates (visit_id, member_id)
 VALUES ($1::uuid, $2::uuid)
@@ -121,6 +148,18 @@ type ApproverAlreadyDecidedParams struct {
 // one approver, one decision per case.
 func (q *Queries) ApproverAlreadyDecided(ctx context.Context, arg ApproverAlreadyDecidedParams) (bool, error) {
 	row := q.db.QueryRow(ctx, approverAlreadyDecided, arg.CaseID, arg.ApproverID)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
+}
+
+const autoSuggestedCaseExists = `-- name: AutoSuggestedCaseExists :one
+SELECT EXISTS(SELECT 1 FROM welfare_cases
+  WHERE membership_id = $1 AND kind = 'bereavement' AND auto_suggested)
+`
+
+func (q *Queries) AutoSuggestedCaseExists(ctx context.Context, membershipID pgtype.UUID) (bool, error) {
+	row := q.db.QueryRow(ctx, autoSuggestedCaseExists, membershipID)
 	var exists bool
 	err := row.Scan(&exists)
 	return exists, err
@@ -159,16 +198,17 @@ func (q *Queries) CaseCountByKind(ctx context.Context, orgID pgtype.UUID) ([]Cas
 
 const completeVisit = `-- name: CompleteVisit :execrows
 UPDATE welfare_visits SET completed_at = now(), report = $2
-WHERE id = $1 AND completed_at IS NULL
+WHERE id = $1 AND case_id = $3 AND completed_at IS NULL
 `
 
 type CompleteVisitParams struct {
 	ID     pgtype.UUID `json:"id"`
 	Report pgtype.Text `json:"report"`
+	CaseID pgtype.UUID `json:"case_id"`
 }
 
 func (q *Queries) CompleteVisit(ctx context.Context, arg CompleteVisitParams) (int64, error) {
-	result, err := q.db.Exec(ctx, completeVisit, arg.ID, arg.Report)
+	result, err := q.db.Exec(ctx, completeVisit, arg.ID, arg.Report, arg.CaseID)
 	if err != nil {
 		return 0, err
 	}
@@ -442,6 +482,32 @@ func (q *Queries) ListWelfareCases(ctx context.Context, arg ListWelfareCasesPara
 	return items, nil
 }
 
+const markBenefitDisbursed = `-- name: MarkBenefitDisbursed :execrows
+UPDATE welfare_benefits SET kind = $2, amount_minor = $3,
+  currency = $4, disbursed_at = now()
+WHERE id = $1 AND disbursed_at IS NULL
+`
+
+type MarkBenefitDisbursedParams struct {
+	ID          pgtype.UUID `json:"id"`
+	Kind        string      `json:"kind"`
+	AmountMinor pgtype.Int8 `json:"amount_minor"`
+	Currency    pgtype.Text `json:"currency"`
+}
+
+func (q *Queries) MarkBenefitDisbursed(ctx context.Context, arg MarkBenefitDisbursedParams) (int64, error) {
+	result, err := q.db.Exec(ctx, markBenefitDisbursed,
+		arg.ID,
+		arg.Kind,
+		arg.AmountMinor,
+		arg.Currency,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const myWelfareCases = `-- name: MyWelfareCases :many
 SELECT wc.id, wc.organization_id, wc.membership_id, wc.kind, wc.title, wc.details, wc.requested_amount_minor, wc.currency, wc.auto_suggested, wc.state, wc.created_at FROM welfare_cases wc
 JOIN organization_memberships m ON m.id = wc.membership_id
@@ -482,6 +548,26 @@ func (q *Queries) MyWelfareCases(ctx context.Context, userID pgtype.UUID) ([]Wel
 	return items, nil
 }
 
+const pendingBenefitForCase = `-- name: PendingBenefitForCase :one
+SELECT id, case_id, kind, amount_minor, currency, payment_id, disbursed_at FROM welfare_benefits WHERE case_id = $1 AND disbursed_at IS NULL
+ORDER BY id LIMIT 1
+`
+
+func (q *Queries) PendingBenefitForCase(ctx context.Context, caseID pgtype.UUID) (WelfareBenefits, error) {
+	row := q.db.QueryRow(ctx, pendingBenefitForCase, caseID)
+	var i WelfareBenefits
+	err := row.Scan(
+		&i.ID,
+		&i.CaseID,
+		&i.Kind,
+		&i.AmountMinor,
+		&i.Currency,
+		&i.PaymentID,
+		&i.DisbursedAt,
+	)
+	return i, err
+}
+
 const priorCaseInWindow = `-- name: PriorCaseInWindow :one
 SELECT id FROM welfare_cases
 WHERE membership_id = $1::uuid AND kind = $2
@@ -503,6 +589,22 @@ func (q *Queries) PriorCaseInWindow(ctx context.Context, arg PriorCaseInWindowPa
 	var id pgtype.UUID
 	err := row.Scan(&id)
 	return id, err
+}
+
+const setBenefitPaymentRef = `-- name: SetBenefitPaymentRef :exec
+UPDATE welfare_benefits SET payment_id = $2 WHERE id = $1 AND payment_id IS NULL
+`
+
+type SetBenefitPaymentRefParams struct {
+	ID        pgtype.UUID `json:"id"`
+	PaymentID pgtype.UUID `json:"payment_id"`
+}
+
+// Link the posted finance ledger entry back onto the benefit (payment_id
+// is an unconstrained uuid pointer -> finance; ledger id is the link).
+func (q *Queries) SetBenefitPaymentRef(ctx context.Context, arg SetBenefitPaymentRefParams) error {
+	_, err := q.db.Exec(ctx, setBenefitPaymentRef, arg.ID, arg.PaymentID)
+	return err
 }
 
 const setWelfareCaseState = `-- name: SetWelfareCaseState :execrows

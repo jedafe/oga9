@@ -111,6 +111,24 @@ func (q *Queries) ApproveProject(ctx context.Context, arg ApproveProjectParams) 
 	return result.RowsAffected(), nil
 }
 
+const committeeExpenseTotal = `-- name: CommitteeExpenseTotal :one
+SELECT COALESCE(SUM(amount_minor),0)::bigint AS total
+FROM project_expenses
+WHERE organization_id = $1::uuid AND unit_id = $2::uuid
+`
+
+type CommitteeExpenseTotalParams struct {
+	OrgID  pgtype.UUID `json:"org_id"`
+	UnitID pgtype.UUID `json:"unit_id"`
+}
+
+func (q *Queries) CommitteeExpenseTotal(ctx context.Context, arg CommitteeExpenseTotalParams) (int64, error) {
+	row := q.db.QueryRow(ctx, committeeExpenseTotal, arg.OrgID, arg.UnitID)
+	var total int64
+	err := row.Scan(&total)
+	return total, err
+}
+
 const completeMilestone = `-- name: CompleteMilestone :execrows
 UPDATE project_milestones SET state = 'completed', completed_on = CURRENT_DATE
 WHERE id = $1 AND project_id = $2 AND state = 'pending'
@@ -174,6 +192,35 @@ func (q *Queries) CreateProject(ctx context.Context, arg CreateProjectParams) (p
 	return id, err
 }
 
+const createProjectBudget = `-- name: CreateProjectBudget :one
+INSERT INTO project_budgets (organization_id, project_id, amount_minor, currency, note, created_by)
+VALUES ($1, $2, $3, $4, $6, $5)
+RETURNING id
+`
+
+type CreateProjectBudgetParams struct {
+	OrganizationID pgtype.UUID `json:"organization_id"`
+	ProjectID      pgtype.UUID `json:"project_id"`
+	AmountMinor    int64       `json:"amount_minor"`
+	Currency       string      `json:"currency"`
+	CreatedBy      pgtype.UUID `json:"created_by"`
+	Note           pgtype.Text `json:"note"`
+}
+
+func (q *Queries) CreateProjectBudget(ctx context.Context, arg CreateProjectBudgetParams) (pgtype.UUID, error) {
+	row := q.db.QueryRow(ctx, createProjectBudget,
+		arg.OrganizationID,
+		arg.ProjectID,
+		arg.AmountMinor,
+		arg.Currency,
+		arg.CreatedBy,
+		arg.Note,
+	)
+	var id pgtype.UUID
+	err := row.Scan(&id)
+	return id, err
+}
+
 const createVendor = `-- name: CreateVendor :one
 INSERT INTO vendors (organization_id, name, contact, kind)
 VALUES ($1::uuid, $2, $3, $4)
@@ -229,6 +276,62 @@ func (q *Queries) GetProject(ctx context.Context, arg GetProjectParams) (Project
 	return i, err
 }
 
+const getProjectBudget = `-- name: GetProjectBudget :one
+SELECT id, organization_id, project_id, amount_minor, currency, note, created_by, created_at FROM project_budgets WHERE project_id = $1 AND organization_id = $2
+`
+
+type GetProjectBudgetParams struct {
+	ProjectID      pgtype.UUID `json:"project_id"`
+	OrganizationID pgtype.UUID `json:"organization_id"`
+}
+
+func (q *Queries) GetProjectBudget(ctx context.Context, arg GetProjectBudgetParams) (ProjectBudgets, error) {
+	row := q.db.QueryRow(ctx, getProjectBudget, arg.ProjectID, arg.OrganizationID)
+	var i ProjectBudgets
+	err := row.Scan(
+		&i.ID,
+		&i.OrganizationID,
+		&i.ProjectID,
+		&i.AmountMinor,
+		&i.Currency,
+		&i.Note,
+		&i.CreatedBy,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const getProjectForUpdate = `-- name: GetProjectForUpdate :one
+SELECT id, organization_id, title, description, resolution_id, state, budget_id, unit_id, starts_on, target_on, completed_on, progress_pct, created_at FROM projects WHERE id = $1::uuid AND organization_id = $2::uuid FOR UPDATE
+`
+
+type GetProjectForUpdateParams struct {
+	ID    pgtype.UUID `json:"id"`
+	OrgID pgtype.UUID `json:"org_id"`
+}
+
+// spend serialization: the row lock makes check-and-reserve atomic.
+func (q *Queries) GetProjectForUpdate(ctx context.Context, arg GetProjectForUpdateParams) (Projects, error) {
+	row := q.db.QueryRow(ctx, getProjectForUpdate, arg.ID, arg.OrgID)
+	var i Projects
+	err := row.Scan(
+		&i.ID,
+		&i.OrganizationID,
+		&i.Title,
+		&i.Description,
+		&i.ResolutionID,
+		&i.State,
+		&i.BudgetID,
+		&i.UnitID,
+		&i.StartsOn,
+		&i.TargetOn,
+		&i.CompletedOn,
+		&i.ProgressPct,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
 const getVendor = `-- name: GetVendor :one
 SELECT id, organization_id, name, contact, kind, created_at FROM vendors WHERE id = $1 AND organization_id = $2
 `
@@ -250,6 +353,36 @@ func (q *Queries) GetVendor(ctx context.Context, arg GetVendorParams) (Vendors, 
 		&i.CreatedAt,
 	)
 	return i, err
+}
+
+const insertProjectExpense = `-- name: InsertProjectExpense :one
+INSERT INTO project_expenses (organization_id, project_id, unit_id, amount_minor, currency, memo)
+VALUES ($1::uuid, $2::uuid, $3::uuid,
+        $4::bigint, $5, $6)
+RETURNING id
+`
+
+type InsertProjectExpenseParams struct {
+	OrgID       pgtype.UUID `json:"org_id"`
+	ProjectID   pgtype.UUID `json:"project_id"`
+	UnitID      pgtype.UUID `json:"unit_id"`
+	AmountMinor int64       `json:"amount_minor"`
+	Currency    string      `json:"currency"`
+	Memo        pgtype.Text `json:"memo"`
+}
+
+func (q *Queries) InsertProjectExpense(ctx context.Context, arg InsertProjectExpenseParams) (pgtype.UUID, error) {
+	row := q.db.QueryRow(ctx, insertProjectExpense,
+		arg.OrgID,
+		arg.ProjectID,
+		arg.UnitID,
+		arg.AmountMinor,
+		arg.Currency,
+		arg.Memo,
+	)
+	var id pgtype.UUID
+	err := row.Scan(&id)
+	return id, err
 }
 
 const latestUpdate = `-- name: LatestUpdate :one
@@ -467,6 +600,17 @@ func (q *Queries) ListVendors(ctx context.Context, organizationID pgtype.UUID) (
 	return items, nil
 }
 
+const lockSpendScope = `-- name: LockSpendScope :exec
+SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))
+`
+
+// serializes committee-capped spend across different projects sharing
+// one mandate (pg advisory lock, released at tx end).
+func (q *Queries) LockSpendScope(ctx context.Context, dollar_1 string) error {
+	_, err := q.db.Exec(ctx, lockSpendScope, dollar_1)
+	return err
+}
+
 const milestoneProgress = `-- name: MilestoneProgress :one
 SELECT COALESCE(sum(weight) FILTER (WHERE state='completed'),0)::bigint AS done,
        COALESCE(sum(weight),0)::bigint AS total
@@ -484,6 +628,24 @@ func (q *Queries) MilestoneProgress(ctx context.Context, projectID pgtype.UUID) 
 	var i MilestoneProgressRow
 	err := row.Scan(&i.Done, &i.Total)
 	return i, err
+}
+
+const projectExpenseTotal = `-- name: ProjectExpenseTotal :one
+SELECT COALESCE(SUM(amount_minor),0)::bigint AS total
+FROM project_expenses
+WHERE organization_id = $1::uuid AND project_id = $2::uuid
+`
+
+type ProjectExpenseTotalParams struct {
+	OrgID     pgtype.UUID `json:"org_id"`
+	ProjectID pgtype.UUID `json:"project_id"`
+}
+
+func (q *Queries) ProjectExpenseTotal(ctx context.Context, arg ProjectExpenseTotalParams) (int64, error) {
+	row := q.db.QueryRow(ctx, projectExpenseTotal, arg.OrgID, arg.ProjectID)
+	var total int64
+	err := row.Scan(&total)
+	return total, err
 }
 
 const projectGraph = `-- name: ProjectGraph :many
@@ -588,6 +750,23 @@ func (q *Queries) ResolutionOutcome(ctx context.Context, arg ResolutionOutcomePa
 	var outcome string
 	err := row.Scan(&outcome)
 	return outcome, err
+}
+
+const setProjectBudgetID = `-- name: SetProjectBudgetID :execrows
+UPDATE projects SET budget_id = $2 WHERE id = $1 AND budget_id IS NULL
+`
+
+type SetProjectBudgetIDParams struct {
+	ID       pgtype.UUID `json:"id"`
+	BudgetID pgtype.UUID `json:"budget_id"`
+}
+
+func (q *Queries) SetProjectBudgetID(ctx context.Context, arg SetProjectBudgetIDParams) (int64, error) {
+	result, err := q.db.Exec(ctx, setProjectBudgetID, arg.ID, arg.BudgetID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const setProjectProgress = `-- name: SetProjectProgress :exec

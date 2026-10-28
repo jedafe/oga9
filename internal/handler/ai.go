@@ -6,19 +6,38 @@ import (
 	"log"
 	"net/http"
 
+	"encoding/json"
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+	"github.com/hibiken/asynq"
 	"github.com/jedafe/oga9/internal/ai"
 	"github.com/jedafe/oga9/internal/httpx"
 	"github.com/jedafe/oga9/internal/middleware"
 )
 
 type AIHandler struct {
-	svc *ai.Service
+	svc   *ai.Service
+	queue *asynq.Client
 }
 
-func NewAIHandler(s *ai.Service) *AIHandler {
-	return &AIHandler{svc: s}
+func NewAIHandler(s *ai.Service, queue *asynq.Client) *AIHandler {
+	return &AIHandler{svc: s, queue: queue}
+}
+
+// enqueueAsync — §22 async path (Rule 8: fire-and-forget). Payload keys
+// match the registered ai:answer / ai:generate_draft handlers.
+func (h *AIHandler) enqueueAsync(w http.ResponseWriter, typ string, payload map[string]any) bool {
+	if h.queue == nil {
+		return false
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return false
+	}
+	if _, err := h.queue.Enqueue(asynq.NewTask(typ, body), asynq.Queue("default")); err != nil {
+		return false
+	}
+	return true
 }
 
 func aiErr(w http.ResponseWriter, err error) {
@@ -40,6 +59,7 @@ func aiErr(w http.ResponseWriter, err error) {
 }
 
 type chatReq struct {
+	Async          bool      `json:"async"` // enqueue ai:answer instead of answering inline
 	ConversationID uuid.UUID `json:"conversation_id"`
 	Persona        string    `json:"persona"`
 	Question       string    `json:"question"`
@@ -51,7 +71,19 @@ func (h *AIHandler) Chat(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteErr(w, 400, "validation_failed", "question required")
 		return
 	}
-	cid, mid, ans, err := h.svc.Chat(r.Context(), middleware.OrgCtx(r.Context()),
+	oc := middleware.OrgCtx(r.Context())
+	if req.Async {
+		if !h.enqueueAsync(w, "ai:answer", map[string]any{
+			"org_id": oc.OrgID.String(), "user_id": oc.UserID.String(),
+			"persona": req.Persona, "question": req.Question,
+			"conversation_id": req.ConversationID.String()}) {
+			httpx.WriteErr(w, 500, "internal_error", "enqueue failed")
+			return
+		}
+		httpx.WriteData(w, 202, map[string]any{"queued": true})
+		return
+	}
+	cid, mid, ans, err := h.svc.Chat(r.Context(), oc,
 		req.ConversationID, req.Persona, req.Question)
 	if err != nil {
 		aiErr(w, err)
@@ -85,8 +117,10 @@ func (h *AIHandler) Messages(w http.ResponseWriter, r *http.Request) {
 }
 
 type draftReq struct {
-	Kind   string `json:"kind"`
-	Prompt string `json:"prompt"`
+	Async    bool   `json:"async"`     // enqueue ai:generate_draft instead of drafting inline
+	TargetID string `json:"target_id"` // meeting for agenda/minutes apply
+	Kind     string `json:"kind"`
+	Prompt   string `json:"prompt"`
 }
 
 func (h *AIHandler) Draft(w http.ResponseWriter, r *http.Request) {
@@ -95,7 +129,19 @@ func (h *AIHandler) Draft(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteErr(w, 400, "validation_failed", "kind required")
 		return
 	}
-	id, err := h.svc.Draft(r.Context(), middleware.OrgCtx(r.Context()), req.Kind, req.Prompt)
+	tid, _ := uuid.Parse(req.TargetID)
+	oc := middleware.OrgCtx(r.Context())
+	if req.Async {
+		if !h.enqueueAsync(w, "ai:generate_draft", map[string]any{
+			"org_id": oc.OrgID, "user_id": oc.UserID, "kind": req.Kind,
+			"prompt": req.Prompt, "target_id": tid}) {
+			httpx.WriteErr(w, 500, "internal_error", "enqueue failed")
+			return
+		}
+		httpx.WriteData(w, 202, map[string]any{"queued": true})
+		return
+	}
+	id, err := h.svc.Draft(r.Context(), oc, req.Kind, req.Prompt, tid)
 	if err != nil {
 		aiErr(w, err)
 		return

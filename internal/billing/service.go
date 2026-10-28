@@ -13,6 +13,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"time"
 
@@ -180,6 +181,10 @@ func (s *Service) CreateSubscription(ctx context.Context, tenantID uuid.UUID, pl
 		if u, err := uuid.Parse(actorID); err == nil {
 			uid = u
 		}
+		price, _ := selfServePrice(p, term) // gated above: always 0 on this path
+		if err := s.issueInvoice(ctx, q, tenantID, id, "", price, p.Currency); err != nil {
+			return err
+		}
 		return events.Emit(ctx, q, tenantID, uuid.Nil, "SubscriptionChanged", "subscription", id, uid, true,
 			map[string]any{"tenant_id": tenantID, "from": "", "to": "trial", "plan_slug": plan})
 	})
@@ -307,6 +312,9 @@ func (s *Service) ChangePlan(ctx context.Context, tenantID uuid.UUID, plan strin
 		}
 		if n == 0 {
 			return ErrBadTransition // raced with another plan change or a cancel
+		}
+		if err := s.issueInvoice(ctx, q, tenantID, uuid.UUID(sub.ID.Bytes), "", targetPrice, target.Currency); err != nil {
+			return err
 		}
 		return events.Emit(ctx, q, tenantID, uuid.Nil, "SubscriptionChanged", "subscription",
 			uuid.UUID(sub.ID.Bytes), actor, true,
@@ -629,7 +637,9 @@ func (s *Service) ProcessWebhook(ctx context.Context, rawEventID uuid.UUID) erro
 			return err
 		}
 		var p struct {
-			TenantID string `json:"tenant_id"`
+			TenantID  string `json:"tenant_id"`
+			PlanSlug  string `json:"plan_slug"`
+			AddonSlug string `json:"addon_slug"`
 		}
 		_ = json.Unmarshal(ev.Payload, &p)
 		tenantID, err := uuid.Parse(p.TenantID)
@@ -637,15 +647,71 @@ func (s *Service) ProcessWebhook(ctx context.Context, rawEventID uuid.UUID) erro
 			return mark() // unrouteable — ack, don't retry forever
 		}
 		sub, err := q.GetSubscription(ctx, toPg(tenantID))
-		if err == pgx.ErrNoRows {
+		if err == pgx.ErrNoRows && p.AddonSlug == "" {
 			return mark() // tenant-less event — ack, don't retry forever
 		}
 		if err != nil {
 			return err // transient lookup failure → retry, don't drop
 		}
+		settle := func() error {
+			// Settlement lands the durable invoice as paid — addon-scoped,
+			// subscription-scoped, or both as the payload carries them.
+			if p.AddonSlug != "" {
+				if _, err := q.MarkPlatformInvoicesPaid(ctx, db.MarkPlatformInvoicesPaidParams{
+					TenantID: toPg(tenantID), SubscriptionID: pgtype.UUID{},
+					AddonSlug: pgtype.Text{String: p.AddonSlug, Valid: true}}); err != nil {
+					return err
+				}
+			}
+			if p.AddonSlug == "" {
+				// subscription-scoped payment: settle this sub's issued
+				// invoices only — an addon payment must not sweep these.
+				if _, err := q.MarkPlatformInvoicesPaid(ctx, db.MarkPlatformInvoicesPaidParams{
+					TenantID: toPg(tenantID), SubscriptionID: sub.ID, AddonSlug: pgtype.Text{}}); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
 		switch ev.EventType {
 		case "invoice.paid", "payment.succeeded", "checkout.completed":
+			if p.AddonSlug != "" {
+				// pending addon settles: activate the grant + pay its
+				// invoice, then AddonSubscribed flushes entitlements.
+				n, err := q.ActivateTenantAddon(ctx, db.ActivateTenantAddonParams{
+					TenantID: toPg(tenantID), AddonSlug: p.AddonSlug})
+				if err != nil {
+					return err
+				}
+				if n > 0 {
+					if err := events.Emit(ctx, q, tenantID, uuid.Nil, "AddonSubscribed",
+						"tenant_addon", tenantID, uuid.Nil, true,
+						map[string]any{"tenant_id": tenantID, "addon_slug": p.AddonSlug, "via": "webhook"}); err != nil {
+						return err
+					}
+				}
+				if err := settle(); err != nil {
+					return err
+				}
+				return mark()
+			}
+			if !sub.ID.Valid {
+				return mark() // nothing to activate — ack
+			}
+			// Provider checkout carries the purchased plan — landing it
+			// here is how upgrades arrive (self-serve only covers free).
+			if p.PlanSlug != "" && p.PlanSlug != sub.PlanSlug {
+				if _, err := q.GetPlan(ctx, p.PlanSlug); err == nil {
+					if _, err := q.SetSubscriptionPlan(ctx, db.SetSubscriptionPlanParams{
+						ID: sub.ID, PlanSlug: p.PlanSlug, ExpectedSlug: sub.PlanSlug}); err != nil {
+						return err
+					}
+				}
+			}
 			if err := s.activate(ctx, q, &sub); err != nil {
+				return err
+			}
+			if err := settle(); err != nil {
 				return err
 			}
 		case "invoice.payment_failed", "payment.failed":
@@ -755,16 +821,16 @@ func (s *Service) TenantAddons(ctx context.Context, tenantID uuid.UUID) ([]db.Li
 // AddonSubscribed so the entitlement cache flushes (Rule 25). Eligibility:
 // the addon must be active and the tenant's current plan must be in
 // available_on_plans.
-func (s *Service) SubscribeAddon(ctx context.Context, tenantID uuid.UUID, slug, term string, expiresAt *time.Time, actor uuid.UUID) error {
+func (s *Service) SubscribeAddon(ctx context.Context, tenantID uuid.UUID, slug, term string, expiresAt *time.Time, actor uuid.UUID) (string, error) {
 	if term == "" {
 		term = "monthly"
 	}
 	if term != "monthly" && term != "annual" { // addons bill monthly|annual only
-		return ErrBadBillingTerm
+		return "", ErrBadBillingTerm
 	}
 	a, err := s.q.GetAddon(ctx, slug)
 	if err != nil || !a.Active {
-		return ErrPlanNotFound
+		return "", ErrPlanNotFound
 	}
 	plan := "starter"
 	if sub, err := s.q.GetSubscription(ctx, toPg(tenantID)); err == nil {
@@ -781,21 +847,48 @@ func (s *Service) SubscribeAddon(ctx context.Context, tenantID uuid.UUID, slug, 
 		}
 	}
 	if !eligible {
-		return ErrAddonNotEligible
+		return "", ErrAddonNotEligible
 	}
 	var exp pgtype.Timestamptz
 	if expiresAt != nil {
 		exp = pgtype.Timestamptz{Time: *expiresAt, Valid: true}
 	}
-	return s.withTx(ctx, func(q *db.Queries) error {
+	price := a.PriceMonthlyMinor.Int64
+	if term == "annual" {
+		price = a.PriceAnnualMinor.Int64
+	}
+	// Priced addons land 'pending' — they grant nothing until the provider
+	// webhook settles the invoice (same Rule 9 self-serve contract as
+	// subscriptions: a bare slug write never mints paid grants). Free
+	// addons activate immediately with a zero paid invoice as the receipt.
+	state := "pending"
+	if price <= 0 {
+		state = "active"
+	}
+	if state == "pending" && !exp.Valid {
+		// an abandoned checkout must lapse, not sit pending forever — the
+		// expiry sweep already consumes 'pending' rows past expires_at.
+		exp = pgtype.Timestamptz{
+			Time:  time.Now().Add(time.Duration(s.settingInt(ctx, "billing.grace_period_days", 14)) * 24 * time.Hour),
+			Valid: true}
+	}
+	err = s.withTx(ctx, func(q *db.Queries) error {
 		if _, err := q.SubscribeTenantAddon(ctx, db.SubscribeTenantAddonParams{
-			TenantID: toPg(tenantID), AddonSlug: slug, BillingTerm: term, ExpiresAt: exp}); err != nil {
+			TenantID: toPg(tenantID), AddonSlug: slug, State: state,
+			BillingTerm: term, ExpiresAt: exp}); err != nil {
 			return err
+		}
+		if err := s.issueInvoice(ctx, q, tenantID, uuid.Nil, slug, price, a.Currency); err != nil {
+			return err
+		}
+		if state == "pending" {
+			return nil // activation + AddonSubscribed land at settlement
 		}
 		return events.Emit(ctx, q, tenantID, uuid.Nil, "AddonSubscribed",
 			"tenant_addon", tenantID, actor, true,
 			map[string]any{"tenant_id": tenantID, "addon_slug": slug, "term": term})
 	})
+	return state, err
 }
 
 // CancelAddon lapses a live addon — emits AddonCancelled (cache flush).
@@ -808,6 +901,12 @@ func (s *Service) CancelAddon(ctx context.Context, tenantID uuid.UUID, slug stri
 		}
 		if n == 0 {
 			return ErrNoSubscription
+		}
+		// a pending addon's issued invoice is dead on cancel — void it so
+		// the billing record matches (a paid invoice never matches 'issued').
+		if err := q.VoidAddonIssuedInvoice(ctx, db.VoidAddonIssuedInvoiceParams{
+			TenantID: toPg(tenantID), AddonSlug: pgtype.Text{String: slug, Valid: true}}); err != nil {
+			return err
 		}
 		return events.Emit(ctx, q, tenantID, uuid.Nil, "AddonCancelled",
 			"tenant_addon", tenantID, actor, true,
@@ -843,4 +942,43 @@ func (s *Service) ExpireAddonSweep(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// ---------- platform invoices (§15) ----------
+// A durable invoice row documents every billable event — plan subscribe,
+// plan change, addon subscribe. Zero-amount events (free/starter trials)
+// record as paid; priced events record as issued until a provider webhook
+// settles them.
+
+func (s *Service) issueInvoice(ctx context.Context, q *db.Queries, tenantID, subID uuid.UUID, addonSlug string, amountMinor int64, currency string) error {
+	seq, err := q.NextInvoiceNumber(ctx, toPg(tenantID))
+	if err != nil {
+		return err
+	}
+	state := "issued"
+	if amountMinor == 0 {
+		state = "paid" // nothing to collect — the record is the receipt
+	}
+	if currency == "" {
+		currency = "USD"
+	}
+	_, err = q.CreatePlatformInvoice(ctx, db.CreatePlatformInvoiceParams{
+		TenantID: toPg(tenantID), SubscriptionID: toPg(subID),
+		AddonSlug:   pgtype.Text{String: addonSlug, Valid: addonSlug != ""},
+		Number:      fmt.Sprintf("INV-%06d", seq),
+		AmountMinor: amountMinor, Currency: currency, State: state,
+	})
+	return err
+}
+
+// ListInvoices — tenant billing history for GET /billing/invoices.
+func (s *Service) ListInvoices(ctx context.Context, tenantID uuid.UUID, state string, lim, off int32) ([]db.PlatformInvoices, int64, error) {
+	rows, err := s.q.ListPlatformInvoices(ctx, db.ListPlatformInvoicesParams{
+		TenantID: toPg(tenantID), Column2: state, Limit: lim, Offset: off})
+	if err != nil {
+		return nil, 0, err
+	}
+	total, err := s.q.CountPlatformInvoices(ctx, db.CountPlatformInvoicesParams{
+		TenantID: toPg(tenantID), Column2: state})
+	return rows, total, err
 }

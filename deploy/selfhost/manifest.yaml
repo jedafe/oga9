@@ -10,6 +10,7 @@ images:
 contents:
   - docker-compose.yml / .env.example / install.sh / upgrade.sh
   - migrations/   # copied from db/migrations at release time
+  - scripts/      # backup.sh + restore.sh — operator backup tooling (§09)
   - license.json  # operator-provided signed file (empty {} = community)
 excluded:
   - control-app                  # cloud-only (ADR-018)

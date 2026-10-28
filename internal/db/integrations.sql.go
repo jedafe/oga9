@@ -32,6 +32,19 @@ func (q *Queries) APIKeyByHash(ctx context.Context, hashedKey string) (ApiKeys, 
 	return i, err
 }
 
+const claimSyncJob = `-- name: ClaimSyncJob :execrows
+UPDATE sync_jobs SET state = 'running' WHERE id = $1 AND state = 'queued'
+`
+
+// CAS claim so concurrent drains can't double-deliver (Rule 27).
+func (q *Queries) ClaimSyncJob(ctx context.Context, id pgtype.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, claimSyncJob, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const connectorByID = `-- name: ConnectorByID :one
 SELECT id, organization_id, kind, config, credential_ref, enabled, created_at FROM connectors WHERE id = $1
 `
@@ -170,6 +183,31 @@ func (q *Queries) CreateSyncJob(ctx context.Context, arg CreateSyncJobParams) (p
 	return id, err
 }
 
+const enabledIcsOrgs = `-- name: EnabledIcsOrgs :many
+SELECT c.organization_id AS org_id FROM connectors c
+WHERE c.kind = 'ics' AND c.enabled AND c.organization_id IS NOT NULL
+`
+
+func (q *Queries) EnabledIcsOrgs(ctx context.Context) ([]pgtype.UUID, error) {
+	rows, err := q.db.Query(ctx, enabledIcsOrgs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []pgtype.UUID
+	for rows.Next() {
+		var org_id pgtype.UUID
+		if err := rows.Scan(&org_id); err != nil {
+			return nil, err
+		}
+		items = append(items, org_id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const externalIDExists = `-- name: ExternalIDExists :one
 SELECT EXISTS(SELECT 1 FROM external_event_map
   WHERE external_type = $1 AND external_id = $2)
@@ -264,19 +302,25 @@ func (q *Queries) InsertAPIKey(ctx context.Context, arg InsertAPIKeyParams) (pgt
 }
 
 const insertWebhookReceipt = `-- name: InsertWebhookReceipt :one
-INSERT INTO webhook_receipts (provider, raw, signature_ok)
-VALUES ($1, $2, $3)
+INSERT INTO webhook_receipts (provider, raw, signature_ok, organization_id)
+VALUES ($1, $2, $3, $4)
 RETURNING id
 `
 
 type InsertWebhookReceiptParams struct {
-	Provider    string `json:"provider"`
-	Raw         []byte `json:"raw"`
-	SignatureOk bool   `json:"signature_ok"`
+	Provider       string      `json:"provider"`
+	Raw            []byte      `json:"raw"`
+	SignatureOk    bool        `json:"signature_ok"`
+	OrganizationID pgtype.UUID `json:"organization_id"`
 }
 
 func (q *Queries) InsertWebhookReceipt(ctx context.Context, arg InsertWebhookReceiptParams) (pgtype.UUID, error) {
-	row := q.db.QueryRow(ctx, insertWebhookReceipt, arg.Provider, arg.Raw, arg.SignatureOk)
+	row := q.db.QueryRow(ctx, insertWebhookReceipt,
+		arg.Provider,
+		arg.Raw,
+		arg.SignatureOk,
+		arg.OrganizationID,
+	)
 	var id pgtype.UUID
 	err := row.Scan(&id)
 	return id, err
@@ -299,6 +343,45 @@ func (q *Queries) InternalMapped(ctx context.Context, arg InternalMappedParams) 
 	var exists bool
 	err := row.Scan(&exists)
 	return exists, err
+}
+
+const listAPIKeysForTenant = `-- name: ListAPIKeysForTenant :many
+SELECT id, prefix, scopes, rate_tier, created_at FROM api_keys
+WHERE tenant_id = $1 ORDER BY created_at DESC
+`
+
+type ListAPIKeysForTenantRow struct {
+	ID        pgtype.UUID        `json:"id"`
+	Prefix    string             `json:"prefix"`
+	Scopes    []string           `json:"scopes"`
+	RateTier  string             `json:"rate_tier"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
+}
+
+func (q *Queries) ListAPIKeysForTenant(ctx context.Context, tenantID pgtype.UUID) ([]ListAPIKeysForTenantRow, error) {
+	rows, err := q.db.Query(ctx, listAPIKeysForTenant, tenantID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListAPIKeysForTenantRow
+	for rows.Next() {
+		var i ListAPIKeysForTenantRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Prefix,
+			&i.Scopes,
+			&i.RateTier,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const listAPIKeysForUser = `-- name: ListAPIKeysForUser :many
@@ -463,6 +546,92 @@ func (q *Queries) PublicOrgBySlug(ctx context.Context, slug string) ([]PublicOrg
 	return items, nil
 }
 
+const publicOrgBySlugFull = `-- name: PublicOrgBySlugFull :one
+SELECT o.id, o.name, o.slug, o.city, o.country_code, o.maturity_level, o.description,
+  (SELECT count(*) FROM organization_memberships m WHERE m.organization_id = o.id
+    AND m.lifecycle_state = 'active')::int AS member_count,
+  b.primary_color, b.secondary_color, b.motto, b.founded_year
+FROM organizations o
+LEFT JOIN org_branding b ON b.organization_id = o.id
+WHERE o.slug = $1 AND o.is_public_listed AND o.deleted_at IS NULL
+`
+
+type PublicOrgBySlugFullRow struct {
+	ID             pgtype.UUID `json:"id"`
+	Name           string      `json:"name"`
+	Slug           string      `json:"slug"`
+	City           pgtype.Text `json:"city"`
+	CountryCode    pgtype.Text `json:"country_code"`
+	MaturityLevel  int32       `json:"maturity_level"`
+	Description    pgtype.Text `json:"description"`
+	MemberCount    int32       `json:"member_count"`
+	PrimaryColor   pgtype.Text `json:"primary_color"`
+	SecondaryColor pgtype.Text `json:"secondary_color"`
+	Motto          pgtype.Text `json:"motto"`
+	FoundedYear    pgtype.Int4 `json:"founded_year"`
+}
+
+// Portal profile: public fields + branding + EXCO roster (opted-in orgs only).
+func (q *Queries) PublicOrgBySlugFull(ctx context.Context, slug string) (PublicOrgBySlugFullRow, error) {
+	row := q.db.QueryRow(ctx, publicOrgBySlugFull, slug)
+	var i PublicOrgBySlugFullRow
+	err := row.Scan(
+		&i.ID,
+		&i.Name,
+		&i.Slug,
+		&i.City,
+		&i.CountryCode,
+		&i.MaturityLevel,
+		&i.Description,
+		&i.MemberCount,
+		&i.PrimaryColor,
+		&i.SecondaryColor,
+		&i.Motto,
+		&i.FoundedYear,
+	)
+	return i, err
+}
+
+const publicOrgExco = `-- name: PublicOrgExco :many
+SELECT p.name AS position_name, u.display_name
+FROM officer_appointments oa
+JOIN terms t ON t.id = oa.term_id AND t.is_current
+JOIN org_positions p ON p.id = oa.position_id AND p.is_executive
+JOIN organization_memberships m ON m.id = oa.member_id
+JOIN users u ON u.id = m.user_id
+WHERE oa.organization_id = $1
+  AND (oa.ends_at IS NULL OR oa.ends_at >= CURRENT_DATE)
+  AND m.lifecycle_state = 'active'
+ORDER BY p.name
+`
+
+type PublicOrgExcoRow struct {
+	PositionName string `json:"position_name"`
+	DisplayName  string `json:"display_name"`
+}
+
+// Current-term executive roster for the public portal: position + display
+// name only (no contact data — Rule: opted-in fields only).
+func (q *Queries) PublicOrgExco(ctx context.Context, organizationID pgtype.UUID) ([]PublicOrgExcoRow, error) {
+	rows, err := q.db.Query(ctx, publicOrgExco, organizationID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []PublicOrgExcoRow
+	for rows.Next() {
+		var i PublicOrgExcoRow
+		if err := rows.Scan(&i.PositionName, &i.DisplayName); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const publicOrgNeedsSync = `-- name: PublicOrgNeedsSync :many
 SELECT o.id FROM organizations o
 WHERE o.is_public_listed AND o.deleted_at IS NULL
@@ -526,6 +695,23 @@ func (q *Queries) QueuedSyncJobs(ctx context.Context) ([]SyncJobs, error) {
 	return items, nil
 }
 
+const revokeAPIKeyForTenant = `-- name: RevokeAPIKeyForTenant :execrows
+UPDATE api_keys SET revoked_at = now() WHERE id = $1 AND tenant_id = $2 AND revoked_at IS NULL
+`
+
+type RevokeAPIKeyForTenantParams struct {
+	ID       pgtype.UUID `json:"id"`
+	TenantID pgtype.UUID `json:"tenant_id"`
+}
+
+func (q *Queries) RevokeAPIKeyForTenant(ctx context.Context, arg RevokeAPIKeyForTenantParams) (int64, error) {
+	result, err := q.db.Exec(ctx, revokeAPIKeyForTenant, arg.ID, arg.TenantID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const revokeAPIKeyForUser = `-- name: RevokeAPIKeyForUser :execrows
 UPDATE api_keys SET revoked_at = now() WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL
 `
@@ -562,7 +748,7 @@ func (q *Queries) SetConnectorEnabled(ctx context.Context, arg SetConnectorEnabl
 }
 
 const unprocessedReceipts = `-- name: UnprocessedReceipts :many
-SELECT id, provider, raw, signature_ok, processed_at, created_at FROM webhook_receipts WHERE processed_at IS NULL
+SELECT id, provider, raw, signature_ok, processed_at, created_at, organization_id FROM webhook_receipts WHERE processed_at IS NULL
 ORDER BY created_at LIMIT 100
 `
 
@@ -582,6 +768,7 @@ func (q *Queries) UnprocessedReceipts(ctx context.Context) ([]WebhookReceipts, e
 			&i.SignatureOk,
 			&i.ProcessedAt,
 			&i.CreatedAt,
+			&i.OrganizationID,
 		); err != nil {
 			return nil, err
 		}
@@ -591,4 +778,23 @@ func (q *Queries) UnprocessedReceipts(ctx context.Context) ([]WebhookReceipts, e
 		return nil, err
 	}
 	return items, nil
+}
+
+const webhookReceipt = `-- name: WebhookReceipt :one
+SELECT id, provider, raw, signature_ok, processed_at, created_at, organization_id FROM webhook_receipts WHERE id = $1
+`
+
+func (q *Queries) WebhookReceipt(ctx context.Context, id pgtype.UUID) (WebhookReceipts, error) {
+	row := q.db.QueryRow(ctx, webhookReceipt, id)
+	var i WebhookReceipts
+	err := row.Scan(
+		&i.ID,
+		&i.Provider,
+		&i.Raw,
+		&i.SignatureOk,
+		&i.ProcessedAt,
+		&i.CreatedAt,
+		&i.OrganizationID,
+	)
+	return i, err
 }

@@ -64,10 +64,10 @@ func TestJWTRoundtrip(t *testing.T) {
 
 func TestActionTokenPurpose(t *testing.T) {
 	tok, _ := SignActionToken("sec", "uid-1", "verify_email", time.Hour)
-	if _, _, err := VerifyActionToken("sec", tok, "verify_email"); err != nil {
+	if _, _, _, err := VerifyActionToken("sec", tok, "verify_email"); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := VerifyActionToken("sec", tok, "password_reset"); err == nil {
+	if _, _, _, err := VerifyActionToken("sec", tok, "password_reset"); err == nil {
 		t.Fatal("cross-purpose token accepted")
 	}
 }

@@ -5,6 +5,8 @@ package elections
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -229,6 +231,11 @@ func (s *Service) BeginNominations(ctx context.Context, oc *tenant.OrgCtx, eid u
 	return s.transition(ctx, oc, eid, "setup", "nominations", "NominationsOpened", "nominations_opened")
 }
 
+// BeginCampaign — nominations close into the campaign window before voting.
+func (s *Service) BeginCampaign(ctx context.Context, oc *tenant.OrgCtx, eid uuid.UUID) error {
+	return s.transition(ctx, oc, eid, "nominations", "campaign", "CampaignStarted", "campaign_started")
+}
+
 func (s *Service) OpenVoting(ctx context.Context, oc *tenant.OrgCtx, eid uuid.UUID) error {
 	e, err := s.Get(ctx, oc, eid)
 	if err != nil {
@@ -262,7 +269,9 @@ func (s *Service) Nominate(ctx context.Context, oc *tenant.OrgCtx, eid uuid.UUID
 	if err != nil {
 		return uuid.Nil, err
 	}
-	if e.State != "nominations" && e.State != "campaign" {
+	// §21: nominations close when the campaign window opens — candidates
+	// are accepted in 'nominations' only.
+	if e.State != "nominations" {
 		return uuid.Nil, ErrBadState
 	}
 	positions, err := s.q.OrgPositions(ctx, e.OrganizationID)
@@ -281,6 +290,14 @@ func (s *Service) Nominate(ctx context.Context, oc *tenant.OrgCtx, eid uuid.UUID
 	}
 	if err := s.eligibility(ctx, e, memberID); err != nil {
 		return uuid.Nil, err
+	}
+	if scopeUnitID != uuid.Nil {
+		// the contest scope must be a unit of THIS org — a foreign unit
+		// would graft another org's seats at ratify.
+		if _, err := s.q.GetCommitteeUnit(ctx, db.GetCommitteeUnitParams{
+			ID: toPg(scopeUnitID), OrganizationID: e.OrganizationID}); err != nil {
+			return uuid.Nil, ErrBadValue
+		}
 	}
 	var id uuid.UUID
 	err = s.withTx(ctx, func(q *db.Queries) error {
@@ -394,6 +411,11 @@ func (s *Service) Vote(ctx context.Context, oc *tenant.OrgCtx, eid uuid.UUID, ch
 	if e.State != "voting" {
 		return ErrBadState
 	}
+	// the state machine is driven by sweeps — a stale 'voting' state must
+	// not admit ballots past the declared close.
+	if e.VotingCloses.Valid && time.Now().After(e.VotingCloses.Time) {
+		return ErrBadState // voting_closes passed — close sweep will conclude
+	}
 	if err := s.eligibility(ctx, e, oc.MembershipID); err != nil {
 		return err
 	}
@@ -420,10 +442,17 @@ func (s *Service) Vote(ctx context.Context, oc *tenant.OrgCtx, eid uuid.UUID, ch
 			ok[fromPg(c.ID)] = fromPg(c.PositionID)
 		}
 	}
+	contested := map[uuid.UUID]bool{}
+	for _, pos := range ok {
+		contested[pos] = true // a vetted candidate exists for this seat
+	}
 	seenPositions := map[uuid.UUID]bool{}
 	for _, ch := range choices {
 		if !orgPositions[ch.PositionID] {
 			return ErrBadValue // seat isn't in this org's position list
+		}
+		if !contested[ch.PositionID] {
+			return ErrBadValue // no contest on this seat in this election
 		}
 		if ch.CandidateID != uuid.Nil {
 			pos, found := ok[ch.CandidateID]
@@ -451,14 +480,17 @@ func (s *Service) Vote(ctx context.Context, oc *tenant.OrgCtx, eid uuid.UUID, ch
 			}
 			return err
 		}
-		seq, err := q.NextCastSeq(ctx, e.ID)
+		// cast_seq is an ORDERING-ONLY nonce — a ballot's choices share one
+		// random value so ordering can't correlate them to the ballots
+		// table's positional row (§21: no correlatable field).
+		seq, err := randomCastSeq()
 		if err != nil {
 			return err
 		}
 		for _, ch := range choices {
 			if err := q.InsertVote(ctx, db.InsertVoteParams{
 				ElectionID: e.ID, PositionID: toPg(ch.PositionID),
-				CandidateID: toPg(ch.CandidateID), CastSeq: int64(seq)}); err != nil {
+				CandidateID: toPg(ch.CandidateID), CastSeq: seq}); err != nil {
 				return err
 			}
 		}
@@ -567,18 +599,12 @@ func (s *Service) Ratify(ctx context.Context, oc *tenant.OrgCtx, eid uuid.UUID) 
 		if seats < 1 {
 			seats = 1
 		}
+		// tie AT the cutoff: the last winning vote count must differ from
+		// the first loser's — otherwise that seat is contested (stays
+		// unfilled + audited), never assigned arbitrarily.
 		var cut int64 = -1
-		for i, c := range list {
-			if i >= seats {
-				break
-			}
-			if c.votes == 0 {
-				break
-			}
-			// tie at the cutoff boundary → those seats stay empty
-			if i > 0 && i == seats-1 && c.votes == list[i-1].votes {
-				cut = c.votes
-			}
+		if len(list) > seats && list[seats-1].votes > 0 && list[seats].votes == list[seats-1].votes {
+			cut = list[seats-1].votes
 		}
 		for i, c := range list {
 			if i >= seats || c.votes == 0 {
@@ -833,4 +859,14 @@ func (s *Service) RemindersSweep(ctx context.Context) (int, error) {
 		}
 	}
 	return n, nil
+}
+
+// randomCastSeq — a crypto-random ordering nonce per ballot (§21 secrecy:
+// sequential ordinals would correlate votes↔ballots positionally).
+func randomCastSeq() (int64, error) {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return 0, err
+	}
+	return int64(binary.BigEndian.Uint64(b[:]) & (1<<63 - 1)), nil
 }

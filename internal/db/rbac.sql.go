@@ -276,6 +276,19 @@ func (q *Queries) GetPositionSeats(ctx context.Context, id pgtype.UUID) (int32, 
 	return seats, err
 }
 
+const getPositionSeatsForUpdate = `-- name: GetPositionSeatsForUpdate :one
+SELECT seats FROM org_positions WHERE id = $1 FOR UPDATE
+`
+
+// seat-cap enforcement: lock the position row inside the appoint tx so
+// concurrent appointments can't both pass under the cap.
+func (q *Queries) GetPositionSeatsForUpdate(ctx context.Context, id pgtype.UUID) (int32, error) {
+	row := q.db.QueryRow(ctx, getPositionSeatsForUpdate, id)
+	var seats int32
+	err := row.Scan(&seats)
+	return seats, err
+}
+
 const getTermOrg = `-- name: GetTermOrg :one
 SELECT organization_id, is_current, starts_at, ends_at FROM terms WHERE id = $1::uuid
 `
@@ -297,6 +310,29 @@ func (q *Queries) GetTermOrg(ctx context.Context, id pgtype.UUID) (GetTermOrgRow
 		&i.EndsAt,
 	)
 	return i, err
+}
+
+const isExecutivePositionHolder = `-- name: IsExecutivePositionHolder :one
+SELECT EXISTS (SELECT 1 FROM officer_appointments oa
+  JOIN org_positions p ON p.id = oa.position_id AND p.is_executive
+  JOIN terms t ON t.id = oa.term_id AND t.is_current
+  WHERE oa.organization_id = $1 AND oa.member_id = $2
+    AND (oa.ends_at IS NULL OR oa.ends_at >= CURRENT_DATE))
+`
+
+type IsExecutivePositionHolderParams struct {
+	OrganizationID pgtype.UUID `json:"organization_id"`
+	MemberID       pgtype.UUID `json:"member_id"`
+}
+
+// §10 field visibility 'exco': an ACTIVE appointment (Rule 21) to an
+// is_executive position — precise exco resolution, not committee
+// membership or a generic officer node.
+func (q *Queries) IsExecutivePositionHolder(ctx context.Context, arg IsExecutivePositionHolderParams) (bool, error) {
+	row := q.db.QueryRow(ctx, isExecutivePositionHolder, arg.OrganizationID, arg.MemberID)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
 }
 
 const listAppointments = `-- name: ListAppointments :many

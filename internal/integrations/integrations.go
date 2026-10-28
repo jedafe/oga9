@@ -48,8 +48,11 @@ type Service struct {
 	// postFn is the outbound transport for sync jobs — injectable for
 	// tests; defaults to a real http.Client POST in main.
 	postFn  func(ctx context.Context, url, authHeader string, payload []byte) error
-	applyFn func(ctx context.Context, slug, email, phone string, answers json.RawMessage) (uuid.UUID, error)
+	applyFn func(ctx context.Context, slug, email, phone, japaSubject string, answers json.RawMessage) (uuid.UUID, error)
 	calFn   func(ctx context.Context, oc *tenant.OrgCtx) (string, error)
+	// oga9:ics:{org_id} feed cache (Rule 4 — catalog entry in §23).
+	feedGet func(ctx context.Context, orgID uuid.UUID) (string, error)
+	feedSet func(ctx context.Context, orgID uuid.UUID, feed string) error
 }
 
 func NewService(pool *pgxpool.Pool) *Service {
@@ -58,7 +61,7 @@ func NewService(pool *pgxpool.Pool) *Service {
 
 func (s *Service) SetSecret(fn func(context.Context, string) (string, error))     { s.secretFn = fn }
 func (s *Service) SetPost(fn func(context.Context, string, string, []byte) error) { s.postFn = fn }
-func (s *Service) SetApply(fn func(context.Context, string, string, string, json.RawMessage) (uuid.UUID, error)) {
+func (s *Service) SetApply(fn func(context.Context, string, string, string, string, json.RawMessage) (uuid.UUID, error)) {
 	s.applyFn = fn
 }
 func (s *Service) SetCalendar(fn func(context.Context, *tenant.OrgCtx) (string, error)) {
@@ -128,6 +131,7 @@ func (s *Service) Intake(ctx context.Context, provider string, raw []byte, signa
 	}
 	conns, _ := s.q.ConnectorsByKind(ctx, provider)
 	sigOK := false
+	var orgID uuid.UUID
 	if s.secretFn != nil {
 		for _, conn := range conns {
 			if !conn.CredentialRef.Valid {
@@ -135,13 +139,14 @@ func (s *Service) Intake(ctx context.Context, provider string, raw []byte, signa
 			}
 			secret, err := s.secretFn(ctx, conn.CredentialRef.String)
 			if err == nil && secret != "" && verifySignature(provider, secret, raw, signature) {
-				sigOK = true // the verifying connector attributes the org
+				sigOK = true
+				orgID = fromPg(conn.OrganizationID) // the verifying connector attributes the org
 				break
 			}
 		}
 	}
 	rid, err := s.q.InsertWebhookReceipt(ctx, db.InsertWebhookReceiptParams{
-		Provider: provider, Raw: raw, SignatureOk: sigOK})
+		Provider: provider, Raw: raw, SignatureOk: sigOK, OrganizationID: toPg(orgID)})
 	if err != nil {
 		return uuid.Nil, false, err
 	}
@@ -175,6 +180,7 @@ func verifySignature(provider, secret string, raw []byte, sig string) bool {
 // ProcessReceipt — integrations:webhook_process: the recorded raw event
 // emits ExternalEventReceived for downstream consumers; receipt marked.
 func (s *Service) ProcessReceipt(ctx context.Context, receiptID uuid.UUID) error {
+	var orgID, tid uuid.UUID
 	return s.withTx(ctx, func(q *db.Queries) error {
 		n, err := q.MarkReceiptProcessed(ctx, toPg(receiptID))
 		if err != nil {
@@ -183,9 +189,19 @@ func (s *Service) ProcessReceipt(ctx context.Context, receiptID uuid.UUID) error
 		if n == 0 {
 			return nil // already processed — idempotent
 		}
-		return events.Emit(ctx, q, uuid.Nil, uuid.Nil, "ExternalEventReceived",
+		// attribute the event to the org the verifying connector proved
+		// at intake (nil org = platform-scoped provider event).
+		if r, err := q.WebhookReceipt(ctx, toPg(receiptID)); err == nil {
+			orgID = fromPg(r.OrganizationID)
+			if orgID != uuid.Nil {
+				if t, err := q.OrgTenantID(ctx, r.OrganizationID); err == nil {
+					tid = fromPg(t)
+				}
+			}
+		}
+		return events.Emit(ctx, q, tid, orgID, "ExternalEventReceived",
 			"webhook_receipt", receiptID, uuid.Nil, false,
-			map[string]any{"receipt_id": receiptID})
+			map[string]any{"receipt_id": receiptID, "org_id": orgID})
 	})
 }
 
@@ -278,11 +294,13 @@ func (s *Service) LocatorJoin(ctx context.Context, slug, email, phone, japaSubje
 	if len(extra) == 0 {
 		extra = json.RawMessage("{}")
 	}
-	subject, err := s.verifyReferral(ctx, japaSubject, referralToken)
+	subject, err := s.verifyReferral(ctx, fromPg(org.ID), japaSubject, referralToken)
 	if err != nil {
 		return uuid.Nil, err
 	}
-	appID, err := s.applyFn(ctx, slug, email, phone, extra)
+	// the verified subject ("" for plain joins) lands on the application
+	// row — the durable §23 link, not event-payload only.
+	appID, err := s.applyFn(ctx, slug, email, phone, subject, extra)
 	if err != nil {
 		return uuid.Nil, err
 	}
@@ -290,8 +308,12 @@ func (s *Service) LocatorJoin(ctx context.Context, slug, email, phone, japaSubje
 	if subject != "" {
 		payload["japa_subject"] = subject // only when the token proved it
 	}
+	var tid uuid.UUID
+	if t, err := s.q.OrgTenantID(ctx, org.ID); err == nil {
+		tid = fromPg(t)
+	}
 	err = s.withTx(ctx, func(q *db.Queries) error {
-		return events.Emit(ctx, q, uuid.Nil, fromPg(org.ID), "MembershipRequestReceived",
+		return events.Emit(ctx, q, tid, fromPg(org.ID), "MembershipRequestReceived",
 			"membership_application", appID, uuid.Nil, true, payload)
 	})
 	return appID, err
@@ -303,7 +325,7 @@ func (s *Service) LocatorJoin(ctx context.Context, slug, email, phone, japaSubje
 // credential_ref secret. A claimed japa_subject without a proving token
 // is REJECTED (never trust request-supplied identity, Rule 24 pattern);
 // no subject at all → a plain application.
-func (s *Service) verifyReferral(ctx context.Context, japaSubject, token string) (string, error) {
+func (s *Service) verifyReferral(ctx context.Context, orgID uuid.UUID, japaSubject, token string) (string, error) {
 	if token == "" {
 		if japaSubject != "" {
 			return "", ErrBadSignature // claimed identity without proof
@@ -329,7 +351,13 @@ func (s *Service) verifyReferral(ctx context.Context, japaSubject, token string)
 	if claims.Exp <= 0 || time.Now().Unix() > claims.Exp {
 		return "", ErrBadSignature // missing or expired referral
 	}
-	conns, _ := s.q.ConnectorsByKind(ctx, "japaconnect")
+	// §23: the signature verifies against THE TARGET ORG's japaconnect
+	// connector secret — a token minted for another org must not cross.
+	conn, err := s.q.ConnectorByKind(ctx, db.ConnectorByKindParams{Kind: "japaconnect", OrgID: toPg(orgID)})
+	if err != nil {
+		return "", ErrBadSignature // no org connector → nothing to verify against
+	}
+	conns := []db.Connectors{conn}
 	for _, conn := range conns {
 		if !conn.CredentialRef.Valid || s.secretFn == nil {
 			continue
@@ -340,7 +368,7 @@ func (s *Service) verifyReferral(ctx context.Context, japaSubject, token string)
 		}
 		mac := hmac.New(sha256.New, []byte(secret))
 		mac.Write([]byte(payloadB64))
-		if base64.RawURLEncoding.EncodeToString(mac.Sum(nil)) == sigB64 {
+		if hmac.Equal([]byte(base64.RawURLEncoding.EncodeToString(mac.Sum(nil))), []byte(sigB64)) {
 			return claims.Subject, nil // token proved the subject
 		}
 	}
@@ -398,18 +426,29 @@ func (s *Service) Authenticate(ctx context.Context, rawKey string) (db.ApiKeys, 
 
 // ---------- ICS ----------
 
-// Calendar — GET /orgs/{id}/calendar.ics via the activities seam.
+// Calendar — GET /orgs/{id}/calendar.ics via the activities seam;
+// serves the oga9:ics:{org_id} cache when warm, then re-renders + stores.
 func (s *Service) Calendar(ctx context.Context, oc *tenant.OrgCtx) (string, error) {
+	if s.feedGet != nil {
+		if feed, err := s.feedGet(ctx, oc.OrgID); err == nil && feed != "" {
+			return feed, nil
+		}
+	}
 	if s.calFn == nil {
 		return "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//OGA9//EN\r\nEND:VCALENDAR\r\n", nil
 	}
-	return s.calFn(ctx, oc)
+	feed, err := s.calFn(ctx, oc)
+	if err != nil {
+		return "", err
+	}
+	if s.feedSet != nil {
+		_ = s.feedSet(ctx, oc.OrgID, feed)
+	}
+	return feed, nil
 }
 
 // IcsFeedSweep — integrations:ics_feed (low): reserved — ICS is rendered
 // on demand; the sweep is a registered no-op for connector health-checks.
-func (s *Service) IcsFeedSweep(ctx context.Context) error { return nil }
-
 // ProcessQueuedReceipts — the periodic form of webhook_process: drains
 // receipts that arrived while the sweep wasn't running.
 func (s *Service) ProcessQueuedReceipts(ctx context.Context) error {
@@ -437,6 +476,15 @@ func (s *Service) PushSyncJobs(ctx context.Context) (int, error) {
 	}
 	var n int
 	for _, j := range rows {
+		// CAS claim — a concurrent drain (two workers on the same queue)
+		// must not double-deliver; the loser sees 0 rows and skips.
+		claimed, err := s.q.ClaimSyncJob(ctx, j.ID)
+		if err != nil {
+			return n, err
+		}
+		if claimed == 0 {
+			continue
+		}
 		if err := s.deliverJob(ctx, j); err != nil {
 			return n, err
 		}
@@ -488,9 +536,16 @@ func (s *Service) deliverJob(ctx context.Context, j db.SyncJobs) error {
 	}
 	if state == "failed" {
 		return s.withTx(ctx, func(q *db.Queries) error {
-			return events.Emit(ctx, q, uuid.Nil, uuid.Nil, "SyncFailed",
+			orgID := fromPg(conn.OrganizationID)
+			var tid uuid.UUID
+			if orgID != uuid.Nil {
+				if t, err := q.OrgTenantID(ctx, conn.OrganizationID); err == nil {
+					tid = fromPg(t)
+				}
+			}
+			return events.Emit(ctx, q, tid, orgID, "SyncFailed",
 				"sync_job", fromPg(j.ID), uuid.Nil, false,
-				map[string]any{"sync_job_id": fromPg(j.ID), "error": note})
+				map[string]any{"sync_job_id": fromPg(j.ID), "org_id": orgID, "error": note})
 		})
 	}
 	return nil
@@ -502,4 +557,147 @@ func (s *Service) PublicOrg(ctx context.Context, slug string) ([]db.PublicOrgByS
 		return nil, ErrBadValue
 	}
 	return s.q.PublicOrgBySlug(ctx, slug)
+}
+
+// ---------- tenant-scoped api keys (§23) ----------
+
+// IssueTenantKey — control-plane issued key for the tenant itself
+// (user_id NULL): automation/service integrations at the billing boundary.
+// Same scope/rate-tier model as user keys; tenant_id set on the row.
+func (s *Service) IssueTenantKey(ctx context.Context, tenantID uuid.UUID,
+	scopes []string) (keyID uuid.UUID, rawKey string, err error) {
+	buf := make([]byte, 24)
+	if _, err := rand.Read(buf); err != nil {
+		return uuid.Nil, "", err
+	}
+	raw := "oga9_" + hex.EncodeToString(buf)
+	hash := sha256.Sum256([]byte(raw))
+	id, err := s.q.InsertAPIKey(ctx, db.InsertAPIKeyParams{
+		TenantID: toPg(tenantID), Prefix: raw[:12],
+		HashedKey: hex.EncodeToString(hash[:]), Scopes: scopes, RateTier: "standard"})
+	return fromPg(id), raw, err
+}
+
+// ListTenantKeys — prefix/scope/rate-tier only, never the hash.
+func (s *Service) ListTenantKeys(ctx context.Context, tenantID uuid.UUID) ([]db.ListAPIKeysForTenantRow, error) {
+	return s.q.ListAPIKeysForTenant(ctx, toPg(tenantID))
+}
+
+// RevokeTenantKey — CAS on revoked_at (Rule 27-safe).
+func (s *Service) RevokeTenantKey(ctx context.Context, tenantID, keyID uuid.UUID) error {
+	n, err := s.q.RevokeAPIKeyForTenant(ctx, db.RevokeAPIKeyForTenantParams{
+		ID: toPg(keyID), TenantID: toPg(tenantID)})
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// ---------- ics feed cache (§23) ----------
+
+// SetFeedCache wires the oga9:ics:{org_id} feed cache (Rule 4 key in the
+// catalog). get misses → regenerate; set overwrites with fresh bytes.
+func (s *Service) SetFeedCache(getFn func(ctx context.Context, orgID uuid.UUID) (string, error),
+	setFn func(ctx context.Context, orgID uuid.UUID, feed string) error) {
+	s.feedGet, s.feedSet = getFn, setFn
+}
+
+// IcsFeedSweep — pre-warm feed caches for orgs with enabled ics connectors
+// (the catalog task does real work now, not just a health check).
+func (s *Service) IcsFeedSweep(ctx context.Context) error {
+	if s.calFn == nil || s.feedSet == nil {
+		return nil // calendar/cache unwired — nothing to warm
+	}
+	orgs, err := s.q.EnabledIcsOrgs(ctx)
+	if err != nil {
+		return err
+	}
+	for _, oid := range orgs {
+		orgID := uuid.UUID(oid.Bytes)
+		tid, err := s.q.OrgTenantID(ctx, toPg(orgID))
+		if err != nil {
+			continue
+		}
+		oc := &tenant.OrgCtx{OrgID: orgID, TenantID: fromPg(tid)}
+		feed, err := s.calFn(ctx, oc)
+		if err != nil || feed == "" {
+			continue
+		}
+		if err := s.feedSet(ctx, orgID, feed); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// PublicOrgProfile — the portal landing payload (ROADMAP-MAIN 07.01):
+// opted-in fields + branding + the current-term EXCO roster.
+func (s *Service) PublicOrgProfile(ctx context.Context, slug string) (map[string]any, error) {
+	if slug == "" {
+		return nil, ErrBadValue
+	}
+	o, err := s.q.PublicOrgBySlugFull(ctx, slug)
+	if err != nil {
+		return nil, err
+	}
+	exco, err := s.q.PublicOrgExco(ctx, o.ID)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{
+		"id": o.ID, "name": o.Name, "slug": o.Slug, "city": o.City,
+		"country_code": o.CountryCode, "maturity_level": o.MaturityLevel,
+		"description": o.Description, "member_count": o.MemberCount,
+		"branding": map[string]any{
+			"primary_color": o.PrimaryColor, "secondary_color": o.SecondaryColor,
+			"motto": o.Motto, "founded_year": o.FoundedYear,
+		},
+		"exco": exco,
+	}, nil
+}
+
+// ResolveHost maps a request host to a listed org — `{slug}.{base}` strips
+// the base domain; anything else is a custom_domain lookup (§04/ADR-021).
+// The public portal calls this to resolve its own host before rendering.
+// ResolveHost → (slug, host_kind). host_kind tells the caller which surface
+// the host represents: "admin" (admin.{slug}.{base} — org console),
+// "subdomain" ({slug}.{base} portal), or "custom" (organizations.custom_domain).
+// Platform surfaces (app/www/docs/api/base apex) are not org addresses.
+var reservedSurfaces = map[string]bool{
+	"app": true, "admin": true, "control": true, "api": true,
+	"www": true, "docs": true,
+}
+
+func (s *Service) ResolveHost(ctx context.Context, host, baseDomain string) (string, string, error) {
+	host = strings.ToLower(strings.Split(host, ":")[0])
+	suffix := "." + strings.ToLower(baseDomain)
+	if strings.HasSuffix(host, suffix) {
+		head := strings.TrimSuffix(host, suffix)
+		if head == "" || reservedSurfaces[head] {
+			return "", "", ErrBadValue
+		}
+		if strings.HasPrefix(head, "admin.") {
+			// admin.{slug}.{base} — the org console interface
+			slug := strings.TrimPrefix(head, "admin.")
+			if slug == "" || strings.Contains(slug, ".") || reservedSurfaces[slug] {
+				return "", "", ErrBadValue
+			}
+			return slug, "admin", nil
+		}
+		if strings.Contains(head, ".") {
+			return "", "", ErrBadValue // deeper nesting isn't an org address
+		}
+		return head, "subdomain", nil
+	}
+	if strings.HasPrefix(host, "www.") {
+		host = host[4:] // www-alias resolves to the bare custom domain
+	}
+	r, err := s.q.OrgByCustomDomain(ctx, host)
+	if err != nil {
+		return "", "", err
+	}
+	return r, "custom", nil
 }

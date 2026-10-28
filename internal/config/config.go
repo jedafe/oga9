@@ -33,12 +33,13 @@ type Config struct {
 	VoiceJoinWindowSec   int
 	VoiceRoomMaxAgeHours int
 	// §22 ai — OpenAI-compatible provider endpoint (empty = unavailable).
-	AIProviderURL   string
-	AIProviderKey   string
-	AIProviderModel string
-	TrialDays       int // §15 default provision trial length (operator may override per request)
-	SessionTTL      time.Duration
-	OutboxInterval  time.Duration // events:dispatch_outbox cadence (§05)
+	AIProviderURL       string
+	AIProviderKey       string
+	AIProviderModel     string
+	AICostPer1KMicroUSD int64 // metering rate (OGA9_AI_COST_PER_1K_MICRO_USD)
+	TrialDays           int   // §15 default provision trial length (operator may override per request)
+	SessionTTL          time.Duration
+	OutboxInterval      time.Duration // events:dispatch_outbox cadence (§05)
 	// §08 job queue cadences
 	SchedulerTickInterval   time.Duration // scheduler:tick cron driver
 	RetryDeadInterval       time.Duration // events:retry_dead DLQ re-drive
@@ -95,6 +96,7 @@ func Load() (*Config, error) {
 		AIProviderURL:           env("OGA9_AI_PROVIDER_URL", ""),
 		AIProviderKey:           env("OGA9_AI_API_KEY", ""),
 		AIProviderModel:         env("OGA9_AI_MODEL", "llama3"),
+		AICostPer1KMicroUSD:     int64(envInt(&errs, "OGA9_AI_COST_PER_1K_MICRO_USD", 0)),
 		TrialDays:               envInt(&errs, "OGA9_TRIAL_DAYS", 14),
 		LicenseFile:             env("OGA9_LICENSE_FILE", ""),
 		LicensePublicKey:        env("OGA9_LICENSE_PUBLIC_KEY", ""),

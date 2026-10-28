@@ -16,12 +16,14 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	valkey "github.com/valkey-io/valkey-go"
 
 	"github.com/jedafe/oga9/internal/db"
 	"github.com/jedafe/oga9/internal/events"
+	"github.com/jedafe/oga9/internal/rules"
 	"github.com/jedafe/oga9/internal/tenant"
 )
 
@@ -47,6 +49,7 @@ var claimChannels = map[string]bool{
 }
 
 type Service struct {
+	ru   *rules.Service // ADR-016 rules engine — org_settings resolve through it (Rule 23)
 	pool *pgxpool.Pool
 	q    *db.Queries
 	vk   valkey.Client
@@ -54,10 +57,13 @@ type Service struct {
 	// wired from activities.Service (Rule 26: finance never reads the
 	// activities tables itself).
 	activityGate func(ctx context.Context, orgID, activityID uuid.UUID) bool
+	// mandateLimit is the §16 governance seam for committee-capped spend
+	// (§25 expenses.mandate_id) — wired from governance.Service (Rule 26).
+	mandateLimit func(ctx context.Context, unitID uuid.UUID) (int64, string, bool)
 }
 
 func NewService(pool *pgxpool.Pool, vk valkey.Client) *Service {
-	return &Service{pool: pool, q: db.New(pool), vk: vk}
+	return &Service{ru: rules.New(pool), pool: pool, q: db.New(pool), vk: vk}
 }
 
 // SetActivityGate wires the activities-module check for event-linked
@@ -79,6 +85,11 @@ func (s *Service) PaymentSnapshot(ctx context.Context, paymentID uuid.UUID) (mem
 func toPg(u uuid.UUID) pgtype.UUID   { return pgtype.UUID{Bytes: u, Valid: u != uuid.Nil} }
 func fromPg(u pgtype.UUID) uuid.UUID { return uuid.UUID(u.Bytes) }
 func pgText(s string) pgtype.Text    { return pgtype.Text{String: s, Valid: s != ""} }
+
+func isUniqueViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505"
+}
 func pgDate(t time.Time) pgtype.Date { return pgtype.Date{Time: t, Valid: !t.IsZero()} }
 
 func (s *Service) withTx(ctx context.Context, fn func(*db.Queries) error) error {
@@ -341,6 +352,7 @@ type PaymentIn struct {
 	ObligationID    uuid.UUID `json:"obligation_id"`
 	DriveID         uuid.UUID `json:"drive_id"`
 	ActivityID      uuid.UUID `json:"activity_id"` // event-linked contribution (§12 donations view)
+	InvoiceID       uuid.UUID `json:"invoice_id"`  // §25 invoice settlement
 	BenefitMemberID uuid.UUID `json:"benefit_member_id"`
 	AmountMinor     int64     `json:"amount_minor"`
 	Currency        string    `json:"currency"`
@@ -573,6 +585,11 @@ func (s *Service) postConfirmation(ctx context.Context, q *db.Queries, oc *tenan
 	if err := refreshObligation(ctx, q, p.OrganizationID, p.ObligationID); err != nil {
 		return err
 	}
+	// §25: invoice-linked payments recompute issued|partially_paid|paid —
+	// 'paid' only ever lands on confirmed ledger money.
+	if err := s.RefreshInvoiceState(ctx, q, p.InvoiceID); err != nil {
+		return err
+	}
 	tid, orgID := oc.TenantID, fromPg(p.OrganizationID)
 	for _, ev := range []struct {
 		name, aggType string
@@ -598,6 +615,11 @@ func (s *Service) postConfirmation(ctx context.Context, q *db.Queries, oc *tenan
 // untouched (Rule 19: corrections are reversal_of entries, never edits).
 func (s *Service) ReversePayment(ctx context.Context, oc *tenant.OrgCtx, pid uuid.UUID, memo string) error {
 	return s.withTx(ctx, func(q *db.Queries) error {
+		// §25: payments backing a disbursed expense are system spend —
+		// reversing one would orphan the budget spent_minor projection.
+		if ex, err := q.DisbursedExpenseForPayment(ctx, toPg(pid)); err == nil && ex.State == "disbursed" {
+			return ErrInvalidTransition
+		}
 		p, err := q.ReversePayment(ctx, db.ReversePaymentParams{ID: toPg(pid), OrganizationID: toPg(oc.OrgID)})
 		if err == pgx.ErrNoRows {
 			return ErrInvalidTransition
@@ -660,15 +682,15 @@ func (s *Service) RetryPayment(ctx context.Context, pid uuid.UUID) error {
 
 // ---------- claims (member claim → officer verify) ----------
 
-func (s *Service) SubmitClaim(ctx context.Context, oc *tenant.OrgCtx, in PaymentIn, note string, receiptMediaID uuid.UUID) (uuid.UUID, error) {
+func (s *Service) SubmitClaim(ctx context.Context, oc *tenant.OrgCtx, in PaymentIn, note string, receiptMediaID uuid.UUID) (*db.PaymentClaims, bool, error) {
 	if in.AmountMinor <= 0 || in.Currency == "" {
-		return uuid.Nil, ErrBadValue
+		return nil, false, ErrBadValue
 	}
 	if in.Channel == "" {
 		in.Channel = "transfer" // schema default — members report bank tx mostly
 	}
 	if !claimChannels[in.Channel] {
-		return uuid.Nil, ErrBadChannel
+		return nil, false, ErrBadChannel
 	}
 	if in.ObligationID != uuid.Nil {
 		// Claims settle the claimant's OWN obligations — paying on behalf of
@@ -677,30 +699,42 @@ func (s *Service) SubmitClaim(ctx context.Context, oc *tenant.OrgCtx, in Payment
 		if ob, err := s.q.GetObligation(ctx, db.GetObligationParams{
 			ID: toPg(in.ObligationID), OrganizationID: toPg(oc.OrgID)}); err != nil ||
 			fromPg(ob.MembershipID) != oc.MembershipID {
-			return uuid.Nil, ErrNotFound
+			return nil, false, ErrNotFound
 		}
 	}
 	if in.DriveID != uuid.Nil {
 		d, err := s.q.GetDrive(ctx, db.GetDriveParams{ID: toPg(in.DriveID), OrganizationID: toPg(oc.OrgID)})
 		if err != nil {
-			return uuid.Nil, ErrNotFound
+			return nil, false, ErrNotFound
 		}
 		if d.State != "open" {
-			return uuid.Nil, ErrInvalidTransition
+			return nil, false, ErrInvalidTransition
 		}
 		if d.Kind == "fixed_amount" && d.FixedAmountMinor.Valid && in.AmountMinor != d.FixedAmountMinor.Int64 {
-			return uuid.Nil, ErrDriveKind
+			return nil, false, ErrDriveKind
 		}
 	}
 	// require_receipt for non-cash (org.finance.claims.require_receipt, default true)
 	if in.Channel != "cash" && receiptMediaID == uuid.Nil {
 		req := true
-		if raw, err := s.q.GetOrgSetting(ctx, db.GetOrgSettingParams{
-			OrganizationID: toPg(oc.OrgID), Key: "org.finance.claims.require_receipt"}); err == nil {
+		if raw, err := s.ru.Value(ctx, oc.OrgID, "org.finance.claims.require_receipt"); err == nil {
 			_ = json.Unmarshal(raw, &req)
 		}
 		if req {
-			return uuid.Nil, errors.New("receipt proof required for non-cash claims")
+			return nil, false, errors.New("receipt proof required for non-cash claims")
+		}
+	}
+	// Rule 9: replayed Idempotency-Key returns the original claim; a key
+	// bound to a different org's claim is a conflict, never a replay.
+	if in.IdempotencyKey != "" {
+		if c, err := s.q.ClaimByIdempotencyKey(ctx, db.ClaimByIdempotencyKeyParams{
+			OrganizationID: toPg(oc.OrgID), IdempotencyKey: pgText(in.IdempotencyKey)}); err == nil {
+			return &c, true, nil // replay — the original claim row, not a duplicate
+			// (its state may already be confirmed — report it, don't claim submitted)
+		}
+		if oid, e2 := s.q.ClaimOrgForIdempotencyKey(ctx, pgText(in.IdempotencyKey)); e2 == nil &&
+			uuid.UUID(oid.Bytes) != oc.OrgID {
+			return nil, false, ErrIdempotencyConflict
 		}
 	}
 	var row db.PaymentClaims
@@ -712,7 +746,8 @@ func (s *Service) SubmitClaim(ctx context.Context, oc *tenant.OrgCtx, in Payment
 			AmountMinor: in.AmountMinor, Currency: in.Currency,
 			Channel: in.Channel, ExternalRef: pgText(in.ExternalRef),
 			ReceiptMediaID: toPg(receiptMediaID), Note: pgText(note),
-			HideContributor: in.HideContributor})
+			HideContributor: in.HideContributor,
+			IdempotencyKey:  pgText(in.IdempotencyKey)})
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrAlreadyClaimed // ON CONFLICT DO NOTHING — same ref already claimed
 		}
@@ -725,9 +760,15 @@ func (s *Service) SubmitClaim(ctx context.Context, oc *tenant.OrgCtx, in Payment
 				"amount_minor": in.AmountMinor, "drive_id": in.DriveID})
 	})
 	if err != nil {
-		return uuid.Nil, err
+		if in.IdempotencyKey != "" && isUniqueViolation(err) {
+			if c, e2 := s.q.ClaimByIdempotencyKey(ctx, db.ClaimByIdempotencyKeyParams{
+				OrganizationID: toPg(oc.OrgID), IdempotencyKey: pgText(in.IdempotencyKey)}); e2 == nil {
+				return &c, true, nil // concurrent replay — the twin already committed
+			}
+		}
+		return nil, false, err
 	}
-	return fromPg(row.ID), nil
+	return &row, false, nil
 }
 
 // ConfirmClaim creates the payment + ledger + receipt trail — the claim is
@@ -1084,7 +1125,7 @@ func (s *Service) OverdueSweep(ctx context.Context, graceDays int) (int, error) 
 // orgSettingInt / orgSettingBool — org_settings lookups with catalog
 // defaults (Rule 3/23: org rules resolve through settings).
 func (s *Service) orgSettingInt(ctx context.Context, orgID uuid.UUID, key string, fallback int64) int64 {
-	raw, err := s.q.GetOrgSetting(ctx, db.GetOrgSettingParams{OrganizationID: toPg(orgID), Key: key})
+	raw, err := s.ru.Value(ctx, orgID, key)
 	if err != nil {
 		return fallback
 	}
@@ -1099,7 +1140,7 @@ func (s *Service) orgSettingInt(ctx context.Context, orgID uuid.UUID, key string
 }
 
 func (s *Service) orgSettingBool(ctx context.Context, orgID uuid.UUID, key string, fallback bool) bool {
-	raw, err := s.q.GetOrgSetting(ctx, db.GetOrgSettingParams{OrganizationID: toPg(orgID), Key: key})
+	raw, err := s.ru.Value(ctx, orgID, key)
 	if err != nil {
 		return fallback
 	}
@@ -1335,8 +1376,7 @@ func (s *Service) RegistrationPending(ctx context.Context, orgID, memberID uuid.
 // (members|exco, default members) — the handler upgrades 'exco' to a
 // reports.read gate.
 func (s *Service) StatementVisibility(ctx context.Context, orgID uuid.UUID) string {
-	raw, err := s.q.GetOrgSetting(ctx, db.GetOrgSettingParams{
-		OrganizationID: toPg(orgID), Key: "org.finance.statement_visibility"})
+	raw, err := s.ru.Value(ctx, orgID, "org.finance.statement_visibility")
 	if err == nil {
 		var v string
 		if json.Unmarshal(raw, &v) == nil && (v == "exco" || v == "members") {
@@ -1393,6 +1433,18 @@ func (s *Service) Summary(ctx context.Context, oc *tenant.OrgCtx) (db.OrgPayment
 
 func (s *Service) Ledger(ctx context.Context, oc *tenant.OrgCtx, account string) ([]db.LedgerEntries, error) {
 	return s.q.ListLedgerEntries(ctx, db.ListLedgerEntriesParams{OrganizationID: toPg(oc.OrgID), Column2: account})
+}
+
+// LedgerPage — bounded page + total for the meta envelope.
+func (s *Service) LedgerPage(ctx context.Context, oc *tenant.OrgCtx, account string, lim, off int32) ([]db.LedgerEntries, int64, error) {
+	rows, err := s.q.ListLedgerEntriesPaged(ctx, db.ListLedgerEntriesPagedParams{
+		OrganizationID: toPg(oc.OrgID), Column2: account, Limit: lim, Offset: off})
+	if err != nil {
+		return nil, 0, err
+	}
+	total, err := s.q.CountLedgerEntries(ctx, db.CountLedgerEntriesParams{
+		OrganizationID: toPg(oc.OrgID), Column2: account})
+	return rows, total, err
 }
 
 // Statement — §12 org purse: current balance, monthly + yearly
@@ -1506,11 +1558,20 @@ func (s *Service) WelfareDisbursementConsumer(ctx context.Context, q *db.Queries
 		return nil // non-cash benefits (item/service/visit) post no ledger entry
 	}
 	pb, _ := uuid.Parse(postedBy)
-	_, err = q.PostLedgerEntry(ctx, db.PostLedgerEntryParams{
+	entry, err := q.PostLedgerEntry(ctx, db.PostLedgerEntryParams{
 		OrganizationID: toPg(e.OrganizationID), Direction: "debit", Account: "general",
 		AmountMinor: int64(amount), Currency: cur,
 		Memo: pgText(memo), PostedBy: toPg(pb)})
-	return err
+	if err != nil {
+		return err
+	}
+	// link the ledger entry back onto the benefit (payment_id is the
+	// finance pointer — a disbursement has no member-payment row).
+	if bid, perr := uuid.Parse(benefitID); perr == nil {
+		_ = q.SetBenefitPaymentRef(ctx, db.SetBenefitPaymentRefParams{
+			ID: toPg(bid), PaymentID: entry.ID})
+	}
+	return nil
 }
 
 // AssetDisposalConsumer — §18: a sold asset posts a credit ledger entry
@@ -1544,4 +1605,81 @@ func (s *Service) AssetDisposalConsumer(ctx context.Context, q *db.Queries, e ev
 		AmountMinor: int64(amount), Currency: cur,
 		Memo: pgText(memo), PostedBy: toPg(pb)})
 	return err
+}
+
+// CommitteeSpendTotal — §16: cumulative committee-tagged spend from
+// ledger debits (memo 'committee:{unit_id}…'). Governance enforces
+// committee_mandates.budget_limit against this via its seam (Rule 26 —
+// finance owns the ledger, governance owns the mandate).
+func (s *Service) CommitteeSpendTotal(ctx context.Context, orgID, unitID uuid.UUID) (int64, error) {
+	return s.q.LedgerDebitsByMemoPrefix(ctx, db.LedgerDebitsByMemoPrefixParams{
+		OrganizationID: toPg(orgID), Column2: pgText("committee:" + unitID.String())})
+}
+
+// PendingClaims — §16 handover section: the claims still awaiting review.
+func (s *Service) PendingClaims(ctx context.Context, oc *tenant.OrgCtx) ([]db.PaymentClaims, error) {
+	return s.q.PendingClaimsForOrg(ctx, toPg(oc.OrgID))
+}
+
+// ProjectExpenseConsumer — §20: a committee/project expense posts a debit
+// ledger entry (Rule 19 — never off-ledger). Memo tags the committee for
+// mandate enforcement + the project for audit. Deduped on the
+// expense-keyed memo (events are at-least-once, Rule 27).
+func (s *Service) ProjectExpenseConsumer(ctx context.Context, q *db.Queries, e events.Event) error {
+	if e.Type != "ProjectExpenseRecorded" {
+		return nil
+	}
+	expenseID, _ := e.Payload["expense_id"].(string)
+	if expenseID == "" {
+		return nil
+	}
+	memo := "project-expense:" + expenseID
+	exists, err := q.LedgerMemoExists(ctx, db.LedgerMemoExistsParams{
+		OrganizationID: toPg(e.OrganizationID), Memo: pgText(memo)})
+	if err != nil || exists {
+		return err
+	}
+	var amount float64
+	if v, ok := e.Payload["amount_minor"].(float64); ok {
+		amount = v
+	}
+	if amount <= 0 {
+		return nil
+	}
+	cur, _ := e.Payload["currency"].(string)
+	unit, _ := e.Payload["unit_id"].(string)
+	projectID, _ := e.Payload["project_id"].(string)
+	postedBy, _ := e.Payload["posted_by"].(string)
+	pb, _ := uuid.Parse(postedBy)
+	fullMemo := memo
+	if unit != "" {
+		fullMemo = "committee:" + unit + " " + memo // mandate-enforcement tag
+	}
+	if projectID != "" {
+		fullMemo += " project:" + projectID
+	}
+	_, err = q.PostLedgerEntry(ctx, db.PostLedgerEntryParams{
+		OrganizationID: toPg(e.OrganizationID), Direction: "debit", Account: "projects",
+		AmountMinor: int64(amount), Currency: cur,
+		Memo: pgText(fullMemo), PostedBy: toPg(pb)})
+	return err
+}
+
+// PaymentExists — §20 donor-link verification seam (Rule 26): projects
+// never reads payments directly; it asks finance whether the payment is
+// real, confirmed, and same-org.
+func (s *Service) PaymentExists(ctx context.Context, orgID, paymentID uuid.UUID) (bool, error) {
+	p, err := s.q.GetPayment(ctx, db.GetPaymentParams{ID: toPg(paymentID), OrganizationID: toPg(orgID)})
+	if err != nil {
+		return false, nil
+	}
+	return p.Status == "confirmed" || p.Status == "reconciled", nil
+}
+
+// ProjectSpendTotal — §20: cumulative spend tagged 'project:{id}' on the
+// ledger; the projects module checks it against its budget row (Rule 26 —
+// finance owns the ledger, projects owns the budget).
+func (s *Service) ProjectSpendTotal(ctx context.Context, orgID, projectID uuid.UUID) (int64, error) {
+	return s.q.LedgerDebitsForProject(ctx, db.LedgerDebitsForProjectParams{
+		OrganizationID: toPg(orgID), Column2: pgText(projectID.String())})
 }

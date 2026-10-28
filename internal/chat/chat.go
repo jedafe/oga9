@@ -18,6 +18,7 @@ import (
 
 	"github.com/jedafe/oga9/internal/db"
 	"github.com/jedafe/oga9/internal/events"
+	"github.com/jedafe/oga9/internal/rules"
 	"github.com/jedafe/oga9/internal/tenant"
 )
 
@@ -39,6 +40,7 @@ var messageKinds = map[string]bool{"text": true, "voice": true, "file": true, "s
 const BusKey = "oga9:realtime:chat"
 
 type Service struct {
+	ru      *rules.Service // ADR-016 rules engine — org_settings resolve through it (Rule 23)
 	pool    *pgxpool.Pool
 	q       *db.Queries
 	vk      valkey.Client
@@ -63,7 +65,7 @@ func (s *Service) SetActivityGate(fn func(ctx context.Context, orgID, activityID
 }
 
 func NewService(pool *pgxpool.Pool, vk valkey.Client) *Service {
-	return &Service{pool: pool, q: db.New(pool), vk: vk}
+	return &Service{ru: rules.New(pool), pool: pool, q: db.New(pool), vk: vk}
 }
 
 func toPg(u uuid.UUID) pgtype.UUID   { return pgtype.UUID{Bytes: u, Valid: u != uuid.Nil} }
@@ -200,7 +202,7 @@ func (s *Service) RemoveMember(ctx context.Context, oc *tenant.OrgCtx, cid, memb
 }
 
 func (s *Service) orgSettingText(ctx context.Context, orgID uuid.UUID, key, fallback string) string {
-	raw, err := s.q.GetOrgSetting(ctx, db.GetOrgSettingParams{OrganizationID: toPg(orgID), Key: key})
+	raw, err := s.ru.Value(ctx, orgID, key)
 	if err != nil {
 		return fallback
 	}
@@ -212,7 +214,7 @@ func (s *Service) orgSettingText(ctx context.Context, orgID uuid.UUID, key, fall
 }
 
 func (s *Service) orgSettingInt(ctx context.Context, orgID uuid.UUID, key string, fallback int64) int64 {
-	raw, err := s.q.GetOrgSetting(ctx, db.GetOrgSettingParams{OrganizationID: toPg(orgID), Key: key})
+	raw, err := s.ru.Value(ctx, orgID, key)
 	if err != nil {
 		return fallback
 	}

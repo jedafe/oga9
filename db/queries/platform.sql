@@ -295,3 +295,6 @@ WHERE id=$1 AND status='processing';
 
 -- name: GetTenantExportByID :one
 SELECT * FROM tenant_exports WHERE id = $1;
+
+-- name: GetFeatureFlag :one
+SELECT enabled FROM feature_flags WHERE key = $1;

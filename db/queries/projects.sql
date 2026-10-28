@@ -106,3 +106,39 @@ ORDER BY p.state DESC, p.created_at DESC LIMIT 50;
 -- name: ResolutionOutcome :one
 -- approval gate: the resolution must exist in this org and be passed.
 SELECT outcome FROM resolutions WHERE id = $1 AND organization_id = $2;
+
+-- name: CreateProjectBudget :one
+INSERT INTO project_budgets (organization_id, project_id, amount_minor, currency, note, created_by)
+VALUES ($1, $2, $3, $4, sqlc.narg(note), $5)
+RETURNING id;
+
+-- name: GetProjectBudget :one
+SELECT * FROM project_budgets WHERE project_id = $1 AND organization_id = $2;
+
+-- name: SetProjectBudgetID :execrows
+UPDATE projects SET budget_id = $2 WHERE id = $1 AND budget_id IS NULL;
+
+-- name: GetProjectForUpdate :one
+-- spend serialization: the row lock makes check-and-reserve atomic.
+SELECT * FROM projects WHERE id = sqlc.arg(id)::uuid AND organization_id = sqlc.arg(org_id)::uuid FOR UPDATE;
+
+-- name: InsertProjectExpense :one
+INSERT INTO project_expenses (organization_id, project_id, unit_id, amount_minor, currency, memo)
+VALUES (sqlc.arg(org_id)::uuid, sqlc.arg(project_id)::uuid, sqlc.narg(unit_id)::uuid,
+        sqlc.arg(amount_minor)::bigint, sqlc.arg(currency), sqlc.narg(memo))
+RETURNING id;
+
+-- name: ProjectExpenseTotal :one
+SELECT COALESCE(SUM(amount_minor),0)::bigint AS total
+FROM project_expenses
+WHERE organization_id = sqlc.arg(org_id)::uuid AND project_id = sqlc.arg(project_id)::uuid;
+
+-- name: CommitteeExpenseTotal :one
+SELECT COALESCE(SUM(amount_minor),0)::bigint AS total
+FROM project_expenses
+WHERE organization_id = sqlc.arg(org_id)::uuid AND unit_id = sqlc.arg(unit_id)::uuid;
+
+-- name: LockSpendScope :exec
+-- serializes committee-capped spend across different projects sharing
+-- one mandate (pg advisory lock, released at tx end).
+SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0));

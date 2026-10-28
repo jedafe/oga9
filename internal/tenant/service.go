@@ -22,6 +22,7 @@ import (
 	"github.com/jedafe/oga9/internal/db"
 	"github.com/jedafe/oga9/internal/entitlements"
 	"github.com/jedafe/oga9/internal/events"
+	"github.com/jedafe/oga9/internal/rules"
 )
 
 var (
@@ -50,16 +51,23 @@ var (
 )
 
 type Service struct {
-	pool    *pgxpool.Pool
-	q       *db.Queries
-	vk      valkey.Client
-	ent     *entitlements.Service // Rule 25 — SetEntitlements wires it
-	regGate func(ctx context.Context, orgID, memberID uuid.UUID) (bool, error)
+	ru         *rules.Service // ADR-016 rules engine — org_settings resolve through it (Rule 23)
+	baseDomain string         // portal host suffix — custom_domain can't claim it
+	pool       *pgxpool.Pool
+	q          *db.Queries
+	vk         valkey.Client
+	ent        *entitlements.Service // Rule 25 — SetEntitlements wires it
+	regGate    func(ctx context.Context, orgID, memberID uuid.UUID) (bool, error)
 }
 
 func NewService(pool *pgxpool.Pool, vk valkey.Client) *Service {
-	return &Service{pool: pool, q: db.New(pool), vk: vk}
+	return &Service{ru: rules.New(pool), pool: pool, q: db.New(pool), vk: vk}
 }
+
+// SetBaseDomain injects the deployment's base domain — SetCustomDomain
+// rejects domains equal to or nested under it (an org claiming
+// `oga9.com`/`*.oga9.com` would hijack the platform's own portal).
+func (s *Service) SetBaseDomain(d string) { s.baseDomain = strings.ToLower(d) }
 
 func toPg(u uuid.UUID) pgtype.UUID { return pgtype.UUID{Bytes: u, Valid: true} }
 func fromPg(p pgtype.UUID) uuid.UUID {
@@ -362,7 +370,7 @@ func (s *Service) CreateOrg(ctx context.Context, userID uuid.UUID, name, slug, t
 	if len(name) == 0 {
 		return nil, ErrBadValue
 	}
-	if !validSlug(slug) {
+	if !validSlug(slug) || reservedSlugs[slug] {
 		return nil, ErrBadSlug
 	}
 	if orgType == "" {
@@ -488,10 +496,11 @@ func (s *Service) CreateOrg(ctx context.Context, userID uuid.UUID, name, slug, t
 				return err
 			}
 			for _, f := range g.Fields {
-				if err := q.CreateCustomField(ctx, db.CreateCustomFieldParams{
+				if _, err := q.CreateCustomField(ctx, db.CreateCustomFieldParams{
 					GroupID: gid, OrganizationID: toPg(orgID), EntityType: g.EntityType,
 					Key: f.Key, Label: f.Label, Kind: f.Kind, Required: f.Required,
-					Source: "template",
+					Validation: []byte(`{}`), // NOT NULL column — template rows carry no validation
+					Source:     "template",
 				}); err != nil {
 					return err
 				}
@@ -569,7 +578,9 @@ func (s *Service) tenantSuspended(ctx context.Context, tid uuid.UUID) bool {
 	}
 	t, err := s.q.GetTenantRow(ctx, toPg(tid))
 	if err != nil {
-		return false
+		return true // fail CLOSED — a suspension gate that errors open
+		// would let suspended tenants in during DB blips; platform
+		// operators still pass via their role check below.
 	}
 	_ = s.vk.Do(ctx, s.vk.B().Set().Key(key).Value(t.Status).ExSeconds(60).Build()).Error()
 	return t.Status == "suspended"

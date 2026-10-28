@@ -10,17 +10,20 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+	"github.com/hibiken/asynq"
 	"github.com/jedafe/oga9/internal/httpx"
 	"github.com/jedafe/oga9/internal/integrations"
 	"github.com/jedafe/oga9/internal/middleware"
 )
 
 type IntegrationsHandler struct {
-	svc *integrations.Service
+	svc        *integrations.Service
+	queue      *asynq.Client
+	baseDomain string
 }
 
-func NewIntegrationsHandler(s *integrations.Service) *IntegrationsHandler {
-	return &IntegrationsHandler{svc: s}
+func NewIntegrationsHandler(s *integrations.Service, queue *asynq.Client, baseDomain string) *IntegrationsHandler {
+	return &IntegrationsHandler{svc: s, queue: queue, baseDomain: baseDomain}
 }
 
 func intErr(w http.ResponseWriter, err error) {
@@ -111,7 +114,7 @@ func (h *IntegrationsHandler) Webhook(w http.ResponseWriter, r *http.Request) {
 	if sig == "" {
 		sig = r.Header.Get("X-Signature")
 	}
-	_, ok, err := h.svc.Intake(r.Context(), provider, raw, sig)
+	rid, ok, err := h.svc.Intake(r.Context(), provider, raw, sig)
 	if err != nil && !errors.Is(err, integrations.ErrBadSignature) {
 		intErr(w, err)
 		return
@@ -120,6 +123,13 @@ func (h *IntegrationsHandler) Webhook(w http.ResponseWriter, r *http.Request) {
 		// receipt persisted — reject the delivery (spec test 2).
 		httpx.WriteErr(w, 400, "invalid_signature", "webhook signature verification failed")
 		return
+	}
+	// Rule 9: record raw → enqueue durable processing → return fast.
+	// Fire-and-forget (Rule 8); the 1-minute sweep covers enqueue misses.
+	if h.queue != nil {
+		payload, _ := json.Marshal(map[string]any{"receipt_id": rid.String()})
+		_, _ = h.queue.Enqueue(asynq.NewTask("integrations:webhook_process", payload),
+			asynq.Queue("critical"))
 	}
 	httpx.WriteData(w, 200, map[string]any{"received": true})
 }
@@ -201,13 +211,80 @@ func (h *IntegrationsHandler) RevokeKey(w http.ResponseWriter, r *http.Request) 
 	httpx.WriteData(w, 200, map[string]any{"revoked": true})
 }
 
-// OrgProfile — GET /directory/orgs/{slug}: public org detail, opted-in
-// fields only.
+// OrgProfile — GET /directory/orgs/{slug}: the portal landing payload —
+// opted-in profile fields + branding + current-term EXCO roster.
 func (h *IntegrationsHandler) OrgProfile(w http.ResponseWriter, r *http.Request) {
-	rows, err := h.svc.PublicOrg(r.Context(), chi.URLParam(r, "slug"))
-	if err != nil || len(rows) == 0 {
+	out, err := h.svc.PublicOrgProfile(r.Context(), chi.URLParam(r, "slug"))
+	if err != nil {
 		httpx.WriteErr(w, 404, "not_found", "org not listed")
 		return
 	}
-	httpx.WriteData(w, 200, rows[0])
+	httpx.WriteData(w, 200, out)
+}
+
+// ResolveHost — GET /directory/resolve?host={h}: host→org map for the
+// portal; `{slug}.{base}` subdomains and org custom_domains both resolve.
+func (h *IntegrationsHandler) ResolveHost(w http.ResponseWriter, r *http.Request) {
+	host := r.URL.Query().Get("host")
+	if host == "" {
+		httpx.WriteErr(w, 400, "validation_failed", "host required")
+		return
+	}
+	slug, kind, err := h.svc.ResolveHost(r.Context(), host, h.baseDomain)
+	if err != nil {
+		httpx.WriteErr(w, 404, "not_found", "no organization at that address")
+		return
+	}
+	httpx.WriteData(w, 200, map[string]any{"slug": slug, "host_kind": kind})
+}
+
+// ---------- tenant-scoped api keys (§23 — control-plane surface) ----------
+
+func (h *IntegrationsHandler) ListTenantKeys(w http.ResponseWriter, r *http.Request) {
+	tid, err := uuid.Parse(chi.URLParam(r, "tenant_id"))
+	if err != nil {
+		httpx.WriteErr(w, 400, "invalid_id", "malformed identifier")
+		return
+	}
+	list, err := h.svc.ListTenantKeys(r.Context(), tid)
+	if err != nil {
+		intErr(w, err)
+		return
+	}
+	httpx.WriteData(w, 200, list)
+}
+
+func (h *IntegrationsHandler) IssueTenantKey(w http.ResponseWriter, r *http.Request) {
+	tid, err := uuid.Parse(chi.URLParam(r, "tenant_id"))
+	if err != nil {
+		httpx.WriteErr(w, 400, "invalid_id", "malformed identifier")
+		return
+	}
+	var req struct {
+		Scopes []string `json:"scopes"`
+	}
+	if err := httpx.Decode(w, r, &req); err != nil {
+		httpx.WriteErr(w, 400, "validation_failed", "malformed body")
+		return
+	}
+	id, raw, err := h.svc.IssueTenantKey(r.Context(), tid, req.Scopes)
+	if err != nil {
+		intErr(w, err)
+		return
+	}
+	httpx.WriteData(w, 201, map[string]any{"key_id": id, "key": raw}) // raw returned ONCE
+}
+
+func (h *IntegrationsHandler) RevokeTenantKey(w http.ResponseWriter, r *http.Request) {
+	tid, err1 := uuid.Parse(chi.URLParam(r, "tenant_id"))
+	kid, err2 := uuid.Parse(chi.URLParam(r, "key_id"))
+	if err1 != nil || err2 != nil {
+		httpx.WriteErr(w, 400, "invalid_id", "malformed identifier")
+		return
+	}
+	if err := h.svc.RevokeTenantKey(r.Context(), tid, kid); err != nil {
+		intErr(w, err)
+		return
+	}
+	httpx.WriteData(w, 200, map[string]any{"revoked": true})
 }

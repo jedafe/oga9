@@ -7,6 +7,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -57,6 +59,12 @@ type Service struct {
 	draftFn    func(ctx context.Context, oc *tenant.OrgCtx, kind, prompt string) (json.RawMessage, int, int, error)
 	applyFn    func(ctx context.Context, oc *tenant.OrgCtx, g db.AiGenerations) error
 	limitFn    func(ctx context.Context, tenantID uuid.UUID, key string) int64
+	// permFn gates context assembly — a source is only grounded when the
+	// asker holds its permission node (§22: permission-scoped answers).
+	permFn      func(ctx context.Context, userID, orgID uuid.UUID, node string) bool
+	contextSrcs map[string]func(ctx context.Context, oc *tenant.OrgCtx) (string, []Citation, error)
+	flagFn      func(ctx context.Context, key string) bool // platform.* feature flags
+	costPer1K   int64                                      // micro-USD per 1k tokens (env)
 }
 
 func NewService(pool *pgxpool.Pool) *Service {
@@ -73,6 +81,58 @@ func (s *Service) SetApply(fn func(context.Context, *tenant.OrgCtx, db.AiGenerat
 	s.applyFn = fn
 }
 func (s *Service) SetLimit(fn func(context.Context, uuid.UUID, string) int64) { s.limitFn = fn }
+
+// SetPermissions wires the asker's permission resolver (orgSvc.HasPermission).
+func (s *Service) SetPermissions(fn func(context.Context, uuid.UUID, uuid.UUID, string) bool) {
+	s.permFn = fn
+}
+
+// AddContextSource registers a permission-scoped grounding source: the fn
+// runs only when the asker holds `node`, and its citations are the only
+// ones an answer may carry (§22 — never provider-invented).
+func (s *Service) AddContextSource(node string, fn func(context.Context, *tenant.OrgCtx) (string, []Citation, error)) {
+	if s.contextSrcs == nil {
+		s.contextSrcs = map[string]func(context.Context, *tenant.OrgCtx) (string, []Citation, error){}
+	}
+	s.contextSrcs[node] = fn
+}
+
+// SetFlag wires platform.* feature-flag reads (system_settings).
+func (s *Service) SetFlag(fn func(context.Context, string) bool) { s.flagFn = fn }
+
+// SetCostRate sets micro-USD per 1k tokens for usage metering.
+func (s *Service) SetCostRate(v int64) { s.costPer1K = v }
+
+// flagOn — platform.ai_assistant.enabled must be truthy for the module.
+func (s *Service) flagOn(ctx context.Context) bool {
+	if s.flagFn == nil {
+		return true // no flag source → module app gate is the only check
+	}
+	return s.flagFn(ctx, "platform.ai_assistant.enabled")
+}
+
+// assembleContext — §22: ground the answer in entities the asker's
+// permission nodes can actually see; the citations returned are exactly
+// the entities fed to the provider (never model-invented).
+func (s *Service) assembleContext(ctx context.Context, oc *tenant.OrgCtx) (string, []Citation) {
+	var b strings.Builder
+	var cites []Citation
+	for node, fn := range s.contextSrcs {
+		if s.permFn != nil && !s.permFn(ctx, oc.UserID, oc.OrgID, node) {
+			continue // outside the asker's scope — never grounded
+		}
+		text, cs, err := fn(ctx, oc)
+		if err != nil || text == "" {
+			continue
+		}
+		if b.Len() > 24000 {
+			break // cap grounding size
+		}
+		b.WriteString("\n[context] " + text + "\n")
+		cites = append(cites, cs...)
+	}
+	return b.String(), cites
+}
 
 func (s *Service) withTx(ctx context.Context, fn func(*db.Queries) error) error {
 	tx, err := s.pool.Begin(ctx)
@@ -132,18 +192,28 @@ func (s *Service) Chat(ctx context.Context, oc *tenant.OrgCtx, convID uuid.UUID,
 	if s.providerFn == nil {
 		return uuid.Nil, uuid.Nil, nil, ErrNotProvider
 	}
+	if !s.flagOn(ctx) {
+		return uuid.Nil, uuid.Nil, nil, ErrNotProvider // platform.ai_assistant.enabled off
+	}
 	// quota is checked OUTSIDE the state tx — a rejected request has no
 	// mutation to roll back with, and AIQuotaExceeded must persist as the
 	// standalone audit event (Rule 25).
 	if err := s.checkQuota(ctx, s.q, oc); err != nil {
 		return uuid.Nil, uuid.Nil, nil, err
 	}
+	// §22 grounding: permission-scoped context + the citations it cites.
+	grounding, cites := s.assembleContext(ctx, oc)
+	prompt := question
+	if grounding != "" {
+		prompt += "\n\nAnswer using ONLY this organization data; cite the entities used:" + grounding
+	}
 	// provider call BEFORE the tx — an LLM round-trip inside a
 	// transaction pins a pooled connection for its full latency.
-	a, err := s.providerFn(ctx, oc, persona, question)
+	a, err := s.providerFn(ctx, oc, persona, prompt)
 	if err != nil {
 		return uuid.Nil, uuid.Nil, nil, err
 	}
+	a.Citations = cites // citations are the grounded entities, period.
 	var cid, mid uuid.UUID
 	ans := a
 	err = s.withTx(ctx, func(q *db.Queries) error {
@@ -183,8 +253,9 @@ func (s *Service) Chat(ctx context.Context, oc *tenant.OrgCtx, convID uuid.UUID,
 		mid = fromPg(mid2)
 		if err := q.LogUsage(ctx, db.LogUsageParams{
 			TenantID: toPg(oc.TenantID), UserID: toPg(oc.UserID), Kind: "chat",
-			TokensIn:  pgtype.Int4{Int32: int32(a.TokensIn), Valid: true},
-			TokensOut: pgtype.Int4{Int32: int32(a.TokensOut), Valid: true}}); err != nil {
+			TokensIn:     pgtype.Int4{Int32: int32(a.TokensIn), Valid: true},
+			TokensOut:    pgtype.Int4{Int32: int32(a.TokensOut), Valid: true},
+			CostMicroUsd: s.cost(a.TokensIn + a.TokensOut)}); err != nil {
 			return err
 		}
 		return events.Emit(ctx, q, oc.TenantID, oc.OrgID, "AIQueryAnswered",
@@ -211,11 +282,11 @@ func (s *Service) Messages(ctx context.Context, oc *tenant.OrgCtx, convID uuid.U
 
 // Draft — §22: sensitive domains produce drafts ONLY; humans review and
 // apply. AI never writes domain tables.
-func (s *Service) Draft(ctx context.Context, oc *tenant.OrgCtx, kind, prompt string) (uuid.UUID, error) {
+func (s *Service) Draft(ctx context.Context, oc *tenant.OrgCtx, kind, prompt string, targetID uuid.UUID) (uuid.UUID, error) {
 	if !draftKinds[kind] {
 		return uuid.Nil, ErrBadValue
 	}
-	if s.draftFn == nil {
+	if s.draftFn == nil || !s.flagOn(ctx) {
 		return uuid.Nil, ErrNotProvider
 	}
 	if oc.MembershipID == uuid.Nil {
@@ -230,6 +301,15 @@ func (s *Service) Draft(ctx context.Context, oc *tenant.OrgCtx, kind, prompt str
 	if err != nil {
 		return uuid.Nil, err
 	}
+	if targetID != uuid.Nil {
+		// the apply seam reads target_id off the draft to find its domain
+		// target (agenda/minutes → the meeting; HITL keeps it in the draft).
+		var m map[string]any
+		if json.Unmarshal(draft, &m) == nil {
+			m["target_id"] = targetID.String()
+			draft, _ = json.Marshal(m)
+		}
+	}
 	var id uuid.UUID
 	err = s.withTx(ctx, func(q *db.Queries) error {
 		gid, err := q.CreateGeneration(ctx, db.CreateGenerationParams{
@@ -240,8 +320,9 @@ func (s *Service) Draft(ctx context.Context, oc *tenant.OrgCtx, kind, prompt str
 		id = fromPg(gid)
 		if err := q.LogUsage(ctx, db.LogUsageParams{
 			TenantID: toPg(oc.TenantID), UserID: toPg(oc.UserID), Kind: "draft",
-			TokensIn:  pgtype.Int4{Int32: int32(tin), Valid: true},
-			TokensOut: pgtype.Int4{Int32: int32(tout), Valid: true}}); err != nil {
+			TokensIn:     pgtype.Int4{Int32: int32(tin), Valid: true},
+			TokensOut:    pgtype.Int4{Int32: int32(tout), Valid: true},
+			CostMicroUsd: s.cost(tin + tout)}); err != nil {
 			return err
 		}
 		return events.Emit(ctx, q, oc.TenantID, oc.OrgID, "AIDraftGenerated",
@@ -341,7 +422,36 @@ func (s *Service) TenantUsage(ctx context.Context) ([]db.TenantUsageRollupRow, e
 
 // UsageRollup — ai:usage_rollup (low): the metered rollup is computed on
 // demand; the sweep is where a future billable-usage sync lands.
+// UsageRollup — monthly ai usage → usage_meters (ai.requests + ai.tokens
+// limit keys for the current period; the rollup is the authoritative
+// overwrite, not an increment).
 func (s *Service) UsageRollup(ctx context.Context) (int, error) {
 	rows, err := s.q.TenantUsageRollup(ctx)
-	return len(rows), err
+	if err != nil {
+		return 0, err
+	}
+	period := time.Date(time.Now().Year(), time.Now().Month(), 1, 0, 0, 0, 0, time.UTC)
+	for _, r := range rows {
+		tid := r.TenantID
+		if err := s.q.UpsertUsageMeter(ctx, db.UpsertUsageMeterParams{
+			TenantID: tid, LimitKey: "ai.requests", Used: r.Requests,
+			PeriodStart: pgtype.Date{Time: period, Valid: true}}); err != nil {
+			return 0, err
+		}
+		if err := s.q.UpsertUsageMeter(ctx, db.UpsertUsageMeterParams{
+			TenantID: tid, LimitKey: "ai.tokens", Used: r.TokensIn + r.TokensOut,
+			PeriodStart: pgtype.Date{Time: period, Valid: true}}); err != nil {
+			return 0, err
+		}
+	}
+	return len(rows), nil
+}
+
+// cost — micro-USD estimate for the metered rollup (rate from env; 0 when
+// the deployment hasn't configured pricing).
+func (s *Service) cost(tokens int) pgtype.Int8 {
+	if s.costPer1K <= 0 || tokens <= 0 {
+		return pgtype.Int8{}
+	}
+	return pgtype.Int8{Int64: int64(tokens) * s.costPer1K / 1000, Valid: true}
 }

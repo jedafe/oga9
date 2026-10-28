@@ -37,26 +37,26 @@ SELECT * FROM tenant_addons WHERE tenant_id = $1 AND addon_slug = $2;
 -- name: SubscribeTenantAddon :one
 -- (re)activate: a cancelled/expired row re-subscribes in place.
 INSERT INTO tenant_addons (tenant_id, addon_slug, state, billing_term, expires_at)
-VALUES (sqlc.arg(tenant_id)::uuid, sqlc.arg(addon_slug), 'active',
+VALUES (sqlc.arg(tenant_id)::uuid, sqlc.arg(addon_slug), sqlc.arg(state),
         sqlc.arg(billing_term), sqlc.narg(expires_at)::timestamptz)
 ON CONFLICT (tenant_id, addon_slug) DO UPDATE SET
-  state = 'active', billing_term = EXCLUDED.billing_term,
+  state = EXCLUDED.state, billing_term = EXCLUDED.billing_term,
   expires_at = EXCLUDED.expires_at, cancelled_at = NULL, started_at = now()
 RETURNING *;
 
 -- name: CancelTenantAddon :execrows
 UPDATE tenant_addons SET state = 'cancelled', cancelled_at = now()
-WHERE tenant_id = $1 AND addon_slug = $2 AND state IN ('trialing','active');
+WHERE tenant_id = $1 AND addon_slug = $2 AND state IN ('trialing','active','pending');
 
 -- name: ListExpiringAddons :many
 -- sweep candidates: past-expiry live addons (each row is then CAS-expired
 -- and its AddonExpired emitted in ONE tx — Rule 12).
 SELECT id, tenant_id, addon_slug FROM tenant_addons
-WHERE state IN ('trialing','active') AND expires_at IS NOT NULL AND expires_at < now();
+WHERE state IN ('trialing','active','pending') AND expires_at IS NOT NULL AND expires_at < now();
 
 -- name: ExpireTenantAddon :execrows
 UPDATE tenant_addons SET state = 'expired'
-WHERE id = $1 AND state IN ('trialing','active');
+WHERE id = $1 AND state IN ('trialing','active','pending');
 
 -- name: ListActiveAddonGrants :many
 -- entitlement merge source (§07 resolution order): live grants only.
@@ -66,3 +66,8 @@ WHERE ta.tenant_id = $1
   AND ta.state IN ('trialing','active')
   AND (ta.expires_at IS NULL OR ta.expires_at > now())
   AND ac.active;
+
+-- name: ActivateTenantAddon :execrows
+-- webhook settlement: pending → active (CAS; replay is a no-op).
+UPDATE tenant_addons SET state = 'active'
+WHERE tenant_id = $1 AND addon_slug = $2 AND state = 'pending';

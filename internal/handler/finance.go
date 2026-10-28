@@ -325,12 +325,21 @@ func (h *FinanceHandler) SubmitClaim(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	in = req.PaymentIn
-	id, err := h.svc.SubmitClaim(r.Context(), oc, in, req.Note, req.ReceiptMediaID)
+	in.IdempotencyKey = r.Header.Get("Idempotency-Key")
+	if in.IdempotencyKey == "" {
+		httpx.WriteErr(w, 400, "idempotency_key_required", "Idempotency-Key header required")
+		return
+	}
+	claim, replayed, err := h.svc.SubmitClaim(r.Context(), oc, in, req.Note, req.ReceiptMediaID)
 	if err != nil {
 		finErr(w, err)
 		return
 	}
-	httpx.WriteData(w, 201, map[string]any{"id": id, "state": "submitted"})
+	status := 201
+	if replayed {
+		status = 200 // idempotent replay — original claim, no duplicate row
+	}
+	httpx.WriteData(w, status, map[string]any{"id": claim.ID, "state": claim.State})
 }
 
 func (h *FinanceHandler) Claims(w http.ResponseWriter, r *http.Request) {
@@ -535,12 +544,14 @@ func (h *FinanceHandler) Ledger(w http.ResponseWriter, r *http.Request) {
 	if !h.statementGate(w, r, oc) {
 		return
 	}
-	list, err := h.svc.Ledger(r.Context(), oc, r.URL.Query().Get("account"))
+	page, per := httpx.PageParams(r)
+	list, total, err := h.svc.LedgerPage(r.Context(), oc, r.URL.Query().Get("account"),
+		int32(per), int32((page-1)*per))
 	if err != nil {
 		finErr(w, err)
 		return
 	}
-	httpx.WriteData(w, 200, list)
+	httpx.WritePage(w, 200, list, page, per, total)
 }
 
 func (h *FinanceHandler) Statement(w http.ResponseWriter, r *http.Request) {

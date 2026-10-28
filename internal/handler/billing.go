@@ -43,6 +43,11 @@ func NewBillingHandler(svc *billing.Service, orgSvc *tenant.Service, ent *entitl
 // node, not role name). An explicit ?tenant_id must belong to that set;
 // multi-tenant callers must disambiguate.
 func (h *BillingHandler) tenantFor(w http.ResponseWriter, r *http.Request) (uuid.UUID, bool) {
+	// §23 tenant-scoped api key: the key IS the tenant's credential —
+	// it binds this tenant directly (Rule 24, server-side resolved).
+	if tid := middleware.TenantID(r.Context()); tid != uuid.Nil {
+		return tid, true
+	}
 	userID := middleware.UserID(r.Context())
 	admins, err := h.orgSvc.TenantsWithNode(r.Context(), userID, "org.admin.billing")
 	if err != nil || len(admins) == 0 {
@@ -179,13 +184,21 @@ func (h *BillingHandler) Cancel(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// Invoices — empty until platform_invoices lands (group-13 migrations);
-// the route shape is catalogued now so clients can integrate.
+// Invoices — the tenant's durable billing record: plan subscriptions,
+// plan changes, addon purchases (platform_invoices, §15).
 func (h *BillingHandler) Invoices(w http.ResponseWriter, r *http.Request) {
-	if _, ok := h.tenantFor(w, r); !ok {
+	tid, ok := h.tenantFor(w, r)
+	if !ok {
 		return
 	}
-	httpx.WriteData(w, 200, []any{})
+	page, per := httpx.PageParams(r)
+	rows, total, err := h.svc.ListInvoices(r.Context(), tid,
+		r.URL.Query().Get("state"), int32(per), int32((page-1)*per))
+	if err != nil {
+		httpx.WriteErr(w, 500, "internal_error", "invoice lookup failed")
+		return
+	}
+	httpx.WritePage(w, 200, rows, page, per, total)
 }
 
 // Entitlements — merged capability+limit view per administered tenant.
@@ -391,11 +404,12 @@ func (h *BillingHandler) SubscribeAddon(w http.ResponseWriter, r *http.Request) 
 		ExpiresAt *time.Time `json:"expires_at"`
 	}
 	_ = httpx.Decode(w, r, &in)
-	if err := h.svc.SubscribeAddon(r.Context(), tenantID, chi.URLParam(r, "slug"), in.Term, in.ExpiresAt, middleware.UserID(r.Context())); err != nil {
+	state, err := h.svc.SubscribeAddon(r.Context(), tenantID, chi.URLParam(r, "slug"), in.Term, in.ExpiresAt, middleware.UserID(r.Context()))
+	if err != nil {
 		addonErr(w, err)
 		return
 	}
-	httpx.WriteData(w, 200, map[string]any{"addon_slug": chi.URLParam(r, "slug"), "state": "active"})
+	httpx.WriteData(w, 200, map[string]any{"addon_slug": chi.URLParam(r, "slug"), "state": state})
 }
 
 // CancelAddon — POST /billing/addons/{slug}/cancel (org.admin.billing).

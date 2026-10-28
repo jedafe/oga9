@@ -217,8 +217,9 @@ func (s *Service) AppointOfficer(ctx context.Context, oc *OrgCtx, termID, positi
 		if startsAt.Before(to.StartsAt.Time) || startsAt.After(to.EndsAt.Time) {
 			return ErrBadValue
 		}
-		// seats cap: §03 seats = concurrent holders per term
-		pseats, err := q.GetPositionSeats(ctx, toPg(positionID))
+		// seats cap: §03 seats = concurrent holders per term — the position
+		// row lock serializes the count with concurrent appointments.
+		pseats, err := q.GetPositionSeatsForUpdate(ctx, toPg(positionID))
 		if err != nil {
 			return err
 		}

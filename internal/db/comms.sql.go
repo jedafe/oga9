@@ -109,6 +109,23 @@ func (q *Queries) AudienceUserIDs(ctx context.Context, arg AudienceUserIDsParams
 	return items, nil
 }
 
+const countMyNotifications = `-- name: CountMyNotifications :one
+SELECT count(*) FROM notifications WHERE user_id = $1
+  AND ($2::bool = false OR read_at IS NULL)
+`
+
+type CountMyNotificationsParams struct {
+	UserID  pgtype.UUID `json:"user_id"`
+	Column2 bool        `json:"column_2"`
+}
+
+func (q *Queries) CountMyNotifications(ctx context.Context, arg CountMyNotificationsParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countMyNotifications, arg.UserID, arg.Column2)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const createAnnouncement = `-- name: CreateAnnouncement :one
 
 INSERT INTO announcements (organization_id, author_id, title, body, audience, state, published_at)
@@ -421,6 +438,57 @@ type MyNotificationsParams struct {
 
 func (q *Queries) MyNotifications(ctx context.Context, arg MyNotificationsParams) ([]Notifications, error) {
 	rows, err := q.db.Query(ctx, myNotifications, arg.UserID, arg.Column2)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []Notifications
+	for rows.Next() {
+		var i Notifications
+		if err := rows.Scan(
+			&i.ID,
+			&i.UserID,
+			&i.OrganizationID,
+			&i.Kind,
+			&i.Title,
+			&i.Body,
+			&i.RefType,
+			&i.RefID,
+			&i.Channel,
+			&i.ReadAt,
+			&i.DeliveredAt,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const myNotificationsPaged = `-- name: MyNotificationsPaged :many
+SELECT id, user_id, organization_id, kind, title, body, ref_type, ref_id, channel, read_at, delivered_at, created_at FROM notifications WHERE user_id = $1
+  AND ($2::bool = false OR read_at IS NULL)
+ORDER BY created_at DESC LIMIT $3 OFFSET $4
+`
+
+type MyNotificationsPagedParams struct {
+	UserID  pgtype.UUID `json:"user_id"`
+	Column2 bool        `json:"column_2"`
+	Limit   int32       `json:"limit"`
+	Offset  int32       `json:"offset"`
+}
+
+func (q *Queries) MyNotificationsPaged(ctx context.Context, arg MyNotificationsPagedParams) ([]Notifications, error) {
+	rows, err := q.db.Query(ctx, myNotificationsPaged,
+		arg.UserID,
+		arg.Column2,
+		arg.Limit,
+		arg.Offset,
+	)
 	if err != nil {
 		return nil, err
 	}

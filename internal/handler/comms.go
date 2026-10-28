@@ -14,6 +14,7 @@ import (
 	"github.com/hibiken/asynq"
 
 	"github.com/jedafe/oga9/internal/comms"
+	"github.com/jedafe/oga9/internal/db"
 	"github.com/jedafe/oga9/internal/httpx"
 	"github.com/jedafe/oga9/internal/middleware"
 	"github.com/jedafe/oga9/internal/tasks"
@@ -120,13 +121,14 @@ func (h *CommsHandler) RetractAnnouncement(w http.ResponseWriter, r *http.Reques
 }
 
 func (h *CommsHandler) MyNotifications(w http.ResponseWriter, r *http.Request) {
-	list, err := h.svc.MyNotifications(r.Context(), middleware.UserID(r.Context()),
-		r.URL.Query().Get("unread") == "true")
+	page, per := httpx.PageParams(r)
+	list, total, err := h.svc.MyNotificationsPage(r.Context(), middleware.UserID(r.Context()),
+		r.URL.Query().Get("unread") == "true", int32(per), int32((page-1)*per))
 	if err != nil {
 		commsErr(w, err)
 		return
 	}
-	httpx.WriteData(w, 200, list)
+	httpx.WritePage(w, 200, list, page, per, total)
 }
 
 func (h *CommsHandler) ReadNotification(w http.ResponseWriter, r *http.Request) {
@@ -212,7 +214,15 @@ func (h *CommsHandler) Documents(w http.ResponseWriter, r *http.Request) {
 		commsErr(w, err)
 		return
 	}
-	httpx.WriteData(w, 200, list)
+	type docView struct {
+		*db.Documents
+		PreviewURL string `json:"preview_url,omitempty"`
+	}
+	out := make([]docView, len(list))
+	for i := range list {
+		out[i] = docView{Documents: &list[i], PreviewURL: h.svc.PreviewURL(list[i])}
+	}
+	httpx.WriteData(w, 200, out)
 }
 
 func (h *CommsHandler) DownloadDocument(w http.ResponseWriter, r *http.Request) {

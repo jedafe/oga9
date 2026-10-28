@@ -1172,6 +1172,43 @@ func (q *Queries) MyCalendar(ctx context.Context, userID pgtype.UUID) ([]Activit
 	return items, nil
 }
 
+const openActionItemsForOrg = `-- name: OpenActionItemsForOrg :many
+SELECT i.id, i.activity_id, i.assignee_id, i.title, i.due_date, i.state, i.done_at, i.created_at FROM action_items i
+JOIN activities a ON a.id = i.activity_id
+WHERE a.organization_id = $1 AND i.state IN ('open','overdue')
+ORDER BY i.due_date NULLS LAST
+`
+
+// §16 handover section: every still-open/overdue item across the org's activities.
+func (q *Queries) OpenActionItemsForOrg(ctx context.Context, organizationID pgtype.UUID) ([]ActionItems, error) {
+	rows, err := q.db.Query(ctx, openActionItemsForOrg, organizationID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ActionItems
+	for rows.Next() {
+		var i ActionItems
+		if err := rows.Scan(
+			&i.ID,
+			&i.ActivityID,
+			&i.AssigneeID,
+			&i.Title,
+			&i.DueDate,
+			&i.State,
+			&i.DoneAt,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const orgCalendar = `-- name: OrgCalendar :many
 SELECT id, organization_id, kind, title, description, venue, starts_at, ends_at, unit_id, status, quorum_percent, capacity, created_by, created_at, reminder_sent, recurrence_id FROM activities WHERE organization_id = $1
   AND ($2::uuid IS NULL OR unit_id = $2 OR unit_id IS NULL) -- a unit's calendar includes org-wide activities

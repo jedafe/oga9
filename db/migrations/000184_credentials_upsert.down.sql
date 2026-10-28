@@ -1,0 +1,1 @@
+DROP INDEX digital_credentials_asset_kind;

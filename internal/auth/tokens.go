@@ -25,26 +25,26 @@ func SignActionToken(secret, userID, purpose string, ttl time.Duration) (string,
 	return fmt.Sprintf("%s.%s", payload, hex.EncodeToString(sig.Sum(nil))[:32]), jti
 }
 
-func VerifyActionToken(secret, token, purpose string) (jti, userID string, err error) {
+func VerifyActionToken(secret, token, purpose string) (jti, userID string, exp int64, err error) {
 	parts := strings.SplitN(token, ".", 2)
 	if len(parts) != 2 {
-		return "", "", errors.New("malformed token")
+		return "", "", 0, errors.New("malformed token")
 	}
 	sig := hmac.New(sha256.New, []byte(secret))
 	sig.Write([]byte(parts[0]))
 	expected, _ := hex.DecodeString(parts[1])
 	if !hmac.Equal(sig.Sum(nil)[:16], expected) {
-		return "", "", errors.New("bad signature")
+		return "", "", 0, errors.New("bad signature")
 	}
 	f := strings.Split(parts[0], "~")
 	if len(f) != 4 || f[2] != purpose {
-		return "", "", errors.New("wrong purpose")
+		return "", "", 0, errors.New("wrong purpose")
 	}
-	exp, _ := strconv.ParseInt(f[3], 10, 64)
+	exp, _ = strconv.ParseInt(f[3], 10, 64)
 	if time.Now().Unix() > exp {
-		return "", "", errors.New("expired")
+		return "", "", 0, errors.New("expired")
 	}
-	return f[0], f[1], nil
+	return f[0], f[1], exp, nil
 }
 
 func newJTI() string { return uuid.NewString() }

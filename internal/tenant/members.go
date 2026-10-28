@@ -199,8 +199,9 @@ func (s *Service) Apply(ctx context.Context, orgID, userID uuid.UUID, email, pho
 }
 
 // PublicApply resolves the org by slug (listed directory orgs only) for
-// the unauthenticated apply path.
-func (s *Service) PublicApply(ctx context.Context, slug, email, phone string, answers json.RawMessage) (uuid.UUID, error) {
+// the unauthenticated apply path. japaSubject carries the verified
+// JapaConnect identity from the locator join (§23) — "" for plain joins.
+func (s *Service) PublicApply(ctx context.Context, slug, email, phone, japaSubject string, answers json.RawMessage) (uuid.UUID, error) {
 	org, err := s.q.GetPublicOrgBySlug(ctx, slug)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return uuid.Nil, ErrOrgNotFound
@@ -208,7 +209,16 @@ func (s *Service) PublicApply(ctx context.Context, slug, email, phone string, an
 	if err != nil {
 		return uuid.Nil, err
 	}
-	return s.Apply(ctx, fromPg(org.ID), uuid.Nil, email, phone, answers, nil)
+	id, err := s.Apply(ctx, fromPg(org.ID), uuid.Nil, email, phone, answers, nil)
+	if err != nil || japaSubject == "" {
+		return id, err
+	}
+	// durable §23 link — the verified subject stamps onto the new row.
+	if _, err := s.q.SetApplicationJapaSubject(ctx, db.SetApplicationJapaSubjectParams{
+		ID: toPg(id), JapaSubject: pgText(japaSubject)}); err != nil {
+		return uuid.Nil, err
+	}
+	return id, nil
 }
 
 // PublicApplyForm feeds GET /directory/orgs/{slug}/apply — the org's
@@ -275,6 +285,17 @@ func (s *Service) DecideApplication(ctx context.Context, oc *OrgCtx, appID uuid.
 	}
 	if fromPg(app.OrganizationID) != oc.OrgID {
 		return ErrApplicationNotFound
+	}
+	if app.Status == "approved" && app.UserID.Valid {
+		// Once approve materialized the membership, the application is a
+		// historical record — further decisions here (e.g. withdraw) would
+		// drift it out of sync with the live membership. Manage the
+		// membership through TransitionMember instead.
+		if _, err := s.q.GetMembership(ctx, db.GetMembershipParams{
+			OrganizationID: app.OrganizationID, UserID: app.UserID,
+		}); err == nil {
+			return ErrInvalidTransition
+		}
 	}
 	var from []string
 	for s, targets := range memberTransitions {
@@ -603,6 +624,22 @@ func (s *Service) Members(ctx context.Context, oc *OrgCtx, category, state strin
 	return s.q.ListMembers(ctx, db.ListMembersParams{
 		OrgID: toPg(oc.OrgID), Category: category, State: state, UnitID: pgUUIDPtr(unitID),
 	})
+}
+
+// MembersPage — the bounded variant the directory route serves: rows for
+// one page plus the total for the meta envelope (page/per_page contract).
+func (s *Service) MembersPage(ctx context.Context, oc *OrgCtx, category, state string, unitID uuid.UUID, lim, off int32) ([]db.ListMembersPagedRow, int64, error) {
+	rows, err := s.q.ListMembersPaged(ctx, db.ListMembersPagedParams{
+		OrgID: toPg(oc.OrgID), Category: category, State: state, UnitID: pgUUIDPtr(unitID),
+		Lim: lim, Off: off,
+	})
+	if err != nil {
+		return nil, 0, err
+	}
+	total, err := s.q.CountMembers(ctx, db.CountMembersParams{
+		OrgID: toPg(oc.OrgID), Category: category, State: state, UnitID: pgUUIDPtr(unitID),
+	})
+	return rows, total, err
 }
 
 func (s *Service) MemberDetail(ctx context.Context, oc *OrgCtx, memberID uuid.UUID) (db.GetMembershipFullRow, error) {

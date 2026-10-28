@@ -45,7 +45,11 @@ type Service struct {
 	// approvals, finance snapshot) filled from other modules' services.
 	quorumFn  func(ctx context.Context, oc *tenant.OrgCtx, activityID uuid.UUID) (bool, error)
 	archiveFn func(ctx context.Context, oc *tenant.OrgCtx, title string, r io.Reader) error
-	sections  map[string]func(ctx context.Context, oc *tenant.OrgCtx) (any, error)
+	fineFn    func(ctx context.Context, orgID, memberID uuid.UUID, amount int64, currency, period string)
+	// suspFn is the member-lifecycle seam for a 'suspension' sanction —
+	// the members module owns lifecycle transitions (Rule 26).
+	suspFn   func(ctx context.Context, oc *tenant.OrgCtx, memberID uuid.UUID) error
+	sections map[string]func(ctx context.Context, oc *tenant.OrgCtx) (any, error)
 }
 
 func NewService(pool *pgxpool.Pool) *Service {
@@ -58,6 +62,12 @@ func (s *Service) SetQuorum(fn func(context.Context, *tenant.OrgCtx, uuid.UUID) 
 
 func (s *Service) SetArchive(fn func(context.Context, *tenant.OrgCtx, string, io.Reader) error) {
 	s.archiveFn = fn
+}
+
+// SetSuspension wires the members lifecycle seam for 'suspension'
+// sanctions (tenant.Service.TransitionMember "suspend").
+func (s *Service) SetSuspension(fn func(context.Context, *tenant.OrgCtx, uuid.UUID) error) {
+	s.suspFn = fn
 }
 
 // SetHandoverSection registers a named report section (e.g. "action_items")
@@ -207,6 +217,15 @@ func (s *Service) AdoptConstitution(ctx context.Context, oc *tenant.OrgCtx, body
 	if r.Outcome != "passed" && r.Outcome != "amended_passed" {
 		return uuid.Nil, 0, ErrBadResolution
 	}
+	// A resolution ratifies ONE constitution version — reusing it would
+	// let the same vote mint unlimited versions.
+	if vs, err := s.q.ListConstitution(ctx, toPg(oc.OrgID)); err == nil {
+		for _, v := range vs {
+			if fromPg(v.AdoptedByResolutionID) == resolutionID {
+				return uuid.Nil, 0, ErrBadResolution
+			}
+		}
+	}
 	var id uuid.UUID
 	var version int32
 	err = s.withTx(ctx, func(q *db.Queries) error {
@@ -231,7 +250,9 @@ func (s *Service) AdoptConstitution(ctx context.Context, oc *tenant.OrgCtx, body
 // ---------- committee mandates ----------
 
 func (s *Service) GetMandate(ctx context.Context, oc *tenant.OrgCtx, unitID uuid.UUID) (db.CommitteeMandates, error) {
-	m, err := s.q.GetMandate(ctx, toPg(unitID))
+	// org-scoped: a foreign-org unit id must not resolve a mandate.
+	m, err := s.q.GetMandateScoped(ctx, db.GetMandateScopedParams{
+		UnitID: toPg(unitID), OrgID: toPg(oc.OrgID)})
 	if err != nil {
 		return m, ErrNotFound
 	}
@@ -317,6 +338,12 @@ func (s *Service) ArchiveHandover(ctx context.Context, oc *tenant.OrgCtx, termID
 		}
 	}
 	return s.withTx(ctx, func(q *db.Queries) error {
+		// re-check inside the tx: the dedupe read and the marker write
+		// must be one atomic step or a concurrent path double-archives.
+		exists, err := q.HandoverGeneratedExists(ctx, toPg(termID))
+		if err != nil || exists {
+			return err
+		}
 		return events.Emit(ctx, q, oc.TenantID, oc.OrgID, "HandoverGenerated",
 			"term", termID, oc.UserID, false,
 			map[string]any{"term_id": termID, "org_id": oc.OrgID})
@@ -344,10 +371,91 @@ func (s *Service) OrgTenant(ctx context.Context, orgID uuid.UUID) (uuid.UUID, er
 	return fromPg(t), nil
 }
 
+// TermEndHandoverConsumer — §16: handover generates at term close.
+// TermEnded (manual close or the transitions sweep) triggers the
+// archive; ArchiveHandover dedupes per term, so the reminders sweep and
+// this path can never double-produce.
+func (s *Service) TermEndHandoverConsumer(ctx context.Context, q *db.Queries, e events.Event) error {
+	if e.Type != "TermEnded" {
+		return nil
+	}
+	termStr, _ := e.Payload["term_id"].(string)
+	termID, err := uuid.Parse(termStr)
+	if err != nil || termID == uuid.Nil {
+		return nil
+	}
+	tid, err := q.OrgTenantID(ctx, toPg(e.OrganizationID))
+	if err != nil {
+		return err
+	}
+	return s.ArchiveHandover(ctx, &tenant.OrgCtx{OrgID: e.OrganizationID, TenantID: fromPg(tid)}, termID)
+}
+
 // CloseExpiredTermData returns the rows the transitions sweep needs —
 // the actual close (revoke grants, events, cache invalidation) lives in
 // the tenant service's term lifecycle.
 func mustJSON(v any) []byte {
 	b, _ := json.MarshalIndent(v, "", "  ")
 	return b
+}
+
+// DebateMotion — tabled → debated (§16 state machine; the recorder marks
+// the motion as under active debate before a vote is called).
+func (s *Service) DebateMotion(ctx context.Context, oc *tenant.OrgCtx, motionID uuid.UUID) error {
+	m, err := s.q.GetMotion(ctx, db.GetMotionParams{ID: toPg(motionID), OrgID: toPg(oc.OrgID)})
+	if err != nil {
+		return ErrNotFound
+	}
+	if m.State != "tabled" {
+		return ErrBadState
+	}
+	n, err := s.q.SetMotionState(ctx, db.SetMotionStateParams{
+		ID: m.ID, ToState: "debated", FromState: "tabled"})
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrBadState
+	}
+	return nil
+}
+
+// WithdrawMotion — tabled|debated → withdrawn (the mover/sponsor pulls it
+// before a vote). §16 state machine includes 'withdrawn'.
+func (s *Service) WithdrawMotion(ctx context.Context, oc *tenant.OrgCtx, motionID uuid.UUID) error {
+	m, err := s.q.GetMotion(ctx, db.GetMotionParams{ID: toPg(motionID), OrgID: toPg(oc.OrgID)})
+	if err != nil {
+		return ErrNotFound
+	}
+	if m.State != "tabled" && m.State != "debated" {
+		return ErrBadState
+	}
+	n, err := s.q.SetMotionState(ctx, db.SetMotionStateParams{
+		ID: m.ID, ToState: "withdrawn", FromState: m.State})
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrBadState
+	}
+	return nil
+}
+
+// CompleteHandover — §16: the incoming EXCO acknowledges the handover
+// report; emits HandoverCompleted for the supplied term (idempotent —
+// completing twice is a no-op via the generated-row check).
+func (s *Service) CompleteHandover(ctx context.Context, oc *tenant.OrgCtx, termID uuid.UUID) error {
+	done, err := s.q.HandoverCompletedExists(ctx, toPg(termID))
+	if err != nil || done {
+		return err
+	}
+	return s.withTx(ctx, func(q *db.Queries) error {
+		done, err := q.HandoverCompletedExists(ctx, toPg(termID))
+		if err != nil || done {
+			return err // atomic with the marker below
+		}
+		return events.Emit(ctx, q, oc.TenantID, oc.OrgID, "HandoverCompleted",
+			"term", termID, oc.UserID, false,
+			map[string]any{"term_id": termID, "org_id": oc.OrgID})
+	})
 }

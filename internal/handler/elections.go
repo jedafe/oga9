@@ -120,6 +120,8 @@ func (h *ElectionsHandler) Patch(w http.ResponseWriter, r *http.Request) {
 	switch req.Action {
 	case "begin_nominations":
 		err = h.svc.BeginNominations(r.Context(), oc, eid)
+	case "begin_campaign":
+		err = h.svc.BeginCampaign(r.Context(), oc, eid)
 	case "open_voting":
 		err = h.svc.OpenVoting(r.Context(), oc, eid)
 	case "close_voting":

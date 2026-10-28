@@ -122,9 +122,13 @@ func (s *Service) withTx(ctx context.Context, fn func(*db.Queries) error) error 
 	return tx.Commit(ctx)
 }
 
-// registrationOpen reads system_settings.platform.registration_open
-// (catalog default: true when the key is absent).
+// registrationOpen resolves the kill-switch: feature_flags wins (the
+// /platform/flags operator surface writes there), system_settings is the
+// seeded fallback (catalog default: true when neither exists).
 func (s *Service) registrationOpen(ctx context.Context) bool {
+	if f, err := s.q.GetFeatureFlag(ctx, "platform.registration_open"); err == nil {
+		return f
+	}
 	v, err := s.q.GetSystemSetting(ctx, "platform.registration_open")
 	if err != nil {
 		return true
@@ -399,11 +403,18 @@ func (s *Service) VerifyEmail(ctx context.Context, token string) (*User, error) 
 // oga9:auth:used_token:{jti} SET NX EX). Returns the token jti so callers can
 // release the burn if the guarded mutation fails.
 func (s *Service) ConsumeActionToken(ctx context.Context, token, purpose string) (string, string, error) {
-	jti, userID, err := VerifyActionToken(s.jwtSecret, token, purpose)
+	jti, userID, exp, err := VerifyActionToken(s.jwtSecret, token, purpose)
 	if err != nil {
 		return "", "", err
 	}
-	ok, err := s.vk.Do(ctx, s.vk.B().Set().Key("oga9:auth:used_token:"+jti).Value("1").Nx().ExSeconds(86400).Build()).AsBool()
+	// The burn marker must outlive the token it suppresses — TTL tracks
+	// the token's own expiry, so a used long-lived token (e.g. the 48h
+	// provision welcome link) can't be replayed after the marker decays.
+	ttl := exp - time.Now().Unix()
+	if ttl < 60 {
+		ttl = 60
+	}
+	ok, err := s.vk.Do(ctx, s.vk.B().Set().Key("oga9:auth:used_token:"+jti).Value("1").Nx().ExSeconds(ttl).Build()).AsBool()
 	if err != nil || !ok {
 		return "", "", errors.New("token_used")
 	}
@@ -745,6 +756,12 @@ func (s *Service) createOAuthUser(ctx context.Context, email, displayName string
 func (s *Service) MintActionToken(userID uuid.UUID, purpose string, ttl time.Duration) string {
 	tok, _ := SignActionToken(s.jwtSecret, userID.String(), purpose, ttl)
 	return tok
+}
+
+// IssueSession mints a normal session for an already-proven caller —
+// the mfa-enrollment completion path carries device context from the gate.
+func (s *Service) IssueSession(ctx context.Context, userID uuid.UUID, deviceLabel, ip, ua, provider string) (string, uuid.UUID, error) {
+	return s.createSession(ctx, userID, deviceLabel, ip, ua, provider)
 }
 
 // CreateSupportSession mints a 30min session for the impersonation target

@@ -161,11 +161,12 @@ func TestFinanceFlow(t *testing.T) {
 	}
 
 	// claim provenance: member submits, officer confirms → same trail
-	cid, err := svc.SubmitClaim(ctx, payerOC, PaymentIn{
+	claim1, _, err := svc.SubmitClaim(ctx, payerOC, PaymentIn{
 		AmountMinor: 100000, Currency: "NGN", Channel: "cash"}, "dues top-up", uuid.Nil)
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
+	cid := uuid.UUID(claim1.ID.Bytes)
 	if err := svc.ConfirmClaim(ctx, oc, cid, "verified", uuid.Nil, uuid.Nil); err != nil {
 		t.Fatalf("confirm claim: %v", err)
 	}
@@ -183,9 +184,9 @@ func TestFinanceFlow(t *testing.T) {
 	if _, err := svc.OpenDrive(ctx, oc, DriveIn{Title: "Bad", Kind: "fixed_amount"}); err != ErrDriveKind {
 		t.Fatalf("fixed_amount without amount should fail, got %v", err)
 	}
-	cid2, _ := svc.SubmitClaim(ctx, payerOC, PaymentIn{
+	claim2, _, _ := svc.SubmitClaim(ctx, payerOC, PaymentIn{
 		DriveID: did, AmountMinor: 1000000, Currency: "NGN", Channel: "cash"}, "", uuid.Nil)
-	if err := svc.ConfirmClaim(ctx, oc, cid2, "", uuid.Nil, uuid.Nil); err != nil {
+	if err := svc.ConfirmClaim(ctx, oc, uuid.UUID(claim2.ID.Bytes), "", uuid.Nil, uuid.Nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := svc.CloseDrive(ctx, oc, did); err != nil {
@@ -237,18 +238,19 @@ func TestFinanceGuards(t *testing.T) {
 		`INSERT INTO documents (organization_id, kind, title, storage_key, uploaded_by)
 		 VALUES ($1,'photo','proof','k',$2) RETURNING id`, org.ID, payerOC.MembershipID).Scan(&docID)
 	in := PaymentIn{AmountMinor: 1000, Currency: "NGN", Channel: "transfer", ExternalRef: "REF-" + uuid.NewString()[:8]}
-	cid, err := svc.SubmitClaim(ctx, payerOC, in, "", docID)
+	claim1, _, err := svc.SubmitClaim(ctx, payerOC, in, "", docID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := svc.SubmitClaim(ctx, payerOC, in, "", docID); err != ErrAlreadyClaimed {
+	cid := uuid.UUID(claim1.ID.Bytes)
+	if _, _, err := svc.SubmitClaim(ctx, payerOC, in, "", docID); err != ErrAlreadyClaimed {
 		t.Fatalf("dup claim should be ErrAlreadyClaimed, got %v", err)
 	}
 	// reject → same ref resubmits fine (rejection doesn't burn the ref)
 	if err := svc.RejectClaim(ctx, oc, cid, "no credit seen"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := svc.SubmitClaim(ctx, payerOC, in, "", docID); err != nil {
+	if _, _, err := svc.SubmitClaim(ctx, payerOC, in, "", docID); err != nil {
 		t.Fatalf("resubmit after reject should pass, got %v", err)
 	}
 

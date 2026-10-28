@@ -87,6 +87,75 @@ func (q *Queries) ClearScheduledPlan(ctx context.Context, id pgtype.UUID) error 
 	return err
 }
 
+const countPlatformInvoices = `-- name: CountPlatformInvoices :one
+SELECT count(*) FROM platform_invoices WHERE tenant_id = $1
+  AND ($2::text = '' OR state = $2)
+`
+
+type CountPlatformInvoicesParams struct {
+	TenantID pgtype.UUID `json:"tenant_id"`
+	Column2  string      `json:"column_2"`
+}
+
+func (q *Queries) CountPlatformInvoices(ctx context.Context, arg CountPlatformInvoicesParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countPlatformInvoices, arg.TenantID, arg.Column2)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
+const createPlatformInvoice = `-- name: CreatePlatformInvoice :one
+INSERT INTO platform_invoices (tenant_id, subscription_id, addon_slug, number,
+  amount_minor, currency, state, period_start, period_end)
+VALUES ($1, $2::uuid, $3::text,
+  $4, $5, $6, $7,
+  $8::timestamptz, $9::timestamptz)
+RETURNING id, tenant_id, subscription_id, addon_slug, number, amount_minor, currency, state, period_start, period_end, issued_at, paid_at, created_at
+`
+
+type CreatePlatformInvoiceParams struct {
+	TenantID       pgtype.UUID        `json:"tenant_id"`
+	SubscriptionID pgtype.UUID        `json:"subscription_id"`
+	AddonSlug      pgtype.Text        `json:"addon_slug"`
+	Number         string             `json:"number"`
+	AmountMinor    int64              `json:"amount_minor"`
+	Currency       string             `json:"currency"`
+	State          string             `json:"state"`
+	PeriodStart    pgtype.Timestamptz `json:"period_start"`
+	PeriodEnd      pgtype.Timestamptz `json:"period_end"`
+}
+
+func (q *Queries) CreatePlatformInvoice(ctx context.Context, arg CreatePlatformInvoiceParams) (PlatformInvoices, error) {
+	row := q.db.QueryRow(ctx, createPlatformInvoice,
+		arg.TenantID,
+		arg.SubscriptionID,
+		arg.AddonSlug,
+		arg.Number,
+		arg.AmountMinor,
+		arg.Currency,
+		arg.State,
+		arg.PeriodStart,
+		arg.PeriodEnd,
+	)
+	var i PlatformInvoices
+	err := row.Scan(
+		&i.ID,
+		&i.TenantID,
+		&i.SubscriptionID,
+		&i.AddonSlug,
+		&i.Number,
+		&i.AmountMinor,
+		&i.Currency,
+		&i.State,
+		&i.PeriodStart,
+		&i.PeriodEnd,
+		&i.IssuedAt,
+		&i.PaidAt,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
 const createSubscription = `-- name: CreateSubscription :one
 INSERT INTO subscriptions (tenant_id, plan_slug, state, billing_term, trial_ends_at)
 VALUES ($1::uuid, $2, $3,
@@ -199,7 +268,7 @@ func (q *Queries) GetLicenseByDeployment(ctx context.Context, deploymentID strin
 }
 
 const getPlan = `-- name: GetPlan :one
-SELECT slug, price_monthly_minor, price_annual_minor, is_public
+SELECT slug, price_monthly_minor, price_annual_minor, currency, is_public
 FROM plans WHERE slug = $1
 `
 
@@ -207,6 +276,7 @@ type GetPlanRow struct {
 	Slug              string      `json:"slug"`
 	PriceMonthlyMinor pgtype.Int8 `json:"price_monthly_minor"`
 	PriceAnnualMinor  pgtype.Int8 `json:"price_annual_minor"`
+	Currency          string      `json:"currency"`
 	IsPublic          bool        `json:"is_public"`
 }
 
@@ -217,6 +287,7 @@ func (q *Queries) GetPlan(ctx context.Context, slug string) (GetPlanRow, error) 
 		&i.Slug,
 		&i.PriceMonthlyMinor,
 		&i.PriceAnnualMinor,
+		&i.Currency,
 		&i.IsPublic,
 	)
 	return i, err
@@ -558,6 +629,58 @@ func (q *Queries) ListPlans(ctx context.Context) ([]ListPlansRow, error) {
 	return items, nil
 }
 
+const listPlatformInvoices = `-- name: ListPlatformInvoices :many
+SELECT id, tenant_id, subscription_id, addon_slug, number, amount_minor, currency, state, period_start, period_end, issued_at, paid_at, created_at FROM platform_invoices WHERE tenant_id = $1
+  AND ($2::text = '' OR state = $2)
+ORDER BY issued_at DESC LIMIT $3 OFFSET $4
+`
+
+type ListPlatformInvoicesParams struct {
+	TenantID pgtype.UUID `json:"tenant_id"`
+	Column2  string      `json:"column_2"`
+	Limit    int32       `json:"limit"`
+	Offset   int32       `json:"offset"`
+}
+
+func (q *Queries) ListPlatformInvoices(ctx context.Context, arg ListPlatformInvoicesParams) ([]PlatformInvoices, error) {
+	rows, err := q.db.Query(ctx, listPlatformInvoices,
+		arg.TenantID,
+		arg.Column2,
+		arg.Limit,
+		arg.Offset,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []PlatformInvoices
+	for rows.Next() {
+		var i PlatformInvoices
+		if err := rows.Scan(
+			&i.ID,
+			&i.TenantID,
+			&i.SubscriptionID,
+			&i.AddonSlug,
+			&i.Number,
+			&i.AmountMinor,
+			&i.Currency,
+			&i.State,
+			&i.PeriodStart,
+			&i.PeriodEnd,
+			&i.IssuedAt,
+			&i.PaidAt,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listStaleWebhookEvents = `-- name: ListStaleWebhookEvents :many
 SELECT id FROM billing_webhook_events
 WHERE processed_at IS NULL
@@ -645,6 +768,29 @@ func (q *Queries) MarkLicenseExpired(ctx context.Context, id pgtype.UUID) error 
 	return err
 }
 
+const markPlatformInvoicesPaid = `-- name: MarkPlatformInvoicesPaid :execrows
+UPDATE platform_invoices SET state = 'paid', paid_at = now()
+WHERE tenant_id = $1 AND state = 'issued'
+  AND ($2::uuid IS NULL OR subscription_id = $2::uuid)
+  AND ($3::text IS NULL OR addon_slug = $3::text)
+`
+
+type MarkPlatformInvoicesPaidParams struct {
+	TenantID       pgtype.UUID `json:"tenant_id"`
+	SubscriptionID pgtype.UUID `json:"subscription_id"`
+	AddonSlug      pgtype.Text `json:"addon_slug"`
+}
+
+// provider settlement marks the tenant's issued invoices paid — scoped
+// to a subscription and/or addon so unrelated issued rows stand.
+func (q *Queries) MarkPlatformInvoicesPaid(ctx context.Context, arg MarkPlatformInvoicesPaidParams) (int64, error) {
+	result, err := q.db.Exec(ctx, markPlatformInvoicesPaid, arg.TenantID, arg.SubscriptionID, arg.AddonSlug)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const markWebhookProcessed = `-- name: MarkWebhookProcessed :execrows
 UPDATE billing_webhook_events SET processed_at = now()
 WHERE id = $1::uuid AND processed_at IS NULL
@@ -657,6 +803,18 @@ func (q *Queries) MarkWebhookProcessed(ctx context.Context, id pgtype.UUID) (int
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const nextInvoiceNumber = `-- name: NextInvoiceNumber :one
+UPDATE tenants SET invoice_no_seq = invoice_no_seq + 1
+WHERE id = $1 RETURNING invoice_no_seq
+`
+
+func (q *Queries) NextInvoiceNumber(ctx context.Context, id pgtype.UUID) (int64, error) {
+	row := q.db.QueryRow(ctx, nextInvoiceNumber, id)
+	var invoice_no_seq int64
+	err := row.Scan(&invoice_no_seq)
+	return invoice_no_seq, err
 }
 
 const scheduleSubscriptionPlan = `-- name: ScheduleSubscriptionPlan :execrows
@@ -838,4 +996,44 @@ func (q *Queries) TransitionSubscriptionState(ctx context.Context, arg Transitio
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const upsertUsageMeter = `-- name: UpsertUsageMeter :exec
+INSERT INTO usage_meters (tenant_id, limit_key, used, period_start)
+VALUES ($1, $2, $3, $4)
+ON CONFLICT (tenant_id, limit_key, period_start) DO UPDATE SET used = EXCLUDED.used
+`
+
+type UpsertUsageMeterParams struct {
+	TenantID    pgtype.UUID `json:"tenant_id"`
+	LimitKey    string      `json:"limit_key"`
+	Used        int64       `json:"used"`
+	PeriodStart pgtype.Date `json:"period_start"`
+}
+
+// ai:usage_rollup sync target — overwrite (rollup is authoritative).
+func (q *Queries) UpsertUsageMeter(ctx context.Context, arg UpsertUsageMeterParams) error {
+	_, err := q.db.Exec(ctx, upsertUsageMeter,
+		arg.TenantID,
+		arg.LimitKey,
+		arg.Used,
+		arg.PeriodStart,
+	)
+	return err
+}
+
+const voidAddonIssuedInvoice = `-- name: VoidAddonIssuedInvoice :exec
+UPDATE platform_invoices SET state = 'void'
+WHERE tenant_id = $1 AND addon_slug = $2 AND state = 'issued'
+`
+
+type VoidAddonIssuedInvoiceParams struct {
+	TenantID  pgtype.UUID `json:"tenant_id"`
+	AddonSlug pgtype.Text `json:"addon_slug"`
+}
+
+// pending-addon cancel voids its unsettled invoice.
+func (q *Queries) VoidAddonIssuedInvoice(ctx context.Context, arg VoidAddonIssuedInvoiceParams) error {
+	_, err := q.db.Exec(ctx, voidAddonIssuedInvoice, arg.TenantID, arg.AddonSlug)
+	return err
 }

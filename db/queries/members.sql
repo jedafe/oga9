@@ -9,11 +9,11 @@ VALUES (sqlc.arg(organization_id), sqlc.arg(user_id), sqlc.arg(email), sqlc.arg(
 RETURNING id;
 
 -- name: GetApplication :one
-SELECT id, organization_id, user_id, email, phone, answers, sponsor_member_id, status, created_at
+SELECT id, organization_id, user_id, email, phone, answers, sponsor_member_id, status, japa_subject, created_at
 FROM membership_applications WHERE id = $1;
 
 -- name: ListApplications :many
-SELECT id, user_id, email, phone, status, sponsor_member_id, answers, created_at, decided_at
+SELECT id, user_id, email, phone, status, sponsor_member_id, answers, japa_subject, created_at, decided_at
 FROM membership_applications
 WHERE organization_id = sqlc.arg(org_id)::uuid AND status = sqlc.arg(status)
 ORDER BY created_at;
@@ -286,3 +286,28 @@ SELECT m.member_no, u.display_name, u.email, m.category, m.lifecycle_state,
 FROM organization_memberships m
 JOIN users u ON u.id = m.user_id
 WHERE m.organization_id = $1 ORDER BY m.member_no;
+
+-- name: SetApplicationJapaSubject :execrows
+-- §23: durable japa identity link — set once at locator-join intake,
+-- only on rows that don't already carry a subject.
+UPDATE membership_applications SET japa_subject = $2
+WHERE id = $1 AND (japa_subject IS NULL OR japa_subject = '');
+
+-- name: ListMembersPaged :many
+SELECT m.id, m.user_id, m.member_no, m.category, m.lifecycle_state, m.dues_standing,
+       m.joined_at, m.org_unit_id, u.display_name, u.email
+FROM organization_memberships m
+JOIN users u ON u.id = m.user_id
+WHERE m.organization_id = sqlc.arg(org_id)::uuid
+  AND (sqlc.arg(category) = '' OR m.category = sqlc.arg(category))
+  AND (sqlc.arg(state) = '' OR m.lifecycle_state = sqlc.arg(state))
+  AND (sqlc.narg(unit_id)::uuid IS NULL OR m.org_unit_id = sqlc.narg(unit_id)::uuid)
+ORDER BY u.display_name
+LIMIT sqlc.arg(lim) OFFSET sqlc.arg(off);
+
+-- name: CountMembers :one
+SELECT count(*) FROM organization_memberships m
+WHERE m.organization_id = sqlc.arg(org_id)::uuid
+  AND (sqlc.arg(category) = '' OR m.category = sqlc.arg(category))
+  AND (sqlc.arg(state) = '' OR m.lifecycle_state = sqlc.arg(state))
+  AND (sqlc.narg(unit_id)::uuid IS NULL OR m.org_unit_id = sqlc.narg(unit_id)::uuid);

@@ -88,7 +88,7 @@ func TestDraftReview(t *testing.T) {
 		applied = true
 		return nil
 	})
-	gid, err := svc.Draft(ctx, oc, "agenda", "next meeting")
+	gid, err := svc.Draft(ctx, oc, "agenda", "next meeting", uuid.Nil)
 	if err != nil {
 		t.Fatal(err)
 	}

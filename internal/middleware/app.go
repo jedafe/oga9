@@ -36,3 +36,26 @@ func RequireAppActive(svc *tenant.Service, appID string) func(http.Handler) http
 		})
 	}
 }
+
+// RequireAnyOrgPermission gates a route when ANY of the listed nodes
+// passes — for surfaces where the spec names alternatives (e.g. voice
+// room end: "room starter or org.chat.moderate" — the service still
+// checks the starter path itself; a moderator needs the node).
+func RequireAnyOrgPermission(svc *tenant.Service, nodes ...string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			oc := OrgCtx(r.Context())
+			if oc == nil {
+				httpx.WriteErr(w, 500, "internal_error", "permission gate requires org context")
+				return
+			}
+			for _, n := range nodes {
+				if svc.HasPermission(r.Context(), oc.UserID, oc.OrgID, n) {
+					next.ServeHTTP(w, r)
+					return
+				}
+			}
+			httpx.WriteErr(w, 403, "forbidden", "missing required permission")
+		})
+	}
+}

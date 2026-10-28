@@ -78,10 +78,19 @@ func (h *MFAHandler) Confirm(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.svc.ClearPendingMFA(r.Context(), userID)
-	// a gated login (mfa_setup_required) has now enrolled — burn the gate
-	// nonce so it can't be replayed against these routes.
+	// a gated login (mfa_setup_required) has now enrolled — consume the
+	// gate and finish the login the nonce stood for, rather than making
+	// the user restart the whole ceremony.
 	if nonce := middleware.MFAGateNonce(r.Context()); nonce != "" {
-		h.svc.DropMFAGate(r.Context(), nonce)
+		if gate, err := h.svc.ConsumeMFAGate(r.Context(), nonce); err == nil && gate.UserID == userID {
+			if token, sessID, err := h.svc.IssueSession(r.Context(),
+				gate.UserID, gate.DeviceLabel, gate.IP, gate.UserAgent, gate.Provider); err == nil {
+				httpx.WriteData(w, 200, map[string]any{"mfa_enabled": true,
+					"recovery_codes": codes, "token": token, "session_id": sessID})
+				return
+			}
+		}
+		h.svc.DropMFAGate(r.Context(), nonce) // consume failed — burn anyway
 	}
 	// recovery codes are returned ONCE — store them offline.
 	httpx.WriteData(w, 200, map[string]any{"mfa_enabled": true, "recovery_codes": codes})

@@ -104,12 +104,13 @@ func (q *Queries) CountTenantOrgs(ctx context.Context, tenantID pgtype.UUID) (in
 	return count, err
 }
 
-const createCustomField = `-- name: CreateCustomField :exec
+const createCustomField = `-- name: CreateCustomField :one
 INSERT INTO custom_fields (group_id, organization_id, entity_type, key, label, help_text,
-                           kind, required, options, sort_order, visibility, source)
+                           kind, required, options, validation, sort_order, visibility, source)
 VALUES ($1, $2, $3, $4,
         $5, $6, $7, $8,
-        $9, $10, $11, $12)
+        $9, $10::jsonb, $11, $12, $13)
+RETURNING id
 `
 
 type CreateCustomFieldParams struct {
@@ -122,13 +123,14 @@ type CreateCustomFieldParams struct {
 	Kind           string      `json:"kind"`
 	Required       bool        `json:"required"`
 	Options        []byte      `json:"options"`
+	Validation     []byte      `json:"validation"`
 	SortOrder      int32       `json:"sort_order"`
 	Visibility     string      `json:"visibility"`
 	Source         string      `json:"source"`
 }
 
-func (q *Queries) CreateCustomField(ctx context.Context, arg CreateCustomFieldParams) error {
-	_, err := q.db.Exec(ctx, createCustomField,
+func (q *Queries) CreateCustomField(ctx context.Context, arg CreateCustomFieldParams) (pgtype.UUID, error) {
+	row := q.db.QueryRow(ctx, createCustomField,
 		arg.GroupID,
 		arg.OrganizationID,
 		arg.EntityType,
@@ -138,11 +140,14 @@ func (q *Queries) CreateCustomField(ctx context.Context, arg CreateCustomFieldPa
 		arg.Kind,
 		arg.Required,
 		arg.Options,
+		arg.Validation,
 		arg.SortOrder,
 		arg.Visibility,
 		arg.Source,
 	)
-	return err
+	var id pgtype.UUID
+	err := row.Scan(&id)
+	return id, err
 }
 
 const createCustomFieldGroup = `-- name: CreateCustomFieldGroup :one
@@ -343,6 +348,23 @@ func (q *Queries) CreateUnit(ctx context.Context, arg CreateUnitParams) (pgtype.
 	return id, err
 }
 
+const deleteFieldGroup = `-- name: DeleteFieldGroup :execrows
+DELETE FROM custom_field_groups WHERE id = $1 AND organization_id = $2
+`
+
+type DeleteFieldGroupParams struct {
+	ID             pgtype.UUID `json:"id"`
+	OrganizationID pgtype.UUID `json:"organization_id"`
+}
+
+func (q *Queries) DeleteFieldGroup(ctx context.Context, arg DeleteFieldGroupParams) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteFieldGroup, arg.ID, arg.OrganizationID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const getBranding = `-- name: GetBranding :one
 SELECT primary_color, secondary_color, motto, founded_year, portal_config
 FROM org_branding WHERE organization_id = $1
@@ -365,6 +387,73 @@ func (q *Queries) GetBranding(ctx context.Context, organizationID pgtype.UUID) (
 		&i.Motto,
 		&i.FoundedYear,
 		&i.PortalConfig,
+	)
+	return i, err
+}
+
+const getField = `-- name: GetField :one
+SELECT id, group_id, organization_id, entity_type, key, label, help_text, kind, required, options, validation, sort_order, visibility, source, created_at, retired_at FROM custom_fields WHERE id = $1 AND organization_id = $2 AND retired_at IS NULL
+`
+
+type GetFieldParams struct {
+	ID             pgtype.UUID `json:"id"`
+	OrganizationID pgtype.UUID `json:"organization_id"`
+}
+
+func (q *Queries) GetField(ctx context.Context, arg GetFieldParams) (CustomFields, error) {
+	row := q.db.QueryRow(ctx, getField, arg.ID, arg.OrganizationID)
+	var i CustomFields
+	err := row.Scan(
+		&i.ID,
+		&i.GroupID,
+		&i.OrganizationID,
+		&i.EntityType,
+		&i.Key,
+		&i.Label,
+		&i.HelpText,
+		&i.Kind,
+		&i.Required,
+		&i.Options,
+		&i.Validation,
+		&i.SortOrder,
+		&i.Visibility,
+		&i.Source,
+		&i.CreatedAt,
+		&i.RetiredAt,
+	)
+	return i, err
+}
+
+const getFieldByKey = `-- name: GetFieldByKey :one
+SELECT id, group_id, organization_id, entity_type, key, label, help_text, kind, required, options, validation, sort_order, visibility, source, created_at, retired_at FROM custom_fields WHERE organization_id = $1 AND entity_type = $2 AND key = $3 AND retired_at IS NULL
+`
+
+type GetFieldByKeyParams struct {
+	OrganizationID pgtype.UUID `json:"organization_id"`
+	EntityType     string      `json:"entity_type"`
+	Key            string      `json:"key"`
+}
+
+func (q *Queries) GetFieldByKey(ctx context.Context, arg GetFieldByKeyParams) (CustomFields, error) {
+	row := q.db.QueryRow(ctx, getFieldByKey, arg.OrganizationID, arg.EntityType, arg.Key)
+	var i CustomFields
+	err := row.Scan(
+		&i.ID,
+		&i.GroupID,
+		&i.OrganizationID,
+		&i.EntityType,
+		&i.Key,
+		&i.Label,
+		&i.HelpText,
+		&i.Kind,
+		&i.Required,
+		&i.Options,
+		&i.Validation,
+		&i.SortOrder,
+		&i.Visibility,
+		&i.Source,
+		&i.CreatedAt,
+		&i.RetiredAt,
 	)
 	return i, err
 }
@@ -611,6 +700,138 @@ func (q *Queries) HasRoleInTenant(ctx context.Context, arg HasRoleInTenantParams
 	var exists bool
 	err := row.Scan(&exists)
 	return exists, err
+}
+
+const listFieldGroups = `-- name: ListFieldGroups :many
+SELECT id, organization_id, entity_type, name, slug, sort_order, visibility, source, created_at FROM custom_field_groups WHERE organization_id = $1
+  AND ($2::text = '' OR entity_type = $2) ORDER BY sort_order, name
+`
+
+type ListFieldGroupsParams struct {
+	OrganizationID pgtype.UUID `json:"organization_id"`
+	Column2        string      `json:"column_2"`
+}
+
+func (q *Queries) ListFieldGroups(ctx context.Context, arg ListFieldGroupsParams) ([]CustomFieldGroups, error) {
+	rows, err := q.db.Query(ctx, listFieldGroups, arg.OrganizationID, arg.Column2)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []CustomFieldGroups
+	for rows.Next() {
+		var i CustomFieldGroups
+		if err := rows.Scan(
+			&i.ID,
+			&i.OrganizationID,
+			&i.EntityType,
+			&i.Name,
+			&i.Slug,
+			&i.SortOrder,
+			&i.Visibility,
+			&i.Source,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listFieldValues = `-- name: ListFieldValues :many
+SELECT cfv.field_id, cfv.entity_id, cfv.value, cfv.updated_at
+FROM custom_field_values cfv
+JOIN custom_fields cf ON cf.id = cfv.field_id AND cf.retired_at IS NULL
+WHERE cfv.organization_id = $1 AND cfv.entity_id = $2 AND cf.entity_type = $3
+`
+
+type ListFieldValuesParams struct {
+	OrganizationID pgtype.UUID `json:"organization_id"`
+	EntityID       pgtype.UUID `json:"entity_id"`
+	EntityType     string      `json:"entity_type"`
+}
+
+type ListFieldValuesRow struct {
+	FieldID   pgtype.UUID        `json:"field_id"`
+	EntityID  pgtype.UUID        `json:"entity_id"`
+	Value     []byte             `json:"value"`
+	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
+}
+
+func (q *Queries) ListFieldValues(ctx context.Context, arg ListFieldValuesParams) ([]ListFieldValuesRow, error) {
+	rows, err := q.db.Query(ctx, listFieldValues, arg.OrganizationID, arg.EntityID, arg.EntityType)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListFieldValuesRow
+	for rows.Next() {
+		var i ListFieldValuesRow
+		if err := rows.Scan(
+			&i.FieldID,
+			&i.EntityID,
+			&i.Value,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listFields = `-- name: ListFields :many
+SELECT id, group_id, organization_id, entity_type, key, label, help_text, kind, required, options, validation, sort_order, visibility, source, created_at, retired_at FROM custom_fields WHERE organization_id = $1 AND retired_at IS NULL
+  AND ($2::text = '' OR entity_type = $2) ORDER BY sort_order, key
+`
+
+type ListFieldsParams struct {
+	OrganizationID pgtype.UUID `json:"organization_id"`
+	Column2        string      `json:"column_2"`
+}
+
+func (q *Queries) ListFields(ctx context.Context, arg ListFieldsParams) ([]CustomFields, error) {
+	rows, err := q.db.Query(ctx, listFields, arg.OrganizationID, arg.Column2)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []CustomFields
+	for rows.Next() {
+		var i CustomFields
+		if err := rows.Scan(
+			&i.ID,
+			&i.GroupID,
+			&i.OrganizationID,
+			&i.EntityType,
+			&i.Key,
+			&i.Label,
+			&i.HelpText,
+			&i.Kind,
+			&i.Required,
+			&i.Options,
+			&i.Validation,
+			&i.SortOrder,
+			&i.Visibility,
+			&i.Source,
+			&i.CreatedAt,
+			&i.RetiredAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const listOrgAdminTenants = `-- name: ListOrgAdminTenants :many
@@ -882,6 +1103,53 @@ func (q *Queries) ListUserOrgs(ctx context.Context, userID pgtype.UUID) ([]ListU
 	return items, nil
 }
 
+const orgByCustomDomain = `-- name: OrgByCustomDomain :one
+SELECT slug FROM organizations WHERE lower(custom_domain) = lower($1) AND deleted_at IS NULL
+`
+
+func (q *Queries) OrgByCustomDomain(ctx context.Context, lower string) (string, error) {
+	row := q.db.QueryRow(ctx, orgByCustomDomain, lower)
+	var slug string
+	err := row.Scan(&slug)
+	return slug, err
+}
+
+const retireField = `-- name: RetireField :execrows
+UPDATE custom_fields SET retired_at = now()
+WHERE id = $1 AND organization_id = $2 AND retired_at IS NULL
+`
+
+type RetireFieldParams struct {
+	ID             pgtype.UUID `json:"id"`
+	OrganizationID pgtype.UUID `json:"organization_id"`
+}
+
+// retire, never hard-delete: CASCADE on custom_field_values would drop data
+func (q *Queries) RetireField(ctx context.Context, arg RetireFieldParams) (int64, error) {
+	result, err := q.db.Exec(ctx, retireField, arg.ID, arg.OrganizationID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const setCustomDomain = `-- name: SetCustomDomain :execrows
+UPDATE organizations SET custom_domain = $2 WHERE id = $1 AND deleted_at IS NULL
+`
+
+type SetCustomDomainParams struct {
+	ID           pgtype.UUID `json:"id"`
+	CustomDomain pgtype.Text `json:"custom_domain"`
+}
+
+func (q *Queries) SetCustomDomain(ctx context.Context, arg SetCustomDomainParams) (int64, error) {
+	result, err := q.db.Exec(ctx, setCustomDomain, arg.ID, arg.CustomDomain)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const setInvitationStatus = `-- name: SetInvitationStatus :one
 UPDATE org_invitations SET status = $3 WHERE id = $1 AND organization_id = $2 AND status = 'pending'
 RETURNING id
@@ -899,6 +1167,23 @@ func (q *Queries) SetInvitationStatus(ctx context.Context, arg SetInvitationStat
 	var id pgtype.UUID
 	err := row.Scan(&id)
 	return id, err
+}
+
+const setOrgDescription = `-- name: SetOrgDescription :execrows
+UPDATE organizations SET description = $2 WHERE id = $1 AND deleted_at IS NULL
+`
+
+type SetOrgDescriptionParams struct {
+	ID          pgtype.UUID `json:"id"`
+	Description pgtype.Text `json:"description"`
+}
+
+func (q *Queries) SetOrgDescription(ctx context.Context, arg SetOrgDescriptionParams) (int64, error) {
+	result, err := q.db.Exec(ctx, setOrgDescription, arg.ID, arg.Description)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const setTenantOwnerOrg = `-- name: SetTenantOwnerOrg :exec
@@ -954,6 +1239,85 @@ func (q *Queries) UnitHasActiveMembers(ctx context.Context, orgUnitID pgtype.UUI
 	var has_members bool
 	err := row.Scan(&has_members)
 	return has_members, err
+}
+
+const updateField = `-- name: UpdateField :one
+UPDATE custom_fields SET group_id = $1::uuid, label = $2,
+  help_text = $3::text, required = $4,
+  options = $5::jsonb, validation = $6::jsonb,
+  sort_order = $7,
+  visibility = COALESCE($8::text, visibility)
+WHERE id = $9 AND organization_id = $10
+  AND retired_at IS NULL
+RETURNING id, entity_type
+`
+
+type UpdateFieldParams struct {
+	GroupID        pgtype.UUID `json:"group_id"`
+	Label          string      `json:"label"`
+	HelpText       pgtype.Text `json:"help_text"`
+	Required       bool        `json:"required"`
+	Options        []byte      `json:"options"`
+	Validation     []byte      `json:"validation"`
+	SortOrder      int32       `json:"sort_order"`
+	Visibility     pgtype.Text `json:"visibility"`
+	ID             pgtype.UUID `json:"id"`
+	OrganizationID pgtype.UUID `json:"organization_id"`
+}
+
+type UpdateFieldRow struct {
+	ID         pgtype.UUID `json:"id"`
+	EntityType string      `json:"entity_type"`
+}
+
+func (q *Queries) UpdateField(ctx context.Context, arg UpdateFieldParams) (UpdateFieldRow, error) {
+	row := q.db.QueryRow(ctx, updateField,
+		arg.GroupID,
+		arg.Label,
+		arg.HelpText,
+		arg.Required,
+		arg.Options,
+		arg.Validation,
+		arg.SortOrder,
+		arg.Visibility,
+		arg.ID,
+		arg.OrganizationID,
+	)
+	var i UpdateFieldRow
+	err := row.Scan(&i.ID, &i.EntityType)
+	return i, err
+}
+
+const updateFieldGroup = `-- name: UpdateFieldGroup :one
+UPDATE custom_field_groups SET name = $3, sort_order = $4,
+  visibility = COALESCE($5::text, visibility)
+WHERE id = $1 AND organization_id = $2 RETURNING id, entity_type
+`
+
+type UpdateFieldGroupParams struct {
+	ID             pgtype.UUID `json:"id"`
+	OrganizationID pgtype.UUID `json:"organization_id"`
+	Name           string      `json:"name"`
+	SortOrder      int32       `json:"sort_order"`
+	Visibility     pgtype.Text `json:"visibility"`
+}
+
+type UpdateFieldGroupRow struct {
+	ID         pgtype.UUID `json:"id"`
+	EntityType string      `json:"entity_type"`
+}
+
+func (q *Queries) UpdateFieldGroup(ctx context.Context, arg UpdateFieldGroupParams) (UpdateFieldGroupRow, error) {
+	row := q.db.QueryRow(ctx, updateFieldGroup,
+		arg.ID,
+		arg.OrganizationID,
+		arg.Name,
+		arg.SortOrder,
+		arg.Visibility,
+	)
+	var i UpdateFieldGroupRow
+	err := row.Scan(&i.ID, &i.EntityType)
+	return i, err
 }
 
 const updateOrgProfile = `-- name: UpdateOrgProfile :one
@@ -1040,6 +1404,32 @@ func (q *Queries) UpsertBranding(ctx context.Context, arg UpsertBrandingParams) 
 		arg.PortalConfig,
 	)
 	return err
+}
+
+const upsertFieldValue = `-- name: UpsertFieldValue :one
+INSERT INTO custom_field_values (field_id, organization_id, entity_id, value)
+VALUES ($1, $2, $3, $4)
+ON CONFLICT (field_id, entity_id) DO UPDATE SET value = EXCLUDED.value, updated_at = now()
+RETURNING id
+`
+
+type UpsertFieldValueParams struct {
+	FieldID        pgtype.UUID `json:"field_id"`
+	OrganizationID pgtype.UUID `json:"organization_id"`
+	EntityID       pgtype.UUID `json:"entity_id"`
+	Value          []byte      `json:"value"`
+}
+
+func (q *Queries) UpsertFieldValue(ctx context.Context, arg UpsertFieldValueParams) (pgtype.UUID, error) {
+	row := q.db.QueryRow(ctx, upsertFieldValue,
+		arg.FieldID,
+		arg.OrganizationID,
+		arg.EntityID,
+		arg.Value,
+	)
+	var id pgtype.UUID
+	err := row.Scan(&id)
+	return id, err
 }
 
 const upsertOrgSetting = `-- name: UpsertOrgSetting :exec

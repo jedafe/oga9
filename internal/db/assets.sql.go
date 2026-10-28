@@ -42,17 +42,20 @@ func (q *Queries) AssignCustody(ctx context.Context, arg AssignCustodyParams) (p
 }
 
 const completeAudit = `-- name: CompleteAudit :execrows
-UPDATE asset_audits SET findings = $2, state = 'completed'
+UPDATE asset_audits SET findings = $2, state = $3
 WHERE id = $1 AND state = 'open'
 `
 
 type CompleteAuditParams struct {
 	ID       pgtype.UUID `json:"id"`
 	Findings []byte      `json:"findings"`
+	State    string      `json:"state"`
 }
 
+// §18 test 4: findings containing a 'missing' item keep the audit open —
+// the caller passes the target state ('completed'|'open').
 func (q *Queries) CompleteAudit(ctx context.Context, arg CompleteAuditParams) (int64, error) {
-	result, err := q.db.Exec(ctx, completeAudit, arg.ID, arg.Findings)
+	result, err := q.db.Exec(ctx, completeAudit, arg.ID, arg.Findings, arg.State)
 	if err != nil {
 		return 0, err
 	}
@@ -140,6 +143,19 @@ func (q *Queries) CurrentCustody(ctx context.Context, assetID pgtype.UUID) (Cust
 		&i.ReturnedAt,
 	)
 	return i, err
+}
+
+const custodyFlagged = `-- name: CustodyFlagged :one
+SELECT EXISTS(SELECT 1 FROM domain_events
+  WHERE event_type = 'CustodyHandoverFlagged' AND aggregate_id = $1)
+`
+
+// at-least-once dedupe for CustodyHandoverFlagged re-delivery.
+func (q *Queries) CustodyFlagged(ctx context.Context, aggregateID pgtype.UUID) (bool, error) {
+	row := q.db.QueryRow(ctx, custodyFlagged, aggregateID)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
 }
 
 const deleteCredential = `-- name: DeleteCredential :execrows
@@ -476,6 +492,43 @@ func (q *Queries) MaintenanceDue(ctx context.Context, dollar_1 int32) ([]Mainten
 	return items, nil
 }
 
+const openCustodyForOrg = `-- name: OpenCustodyForOrg :many
+SELECT c.id, c.asset_id, c.holder_member_id, c.holder_unit_id, c.term_id, c.assigned_by, c.assigned_at, c.returned_at FROM custody_assignments c
+JOIN assets a ON a.id = c.asset_id
+WHERE a.organization_id = $1 AND c.returned_at IS NULL
+ORDER BY c.assigned_at
+`
+
+// §16 handover section: custody rows still open in the org (any term).
+func (q *Queries) OpenCustodyForOrg(ctx context.Context, organizationID pgtype.UUID) ([]CustodyAssignments, error) {
+	rows, err := q.db.Query(ctx, openCustodyForOrg, organizationID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []CustodyAssignments
+	for rows.Next() {
+		var i CustodyAssignments
+		if err := rows.Scan(
+			&i.ID,
+			&i.AssetID,
+			&i.HolderMemberID,
+			&i.HolderUnitID,
+			&i.TermID,
+			&i.AssignedBy,
+			&i.AssignedAt,
+			&i.ReturnedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const patchAsset = `-- name: PatchAsset :execrows
 UPDATE assets SET
   name = COALESCE($1, name),
@@ -600,7 +653,9 @@ const upsertCredential = `-- name: UpsertCredential :exec
 INSERT INTO digital_credentials (asset_id, kind, label, reference, vault_ref, updated_at)
 VALUES ($1::uuid, $2, $3,
   $4, $5, now())
-ON CONFLICT (id) DO NOTHING
+ON CONFLICT (asset_id, kind) DO UPDATE SET
+  label = EXCLUDED.label, reference = EXCLUDED.reference,
+  vault_ref = EXCLUDED.vault_ref, updated_at = now()
 `
 
 type UpsertCredentialParams struct {

@@ -177,3 +177,25 @@ func (g *Gateway) ServeWS(w http.ResponseWriter, r *http.Request) {
 		log.Printf("realtime: pubsub: %v", err)
 	}
 }
+
+// Ticket — POST /api/v1/ws/ticket (§24): browser clients can't set headers
+// on WS upgrade, so they mint a single-use 60s ticket here and pass it as
+// ?ticket= (consumed atomically via GETDEL — replay fails). The session JWT
+// never lands in a URL.
+func (g *Gateway) Ticket(w http.ResponseWriter, r *http.Request) {
+	uid := middleware.UserID(r.Context())
+	if uid == uuid.Nil {
+		http.Error(w, `{"error":{"code":"unauthorized","message":"session required","status":401}}`, 401)
+		return
+	}
+	nonce := uuid.NewString()
+	if g.vk != nil {
+		if err := g.vk.Do(r.Context(), g.vk.B().Set().Key("oga9:ws_ticket:"+nonce).
+			Value(uid.String()).ExSeconds(60).Build()).Error(); err != nil {
+			http.Error(w, `{"error":{"code":"internal_error","message":"ticket mint failed","status":500}}`, 500)
+			return
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Write([]byte(`{"data":{"ticket":"` + nonce + `","expires_in":60}}`))
+}

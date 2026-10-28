@@ -49,15 +49,17 @@ func assetID(w http.ResponseWriter, r *http.Request) (uuid.UUID, bool) {
 }
 
 type assetReq struct {
-	Category    string    `json:"category"`
-	Name        string    `json:"name"`
-	Description string    `json:"description"`
-	Identifier  string    `json:"identifier"`
-	Condition   string    `json:"condition"`
-	AcquiredAt  time.Time `json:"acquired_at"`
-	CostMinor   int64     `json:"cost_minor"`
-	Currency    string    `json:"currency"`
-	UnitID      uuid.UUID `json:"unit_id"`
+	Category     string    `json:"category"`
+	Name         string    `json:"name"`
+	Description  string    `json:"description"`
+	Identifier   string    `json:"identifier"`
+	Condition    string    `json:"condition"`
+	AcquiredAt   time.Time `json:"acquired_at"`
+	CostMinor    int64     `json:"cost_minor"`
+	Currency     string    `json:"currency"`
+	UnitID       uuid.UUID `json:"unit_id"`
+	HolderMember uuid.UUID `json:"holder_member_id"` // §18 custodian (XOR holder_unit_id)
+	HolderUnit   uuid.UUID `json:"holder_unit_id"`
 }
 
 func (h *AssetsHandler) List(w http.ResponseWriter, r *http.Request) {
@@ -78,7 +80,8 @@ func (h *AssetsHandler) Register(w http.ResponseWriter, r *http.Request) {
 	}
 	id, err := h.svc.Register(r.Context(), middleware.OrgCtx(r.Context()),
 		req.Category, req.Name, req.Description, req.Identifier, req.Condition,
-		req.AcquiredAt, req.CostMinor, req.Currency, req.UnitID)
+		req.AcquiredAt, req.CostMinor, req.Currency, req.UnitID,
+		req.HolderMember, req.HolderUnit)
 	if err != nil {
 		assetErr(w, err)
 		return

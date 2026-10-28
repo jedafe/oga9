@@ -85,17 +85,33 @@ SELECT * FROM asset_audits WHERE id = $1 AND organization_id = $2;
 SELECT * FROM asset_audits WHERE organization_id = $1 ORDER BY created_at DESC LIMIT 100;
 
 -- name: CompleteAudit :execrows
-UPDATE asset_audits SET findings = $2, state = 'completed'
+-- §18 test 4: findings containing a 'missing' item keep the audit open —
+-- the caller passes the target state ('completed'|'open').
+UPDATE asset_audits SET findings = $2, state = $3
 WHERE id = $1 AND state = 'open';
 
 -- name: UpsertCredential :exec
 INSERT INTO digital_credentials (asset_id, kind, label, reference, vault_ref, updated_at)
 VALUES (sqlc.arg(asset_id)::uuid, sqlc.arg(kind), sqlc.arg(label),
   sqlc.arg(reference), sqlc.narg(vault_ref), now())
-ON CONFLICT (id) DO NOTHING;
+ON CONFLICT (asset_id, kind) DO UPDATE SET
+  label = EXCLUDED.label, reference = EXCLUDED.reference,
+  vault_ref = EXCLUDED.vault_ref, updated_at = now();
 
 -- name: ListCredentials :many
 SELECT * FROM digital_credentials WHERE asset_id = $1;
 
 -- name: DeleteCredential :execrows
 DELETE FROM digital_credentials WHERE id = $1 AND asset_id = $2;
+
+-- name: OpenCustodyForOrg :many
+-- §16 handover section: custody rows still open in the org (any term).
+SELECT c.* FROM custody_assignments c
+JOIN assets a ON a.id = c.asset_id
+WHERE a.organization_id = $1 AND c.returned_at IS NULL
+ORDER BY c.assigned_at;
+
+-- name: CustodyFlagged :one
+-- at-least-once dedupe for CustodyHandoverFlagged re-delivery.
+SELECT EXISTS(SELECT 1 FROM domain_events
+  WHERE event_type = 'CustodyHandoverFlagged' AND aggregate_id = $1);

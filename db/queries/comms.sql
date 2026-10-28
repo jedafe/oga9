@@ -139,3 +139,12 @@ JOIN users u ON u.id = n.user_id
 WHERE n.channel = 'email' AND n.delivered_at IS NULL AND n.kind = 'announcement'
   AND n.created_at < now() - interval '1 hour'
 ORDER BY n.created_at LIMIT 100;
+
+-- name: MyNotificationsPaged :many
+SELECT * FROM notifications WHERE user_id = $1
+  AND ($2::bool = false OR read_at IS NULL)
+ORDER BY created_at DESC LIMIT $3 OFFSET $4;
+
+-- name: CountMyNotifications :one
+SELECT count(*) FROM notifications WHERE user_id = $1
+  AND ($2::bool = false OR read_at IS NULL);

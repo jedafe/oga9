@@ -17,9 +17,11 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
+	valkey "github.com/valkey-io/valkey-go"
 
 	"github.com/jedafe/oga9/internal/db"
 	"github.com/jedafe/oga9/internal/events"
+	"github.com/jedafe/oga9/internal/rules"
 	"github.com/jedafe/oga9/internal/storage"
 	"github.com/jedafe/oga9/internal/tenant"
 )
@@ -31,9 +33,11 @@ var (
 )
 
 type Service struct {
+	ru         *rules.Service // ADR-016 rules engine — org_settings resolve through it (Rule 23)
 	pool       *pgxpool.Pool
 	q          *db.Queries
-	store      *storage.Store
+	vk         valkey.Client // §26 survey submit-claim markers (oga9:survey:claim:*)
+	store      storage.BlobStore
 	limitFn    func(ctx context.Context, tenantID uuid.UUID, key string) int64
 	fallbackMB int64 // used when no plan limit resolves (dev/new plans)
 	// Rule-26 read seams — comms never reads activities/finance tables;
@@ -80,12 +84,31 @@ var Kinds = map[string]bool{
 	"subscription":       true,
 	"platform":           true,
 	"chat_message":       true, // §24 channel message (muted channels skip)
+	"poll":               true, // §26 poll open/close to the audience
+	"survey":             true, // §26 survey open/close to the audience
+	"volunteer_reminder": true, // §27 confirmed-volunteer reminder
 }
 
-func NewService(pool *pgxpool.Pool) *Service { return &Service{pool: pool, q: db.New(pool)} }
+func NewService(pool *pgxpool.Pool) *Service {
+	return &Service{ru: rules.New(pool), pool: pool, q: db.New(pool)}
+}
 
 func toPg(u uuid.UUID) pgtype.UUID   { return pgtype.UUID{Bytes: u, Valid: u != uuid.Nil} }
 func fromPg(u pgtype.UUID) uuid.UUID { return uuid.UUID(u.Bytes) }
+func pgText(s string) pgtype.Text    { return pgtype.Text{String: s, Valid: s != ""} }
+
+// orgSettingBool — org rule read (Rule 23); catalog default on miss.
+func (s *Service) orgSettingBool(ctx context.Context, orgID uuid.UUID, key string, fallback bool) bool {
+	raw, err := s.ru.Value(ctx, orgID, key)
+	if err != nil {
+		return fallback
+	}
+	var b bool
+	if json.Unmarshal(raw, &b) != nil {
+		return fallback
+	}
+	return b
+}
 
 func (s *Service) withTx(ctx context.Context, fn func(*db.Queries) error) error {
 	tx, err := s.pool.Begin(ctx)
@@ -181,6 +204,18 @@ func (s *Service) Retract(ctx context.Context, oc *tenant.OrgCtx, aid uuid.UUID)
 
 func (s *Service) MyNotifications(ctx context.Context, userID uuid.UUID, unreadOnly bool) ([]db.Notifications, error) {
 	return s.q.MyNotifications(ctx, db.MyNotificationsParams{UserID: toPg(userID), Column2: unreadOnly})
+}
+
+// MyNotificationsPage — bounded page + total for the meta envelope.
+func (s *Service) MyNotificationsPage(ctx context.Context, userID uuid.UUID, unreadOnly bool, lim, off int32) ([]db.Notifications, int64, error) {
+	rows, err := s.q.MyNotificationsPaged(ctx, db.MyNotificationsPagedParams{
+		UserID: toPg(userID), Column2: unreadOnly, Limit: lim, Offset: off})
+	if err != nil {
+		return nil, 0, err
+	}
+	total, err := s.q.CountMyNotifications(ctx, db.CountMyNotificationsParams{
+		UserID: toPg(userID), Column2: unreadOnly})
+	return rows, total, err
 }
 
 func (s *Service) MarkRead(ctx context.Context, userID, nid uuid.UUID) error {
@@ -441,6 +476,12 @@ func (s *Service) MinutesArchivedConsumer(ctx context.Context, q *db.Queries, e 
 		"minutes", mid, e.ActorID, false,
 		map[string]any{"minutes_id": mid, "meeting_id": e.Payload["meeting_id"],
 			"document_id": fromPg(row.ID)})
+}
+
+// NotifyOnce is the exported seam the tasks registry hands to sweeps
+// (activities:volunteer_remind) — same dedupe + preference gating.
+func (s *Service) NotifyOnce(ctx context.Context, q *db.Queries, e events.Event, userID uuid.UUID, kind, title, body, refType string, refID pgtype.UUID) error {
+	return s.notifyOnce(ctx, q, e, userID, kind, title, body, refType, refID)
 }
 
 // notifyOnce inserts an in_app notification for one user, gated on

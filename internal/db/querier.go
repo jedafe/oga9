@@ -19,6 +19,8 @@ type Querier interface {
 	// (terminal) subscription — the guard keeps cancelled sticky. 0 rows =
 	// already cancelled, nothing to emit.
 	ActivateSubscription(ctx context.Context, arg ActivateSubscriptionParams) (int64, error)
+	// webhook settlement: pending → active (CAS; replay is a no-op).
+	ActivateTenantAddon(ctx context.Context, arg ActivateTenantAddonParams) (int64, error)
 	// 'registration'-type schedules are excluded: their obligations mint on
 	// MemberApproved via the consumer, one per new member — periodic fan-out
 	// would charge the whole existing roster and double-charge new members.
@@ -28,11 +30,14 @@ type Querier interface {
 	// /activities/{aid}/donations: event-linked contributions (payments.activity_id
 	// is untyped until g10 lands the activities table — query the column anyway).
 	ActivityDonations(ctx context.Context, arg ActivityDonationsParams) ([]Payments, error)
+	// all signups across an activity's roles (roster view).
+	ActivityRoster(ctx context.Context, arg ActivityRosterParams) ([]ActivityRosterRow, error)
 	// Extra sponsors attached at intake (sponsor_required up to 2); they
 	// migrate onto the membership on approve.
 	AddApplicationSponsor(ctx context.Context, arg AddApplicationSponsorParams) error
 	AddApproval(ctx context.Context, arg AddApprovalParams) (pgtype.UUID, error)
 	AddBenefit(ctx context.Context, arg AddBenefitParams) (pgtype.UUID, error)
+	AddBudgetLine(ctx context.Context, arg AddBudgetLineParams) (BudgetLines, error)
 	// append-only case history — visible to member + welfare officers.
 	AddCaseEvent(ctx context.Context, arg AddCaseEventParams) (pgtype.UUID, error)
 	AddCommitteeMember(ctx context.Context, arg AddCommitteeMemberParams) (pgtype.UUID, error)
@@ -40,8 +45,14 @@ type Querier interface {
 	// caller's tx.
 	AddDocumentVersion(ctx context.Context, arg AddDocumentVersionParams) (int32, error)
 	AddDonor(ctx context.Context, arg AddDonorParams) (pgtype.UUID, error)
+	// append-only decision trail.
+	AddExpenseApproval(ctx context.Context, arg AddExpenseApprovalParams) (ExpenseApprovals, error)
 	AddMessage(ctx context.Context, arg AddMessageParams) (pgtype.UUID, error)
 	AddMilestone(ctx context.Context, arg AddMilestoneParams) (pgtype.UUID, error)
+	// §17 approve-time expense request: pending until MarkBenefitDisbursed.
+	AddPendingBenefit(ctx context.Context, arg AddPendingBenefitParams) (pgtype.UUID, error)
+	AddPollOption(ctx context.Context, arg AddPollOptionParams) (PollOptions, error)
+	AddPollVote(ctx context.Context, arg AddPollVoteParams) error
 	AddSponsor(ctx context.Context, arg AddSponsorParams) error
 	AddUpdate(ctx context.Context, arg AddUpdateParams) (pgtype.UUID, error)
 	AddUsage(ctx context.Context, arg AddUsageParams) (int64, error)
@@ -53,6 +64,8 @@ type Querier interface {
 	// partially_paid/paid rows are left alone — money already moved; that's a
 	// credit/reversal decision.
 	AdjustFineForPeriod(ctx context.Context, arg AdjustFineForPeriodParams) (int64, error)
+	// draft → adopted; term_id binds at adoption (Rule 21) unless already set.
+	AdoptBudget(ctx context.Context, arg AdoptBudgetParams) (Budgets, error)
 	// version is max+1 per org — v1 stays readable (append-only version log).
 	AdoptConstitution(ctx context.Context, arg AdoptConstitutionParams) (AdoptConstitutionRow, error)
 	// Sweep: current_period_end passed — the pending downgrade takes effect.
@@ -61,6 +74,9 @@ type Querier interface {
 	// re-ratify idempotency: a winner already seated for this
 	// term+position+scope is skipped, not re-appointed.
 	AppointmentExists(ctx context.Context, arg AppointmentExistsParams) (bool, error)
+	// requested → approved; the CAS enforces requester != approver
+	// (separation of duties — same membership can't hold two of three roles).
+	ApproveExpense(ctx context.Context, arg ApproveExpenseParams) (Expenses, error)
 	// draft → approved CAS; approved rows are immutable (no UPDATE surface).
 	ApproveMinutes(ctx context.Context, arg ApproveMinutesParams) (Minutes, error)
 	// resolution edge lands at approval time.
@@ -89,12 +105,28 @@ type Querier interface {
 	// Announcement audience snapshot: {"all":true} or {categories:[],unit_ids:[]}
 	// resolve to active/life members' user ids at dispatch time.
 	AudienceUserIDs(ctx context.Context, arg AudienceUserIDsParams) ([]pgtype.UUID, error)
+	AutoSuggestedCaseExists(ctx context.Context, membershipID pgtype.UUID) (bool, error)
 	BallotExists(ctx context.Context, arg BallotExistsParams) (bool, error)
+	// vs-actual read: allocated vs the spent_minor projection (ledger truth
+	// maintained at disburse; this re-derives for the report surface).
+	BudgetVsActual(ctx context.Context, budgetID pgtype.UUID) ([]BudgetVsActualRow, error)
+	// Disbursement projection update — called inside the disburse tx.
+	BumpBudgetLineSpent(ctx context.Context, arg BumpBudgetLineSpentParams) (BudgetLines, error)
 	CancelActionItem(ctx context.Context, arg CancelActionItemParams) (int64, error)
 	// cancelled is terminal
 	CancelActivity(ctx context.Context, arg CancelActivityParams) (int64, error)
+	// requester may cancel their own expense while undecided.
+	CancelExpense(ctx context.Context, arg CancelExpenseParams) (int64, error)
+	CancelSignup(ctx context.Context, arg CancelSignupParams) (VolunteerSignups, error)
+	// self-withdraw — the caller's own signup only.
+	CancelSignupSelf(ctx context.Context, arg CancelSignupSelfParams) (VolunteerSignups, error)
+	// ActivityCancelled consumer — open signups on the activity's roles cancel.
+	CancelSignupsForActivity(ctx context.Context, activityID pgtype.UUID) ([]CancelSignupsForActivityRow, error)
 	CancelTenantAddon(ctx context.Context, arg CancelTenantAddonParams) (int64, error)
 	CaseCountByKind(ctx context.Context, orgID pgtype.UUID) ([]CaseCountByKindRow, error)
+	// one vote per member — ON CONFLICT DO NOTHING makes replays surface as
+	// already_voted via ErrNoRows.
+	CastBallot(ctx context.Context, arg CastBallotParams) (PollBallots, error)
 	ChannelMember(ctx context.Context, arg ChannelMemberParams) (ChatChannelMembers, error)
 	// explicit members + (general: all active) + (unit: home-unit members) —
 	// the notification fan-out audience for a channel message.
@@ -118,6 +150,8 @@ type Querier interface {
 	// FinishProvision must let a reclaim SKIP re-running CreateOrg (a re-run
 	// dies on the slug conflict and can never complete).
 	CheckpointProvisionOrg(ctx context.Context, arg CheckpointProvisionOrgParams) error
+	ClaimByIdempotencyKey(ctx context.Context, arg ClaimByIdempotencyKeyParams) (PaymentClaims, error)
+	ClaimOrgForIdempotencyKey(ctx context.Context, idempotencyKey pgtype.Text) (pgtype.UUID, error)
 	// atomic retry claim — 'failed' rows reclaim; 'processing' rows whose
 	// lease is older than 30min reclaim too. processing_started_at re-stamps
 	// at every pipeline checkpoint so staleness measures from the last stage
@@ -127,6 +161,8 @@ type Querier interface {
 	// Window = org.meeting.notice_days (default 7); a fixed window would
 	// shorten every longer-notice org's reminder.
 	ClaimReminders(ctx context.Context) ([]Activities, error)
+	// CAS claim so concurrent drains can't double-deliver (Rule 27).
+	ClaimSyncJob(ctx context.Context, id pgtype.UUID) (int64, error)
 	// Terminal moves (cancel) drop any pending downgrade with them.
 	ClearScheduledPlan(ctx context.Context, id pgtype.UUID) error
 	CloneTenantRolePermissions(ctx context.Context, tenantID pgtype.UUID) error
@@ -134,23 +170,40 @@ type Querier interface {
 	// Roles carrying platform.* nodes are control-plane only and must never be
 	// cloned into a tenant (they'd be assignable to tenant members otherwise).
 	CloneTenantRoles(ctx context.Context, tenantID pgtype.UUID) error
+	CloseBudget(ctx context.Context, arg CloseBudgetParams) (int64, error)
 	// Auto-close the org's live term when a new current term is created (§03).
 	CloseCurrentTerm(ctx context.Context, orgID pgtype.UUID) (pgtype.UUID, error)
+	ClosePoll(ctx context.Context, arg ClosePollParams) (Polls, error)
+	CloseSurvey(ctx context.Context, arg CloseSurveyParams) (Surveys, error)
 	// Closes the current term; appointments lose their is_current backing.
 	// RETURNING lets callers distinguish unknown/foreign/closed terms (404).
 	CloseTerm(ctx context.Context, arg CloseTermParams) (pgtype.UUID, error)
+	CommitteeExpenseTotal(ctx context.Context, arg CommitteeExpenseTotalParams) (int64, error)
 	// done_at stamped here; assignee or officer both reach this (perm gate is
 	// in the route layer — view_own for self, org.action_items.manage else).
 	CompleteActionItem(ctx context.Context, arg CompleteActionItemParams) (int64, error)
 	CompleteActionItemManage(ctx context.Context, arg CompleteActionItemManageParams) (int64, error)
+	// §18 test 4: findings containing a 'missing' item keep the audit open —
+	// the caller passes the target state ('completed'|'open').
 	CompleteAudit(ctx context.Context, arg CompleteAuditParams) (int64, error)
+	CompleteHearing(ctx context.Context, arg CompleteHearingParams) (int64, error)
 	CompleteMilestone(ctx context.Context, arg CompleteMilestoneParams) (int64, error)
 	CompleteProject(ctx context.Context, id pgtype.UUID) (int64, error)
 	CompleteVisit(ctx context.Context, arg CompleteVisitParams) (int64, error)
 	ConfirmClaim(ctx context.Context, arg ConfirmClaimParams) (PaymentClaims, error)
 	ConfirmPayment(ctx context.Context, arg ConfirmPaymentParams) (Payments, error)
+	ConfirmSignup(ctx context.Context, arg ConfirmSignupParams) (VolunteerSignups, error)
+	// system-recorded payments (expense disbursement, invoice settlement)
+	// confirm without the recorder!=approver CAS — separation of duties for
+	// these lives on the expense/invoice workflow, not the payment row.
+	ConfirmSystemPayment(ctx context.Context, arg ConfirmSystemPaymentParams) (Payments, error)
+	// capacity check inside the confirm tx (role row must be locked first).
+	ConfirmedCount(ctx context.Context, roleID pgtype.UUID) (int32, error)
 	// Status derives from confirmed ledger money, not payment row state alone.
 	ConfirmedPaymentsForObligation(ctx context.Context, obligationID pgtype.UUID) (int64, error)
+	// volunteer_remind sweep: confirmed signups whose activity starts within
+	// the org's remind_hours window (org_setting wins over the arg default).
+	ConfirmedVolunteersDue(ctx context.Context, dollar_1 int32) ([]ConfirmedVolunteersDueRow, error)
 	// sync-job delivery knows the connector from the job row — no org
 	// predicate (the job's provenance is the scope proof).
 	ConnectorByID(ctx context.Context, id pgtype.UUID) (Connectors, error)
@@ -175,14 +228,20 @@ type Querier interface {
 	// Total sponsors across the application's primary sponsor_member_id plus
 	// any application-staged rows — the sponsor_required numerator at approve.
 	CountApplicationSponsors(ctx context.Context, applicationID pgtype.UUID) (int32, error)
+	CountBlogPostsAdmin(ctx context.Context, state string) (int64, error)
+	CountBlogPostsPublished(ctx context.Context, tag string) (int64, error)
 	CountCaseApprovals(ctx context.Context, caseID pgtype.UUID) (int64, error)
 	// DLQ depth for the queue-depth metric (ADR-020 reliability signal).
 	CountDeadEvents(ctx context.Context, maxAttempts int32) (int64, error)
+	CountLedgerEntries(ctx context.Context, arg CountLedgerEntriesParams) (int64, error)
 	// limit.branches meter: member-capable structural units (hq|branch|chapter)
 	// count; committees/wings never do (plans-entitlements-catalog).
 	CountMemberCapableUnits(ctx context.Context, orgID pgtype.UUID) (int64, error)
+	CountMembers(ctx context.Context, arg CountMembersParams) (int64, error)
+	CountMyNotifications(ctx context.Context, arg CountMyNotificationsParams) (int64, error)
 	// quorum denominator: active-equivalent members of the org.
 	CountOrgMembers(ctx context.Context, organizationID pgtype.UUID) (int64, error)
+	CountPlatformInvoices(ctx context.Context, arg CountPlatformInvoicesParams) (int64, error)
 	// Active seat occupancy for a position within a term (seats cap, §03).
 	CountPositionSeats(ctx context.Context, arg CountPositionSeatsParams) (int64, error)
 	// COUNT semantics cap TOTAL occurrences per series, not per window —
@@ -214,6 +273,13 @@ type Querier interface {
 	// Ref: oga9-engineering/sections/18-assets.md
 	CreateAsset(ctx context.Context, arg CreateAssetParams) (pgtype.UUID, error)
 	CreateAudit(ctx context.Context, arg CreateAuditParams) (pgtype.UUID, error)
+	// Ref: oga9-engineering/sections/28-platform-blog.md — platform blog queries.
+	CreateBlogPost(ctx context.Context, arg CreateBlogPostParams) (BlogPosts, error)
+	// Ref: oga9-engineering/sections/25-finance-full.md — budgets, expenses,
+	// invoices. Ledger stays append-only (Rule 19); disbursement posts ledger
+	// + payment + spent projection in one tx (Rule 12).
+	// ---------- budgets ----------
+	CreateBudget(ctx context.Context, arg CreateBudgetParams) (Budgets, error)
 	// Ref: oga9-engineering/sections/24-realtime-chat-voice.md — chat.
 	CreateChannel(ctx context.Context, arg CreateChannelParams) (ChatChannels, error)
 	// ---------- claims ----------
@@ -227,9 +293,11 @@ type Querier interface {
 	CreateContributionType(ctx context.Context, arg CreateContributionTypeParams) (ContributionTypes, error)
 	// Ref: oga9-engineering/sections/22-ai.md
 	CreateConversation(ctx context.Context, arg CreateConversationParams) (pgtype.UUID, error)
-	CreateCustomField(ctx context.Context, arg CreateCustomFieldParams) error
+	CreateCustomField(ctx context.Context, arg CreateCustomFieldParams) (pgtype.UUID, error)
 	CreateCustomFieldGroup(ctx context.Context, arg CreateCustomFieldGroupParams) (pgtype.UUID, error)
 	CreateDeployment(ctx context.Context, arg CreateDeploymentParams) (Deployments, error)
+	// Ref: oga9-engineering/sections/16-governance.md — discipline casework.
+	CreateDisciplineCase(ctx context.Context, arg CreateDisciplineCaseParams) (pgtype.UUID, error)
 	// Ref: oga9-engineering/sections/14-comms-documents.md — documents.
 	CreateDocument(ctx context.Context, arg CreateDocumentParams) (Documents, error)
 	// ---------- drives ----------
@@ -238,10 +306,14 @@ type Querier interface {
 	CreateDuesSchedule(ctx context.Context, arg CreateDuesScheduleParams) (DuesSchedules, error)
 	// Ref: oga9-engineering/sections/21-elections.md
 	CreateElection(ctx context.Context, arg CreateElectionParams) (pgtype.UUID, error)
+	// ---------- expenses ----------
+	CreateExpense(ctx context.Context, arg CreateExpenseParams) (Expenses, error)
 	CreateExport(ctx context.Context, arg CreateExportParams) (pgtype.UUID, error)
 	CreateGeneration(ctx context.Context, arg CreateGenerationParams) (pgtype.UUID, error)
+	CreateHearing(ctx context.Context, arg CreateHearingParams) (pgtype.UUID, error)
 	CreateImport(ctx context.Context, arg CreateImportParams) (pgtype.UUID, error)
 	CreateInvitation(ctx context.Context, arg CreateInvitationParams) (CreateInvitationRow, error)
+	CreateInvoice(ctx context.Context, arg CreateInvoiceParams) (Invoices, error)
 	// joined_at marks actual joining — 'applied' states haven't joined yet (ADR-014).
 	CreateMembership(ctx context.Context, arg CreateMembershipParams) (pgtype.UUID, error)
 	// version = prior max + 1 (versioned per edit until approved).
@@ -259,9 +331,16 @@ type Querier interface {
 	CreateOrg(ctx context.Context, arg CreateOrgParams) (CreateOrgRow, error)
 	// ---------- payments (Rule 9 idempotency) ----------
 	CreatePayment(ctx context.Context, arg CreatePaymentParams) (Payments, error)
+	CreatePlatformInvoice(ctx context.Context, arg CreatePlatformInvoiceParams) (PlatformInvoices, error)
+	// Ref: oga9-engineering/sections/26-polls-surveys.md — polls & surveys.
+	// Secrecy is structural: poll_ballots = turnout receipt (one per member),
+	// poll_votes = content with membership stamped only on non-secret polls.
+	// ---------- polls ----------
+	CreatePoll(ctx context.Context, arg CreatePollParams) (Polls, error)
 	CreatePosition(ctx context.Context, arg CreatePositionParams) (pgtype.UUID, error)
 	// Ref: oga9-engineering/sections/20-projects.md
 	CreateProject(ctx context.Context, arg CreateProjectParams) (pgtype.UUID, error)
+	CreateProjectBudget(ctx context.Context, arg CreateProjectBudgetParams) (pgtype.UUID, error)
 	// Ref: oga9-engineering/sections/15-subscription-admin.md — control-plane queries.
 	// Platform scope is tenant-scoped (Rule 24): operators never pass tenant_id
 	// from the request body alone; the catalog requires a platform.* node.
@@ -283,6 +362,8 @@ type Querier interface {
 	CreateSubscription(ctx context.Context, arg CreateSubscriptionParams) (pgtype.UUID, error)
 	// ---------- support sessions ----------
 	CreateSupportSession(ctx context.Context, arg CreateSupportSessionParams) (SupportSessions, error)
+	// ---------- surveys ----------
+	CreateSurvey(ctx context.Context, arg CreateSurveyParams) (Surveys, error)
 	CreateSyncJob(ctx context.Context, arg CreateSyncJobParams) (pgtype.UUID, error)
 	// Ref: oga9-engineering/sections/04-tenancy-organizations.md, 10-organization-core.md
 	// sqlc queries for tenants, organizations, memberships, units, settings,
@@ -299,6 +380,11 @@ type Querier interface {
 	CreateVisit(ctx context.Context, arg CreateVisitParams) (pgtype.UUID, error)
 	// Ref: oga9-engineering/sections/24-realtime-chat-voice.md — voice rooms.
 	CreateVoiceRoom(ctx context.Context, arg CreateVoiceRoomParams) (VoiceRooms, error)
+	// Ref: oga9-engineering/sections/27-volunteers.md — volunteer roles +
+	// signups. Signups are audited, never deleted; standby queue promotes
+	// first-come when a confirmed slot frees.
+	// ---------- roles ----------
+	CreateVolunteerRole(ctx context.Context, arg CreateVolunteerRoleParams) (VolunteerRoles, error)
 	// Ref: oga9-engineering/sections/17-welfare.md
 	CreateWelfareCase(ctx context.Context, arg CreateWelfareCaseParams) (pgtype.UUID, error)
 	// current = max adopted_at per §16.
@@ -306,14 +392,26 @@ type Querier interface {
 	CurrentCustody(ctx context.Context, assetID pgtype.UUID) (CustodyAssignments, error)
 	// resolution/motion records bind to the current term.
 	CurrentTermID(ctx context.Context, orgID pgtype.UUID) (pgtype.UUID, error)
+	// at-least-once dedupe for CustodyHandoverFlagged re-delivery.
+	CustodyFlagged(ctx context.Context, aggregateID pgtype.UUID) (bool, error)
 	// Only an active installation transitions — callers check the active set
 	// first, and this guard keeps already-deactivated rows untouched.
 	DeactivateApp(ctx context.Context, arg DeactivateAppParams) (pgtype.UUID, error)
 	// Attempt cap reached: pull the event out of the pending set and record the
 	// terminal error. `events:retry_dead` (Phase 06) can reset dispatched_at.
 	DeadLetterEvent(ctx context.Context, arg DeadLetterEventParams) error
+	DecideAppeal(ctx context.Context, arg DecideAppealParams) (int64, error)
 	DeleteApplicationSponsors(ctx context.Context, applicationID pgtype.UUID) error
 	DeleteCredential(ctx context.Context, arg DeleteCredentialParams) (int64, error)
+	DeleteFieldGroup(ctx context.Context, arg DeleteFieldGroupParams) (int64, error)
+	// roles delete only while no confirmed/completed signups exist (§27).
+	DeleteVolunteerRole(ctx context.Context, arg DeleteVolunteerRoleParams) (int64, error)
+	// approved → disbursed; disburser must differ from requester (the approver
+	// check happens in the service against expense_approvals).
+	DisburseExpense(ctx context.Context, arg DisburseExpenseParams) (Expenses, error)
+	// §25: a payment backing a disbursed expense cannot be reversed — the
+	// expense itself must be voided/re-done, else the budget projection orphans.
+	DisbursedExpenseForPayment(ctx context.Context, paymentID pgtype.UUID) (DisbursedExpenseForPaymentRow, error)
 	DocumentVersions(ctx context.Context, documentID pgtype.UUID) ([]DocumentVersions, error)
 	DriveCollected(ctx context.Context, driveID pgtype.UUID) (DriveCollectedRow, error)
 	// Contributor list with per-claim hide flags (§12 drive transparency):
@@ -324,6 +422,8 @@ type Querier interface {
 	// version row and reverts the head to the previous version instead of
 	// deleting the whole document (good v1 survives a bad v2).
 	DropLatestVersion(ctx context.Context, arg DropLatestVersionParams) (string, error)
+	DuePollsToClose(ctx context.Context) ([]Polls, error)
+	DueSurveysToClose(ctx context.Context) ([]Surveys, error)
 	EditMessage(ctx context.Context, arg EditMessageParams) (int64, error)
 	// every nomination/vet/vote/ratify writes audit_events — the audit view.
 	ElectionAuditTrail(ctx context.Context, arg ElectionAuditTrailParams) ([]AuditEvents, error)
@@ -336,6 +436,7 @@ type Querier interface {
 	// Ref: oga9-engineering/sections/05-domain-events-infrastructure.md
 	// Outbox + audit queries (Phase 02 emission, Phase 05 dispatch).
 	EmitDomainEvent(ctx context.Context, arg EmitDomainEventParams) error
+	EnabledIcsOrgs(ctx context.Context) ([]pgtype.UUID, error)
 	EndAppointment(ctx context.Context, arg EndAppointmentParams) (EndAppointmentRow, error)
 	// Terminal transitions vacate the member's open office seats (§11:
 	// deceased/expelled → position vacancies). Same-tx + AppointmentEnded.
@@ -365,6 +466,9 @@ type Querier interface {
 	// org must not mint a parallel application (the member applies through
 	// their account, or not at all).
 	ExistsOrgMemberByContact(ctx context.Context, arg ExistsOrgMemberByContactParams) (bool, error)
+	// §16 MandateLimit seam support: committee-linked spend total (pending +
+	// approved + disbursed expenses count against the mandate cap).
+	ExpenseSpentForMandate(ctx context.Context, mandateID pgtype.UUID) (int64, error)
 	ExpireTenantAddon(ctx context.Context, id pgtype.UUID) (int64, error)
 	// governance:term_transitions sweep — current terms past ends_at.
 	ExpiredCurrentTerms(ctx context.Context) ([]Terms, error)
@@ -406,6 +510,7 @@ type Querier interface {
 	// blocking event_consumer_log's FOR KEY SHARE FK check (FOR UPDATE would
 	// self-deadlock the claim tx against its own consumers).
 	FetchPendingEvents(ctx context.Context, arg FetchPendingEventsParams) ([]FetchPendingEventsRow, error)
+	FileAppeal(ctx context.Context, arg FileAppealParams) (pgtype.UUID, error)
 	FinishExport(ctx context.Context, arg FinishExportParams) error
 	FinishImport(ctx context.Context, arg FinishImportParams) error
 	FinishProvision(ctx context.Context, arg FinishProvisionParams) (int64, error)
@@ -422,13 +527,19 @@ type Querier interface {
 	GetAgenda(ctx context.Context, activityID pgtype.UUID) (MeetingAgendas, error)
 	GetAnnouncement(ctx context.Context, id pgtype.UUID) (Announcements, error)
 	GetApp(ctx context.Context, appID string) (GetAppRow, error)
+	GetAppeal(ctx context.Context, arg GetAppealParams) (DisciplineAppeals, error)
 	GetApplication(ctx context.Context, id pgtype.UUID) (GetApplicationRow, error)
 	// Only UNDECIDED applications block a new one — a decided (approved/
 	// rejected/withdrawn) row is history, not an open intake.
 	GetApplicationCountForUser(ctx context.Context, arg GetApplicationCountForUserParams) (int64, error)
 	GetAsset(ctx context.Context, arg GetAssetParams) (Assets, error)
 	GetAudit(ctx context.Context, arg GetAuditParams) (AssetAudits, error)
+	GetBlogPost(ctx context.Context, id pgtype.UUID) (BlogPosts, error)
+	GetBlogPostBySlug(ctx context.Context, slug string) (BlogPosts, error)
 	GetBranding(ctx context.Context, organizationID pgtype.UUID) (GetBrandingRow, error)
+	GetBudget(ctx context.Context, arg GetBudgetParams) (Budgets, error)
+	// org-scoped through the parent budget.
+	GetBudgetLine(ctx context.Context, arg GetBudgetLineParams) (BudgetLines, error)
 	GetCandidate(ctx context.Context, arg GetCandidateParams) (Candidates, error)
 	GetChannel(ctx context.Context, arg GetChannelParams) (ChatChannels, error)
 	GetChannelAny(ctx context.Context, id pgtype.UUID) (ChatChannels, error)
@@ -440,6 +551,7 @@ type Querier interface {
 	GetConnector(ctx context.Context, arg GetConnectorParams) (Connectors, error)
 	GetContributionType(ctx context.Context, arg GetContributionTypeParams) (ContributionTypes, error)
 	GetConversation(ctx context.Context, arg GetConversationParams) (AiConversations, error)
+	GetDisciplineCase(ctx context.Context, arg GetDisciplineCaseParams) (DisciplineCases, error)
 	GetDocument(ctx context.Context, arg GetDocumentParams) (Documents, error)
 	GetDocumentAny(ctx context.Context, id pgtype.UUID) (Documents, error)
 	GetDrive(ctx context.Context, arg GetDriveParams) (ContributionDrives, error)
@@ -450,16 +562,26 @@ type Querier interface {
 	// vote serialization: the election row lock orders concurrent ballot
 	// writes so cast_seq stays gap-free.
 	GetElectionForUpdate(ctx context.Context, id pgtype.UUID) (GetElectionForUpdateRow, error)
+	GetExpense(ctx context.Context, arg GetExpenseParams) (Expenses, error)
 	GetExport(ctx context.Context, arg GetExportParams) (MemberExports, error)
 	GetExportAny(ctx context.Context, id pgtype.UUID) (MemberExports, error)
+	GetFeatureFlag(ctx context.Context, key string) (bool, error)
+	GetField(ctx context.Context, arg GetFieldParams) (CustomFields, error)
+	GetFieldByKey(ctx context.Context, arg GetFieldByKeyParams) (CustomFields, error)
 	GetGeneration(ctx context.Context, arg GetGenerationParams) (AiGenerations, error)
 	GetImport(ctx context.Context, id pgtype.UUID) (GetImportRow, error)
 	GetInvitationByToken(ctx context.Context, token pgtype.UUID) (GetInvitationByTokenRow, error)
+	GetInvoice(ctx context.Context, arg GetInvoiceParams) (Invoices, error)
+	// Task/refresh context — org read from the row.
+	GetInvoiceAny(ctx context.Context, id pgtype.UUID) (Invoices, error)
 	// Entitlement merge source: unexpired license for the tenant, newest first.
 	GetLatestLicense(ctx context.Context, tenantID pgtype.UUID) (GetLatestLicenseRow, error)
 	GetLicenseByDeployment(ctx context.Context, deploymentID string) (GetLicenseByDeploymentRow, error)
 	GetMFASecret(ctx context.Context, id pgtype.UUID) ([]byte, error)
 	GetMandate(ctx context.Context, unitID pgtype.UUID) (CommitteeMandates, error)
+	// org-scoped variant for request paths — a foreign-org unit id must not
+	// resolve a mandate (Rule 24).
+	GetMandateScoped(ctx context.Context, arg GetMandateScopedParams) (CommitteeMandates, error)
 	GetMemberStanding(ctx context.Context, id pgtype.UUID) (string, error)
 	GetMembership(ctx context.Context, arg GetMembershipParams) (GetMembershipRow, error)
 	GetMembershipByID(ctx context.Context, id pgtype.UUID) (GetMembershipByIDRow, error)
@@ -492,9 +614,16 @@ type Querier interface {
 	GetPlan(ctx context.Context, slug string) (GetPlanRow, error)
 	GetPlanCapabilities(ctx context.Context, planSlug string) ([]string, error)
 	GetPlanLimits(ctx context.Context, planSlug string) ([]GetPlanLimitsRow, error)
+	GetPoll(ctx context.Context, arg GetPollParams) (Polls, error)
 	GetPositionOrg(ctx context.Context, id pgtype.UUID) (pgtype.UUID, error)
 	GetPositionSeats(ctx context.Context, id pgtype.UUID) (int32, error)
+	// seat-cap enforcement: lock the position row inside the appoint tx so
+	// concurrent appointments can't both pass under the cap.
+	GetPositionSeatsForUpdate(ctx context.Context, id pgtype.UUID) (int32, error)
 	GetProject(ctx context.Context, arg GetProjectParams) (Projects, error)
+	GetProjectBudget(ctx context.Context, arg GetProjectBudgetParams) (ProjectBudgets, error)
+	// spend serialization: the row lock makes check-and-reserve atomic.
+	GetProjectForUpdate(ctx context.Context, arg GetProjectForUpdateParams) (Projects, error)
 	GetProvision(ctx context.Context, requestID string) (TenantProvisions, error)
 	GetPublicOrgBySlug(ctx context.Context, slug string) (GetPublicOrgBySlugRow, error)
 	// Receipts are org-scoped via their payment.
@@ -502,11 +631,17 @@ type Querier interface {
 	GetRecoveryCodes(ctx context.Context, id pgtype.UUID) ([]byte, error)
 	GetReportRun(ctx context.Context, arg GetReportRunParams) (ReportRuns, error)
 	GetResolution(ctx context.Context, arg GetResolutionParams) (Resolutions, error)
+	// Ref: oga9-engineering/adr/ADR-016-rules-workflow-engine.md — rule_definitions.
+	// Resolution: org-scoped active rule wins over the platform default row;
+	// highest priority breaks ties (engine falls through to org_settings on miss).
+	GetRule(ctx context.Context, arg GetRuleParams) (RuleDefinitions, error)
 	GetSessionByJTI(ctx context.Context, jti pgtype.UUID) (GetSessionByJTIRow, error)
+	GetSignup(ctx context.Context, arg GetSignupParams) (VolunteerSignups, error)
 	GetSnapshot(ctx context.Context, arg GetSnapshotParams) (DashboardSnapshots, error)
 	// Latest subscription row is the current one.
 	GetSubscription(ctx context.Context, tenantID pgtype.UUID) (Subscriptions, error)
 	GetSupportSession(ctx context.Context, id pgtype.UUID) (SupportSessions, error)
+	GetSurvey(ctx context.Context, arg GetSurveyParams) (Surveys, error)
 	// Ref: oga9-engineering/conventions/system-settings-catalog.md
 	// Platform-level settings (Rule 3: hot-reloadable via GetSetting).
 	GetSystemSetting(ctx context.Context, key string) ([]byte, error)
@@ -526,6 +661,7 @@ type Querier interface {
 	GetUserIDByEmail(ctx context.Context, email string) (pgtype.UUID, error)
 	GetVendor(ctx context.Context, arg GetVendorParams) (Vendors, error)
 	GetVoiceRoom(ctx context.Context, arg GetVoiceRoomParams) (VoiceRooms, error)
+	GetVolunteerRole(ctx context.Context, arg GetVolunteerRoleParams) (VolunteerRoles, error)
 	GetWebhookEvent(ctx context.Context, id pgtype.UUID) (GetWebhookEventRow, error)
 	// Row lock serializes concurrent processors of the same event (Rule 27 —
 	// processed_at rechecked under lock inside the tx).
@@ -534,9 +670,11 @@ type Querier interface {
 	// Guest-cap enforcement: how many guests a member has already registered
 	// for this event (org.events.guest_cap).
 	GuestCountByMember(ctx context.Context, arg GuestCountByMemberParams) (int64, error)
+	HandoverCompletedExists(ctx context.Context, aggregateID pgtype.UUID) (bool, error)
 	// dedupe: one HandoverGenerated per term aggregate (Rule 27-style
 	// idempotent producer — the sweep can re-run safely).
 	HandoverGeneratedExists(ctx context.Context, aggregateID pgtype.UUID) (bool, error)
+	HasBallot(ctx context.Context, arg HasBallotParams) (bool, error)
 	// platform.* nodes resolve via NULL-tenant roles only (super-admin scope —
 	// org role clones never carry platform nodes).
 	HasPlatformNode(ctx context.Context, arg HasPlatformNodeParams) (bool, error)
@@ -549,6 +687,7 @@ type Querier interface {
 	// Re-issue on the same deployment_id is a renewal: rotate the signed
 	// material in place (UNIQUE deployment_id is one-license-per-deployment).
 	InsertLicense(ctx context.Context, arg InsertLicenseParams) (pgtype.UUID, error)
+	InsertProjectExpense(ctx context.Context, arg InsertProjectExpenseParams) (pgtype.UUID, error)
 	InsertReportRun(ctx context.Context, arg InsertReportRunParams) (pgtype.UUID, error)
 	InsertVersionRow(ctx context.Context, arg InsertVersionRowParams) error
 	// ANONYMOUS: no ballot_id / membership_id / user_id by design (secrecy
@@ -560,6 +699,9 @@ type Querier interface {
 	InsertWebhookReceipt(ctx context.Context, arg InsertWebhookReceiptParams) (pgtype.UUID, error)
 	// reverse lookup: has this org already synced to the external type?
 	InternalMapped(ctx context.Context, arg InternalMappedParams) (bool, error)
+	// state derives from confirmed ledger money only.
+	InvoicePaidTotal(ctx context.Context, invoiceID pgtype.UUID) (int64, error)
+	InvoicePayments(ctx context.Context, invoiceID pgtype.UUID) ([]Payments, error)
 	// §24 exco scope: an active term-scoped appointment (Rule 21) counts.
 	IsActiveOfficer(ctx context.Context, memberID pgtype.UUID) (bool, error)
 	IsAppActive(ctx context.Context, arg IsAppActiveParams) (bool, error)
@@ -575,13 +717,22 @@ type Querier interface {
 	// channel's org — a client-supplied membership_id can't borrow someone
 	// else's seat or another org's channel.
 	IsChannelMemberForUser(ctx context.Context, arg IsChannelMemberForUserParams) (bool, error)
+	// §10 field visibility 'exco': an ACTIVE appointment (Rule 21) to an
+	// is_executive position — precise exco resolution, not committee
+	// membership or a generic officer node.
+	IsExecutivePositionHolder(ctx context.Context, arg IsExecutivePositionHolderParams) (bool, error)
 	IssueCard(ctx context.Context, arg IssueCardParams) (IssueCardRow, error)
 	JoinChannel(ctx context.Context, arg JoinChannelParams) error
 	JoinVoiceRoom(ctx context.Context, arg JoinVoiceRoomParams) error
+	LatestExpenseApproval(ctx context.Context, expenseID pgtype.UUID) (ExpenseApprovals, error)
 	LatestHealthScore(ctx context.Context, organizationID pgtype.UUID) (HealthScores, error)
 	LatestUpdate(ctx context.Context, projectID pgtype.UUID) (pgtype.Timestamptz, error)
 	LatestVersionRow(ctx context.Context, documentID pgtype.UUID) (LatestVersionRowRow, error)
 	LeaveVoiceRoom(ctx context.Context, arg LeaveVoiceRoomParams) (int64, error)
+	// §16 committee-mandate enforcement: cumulative committee-tagged spend.
+	LedgerDebitsByMemoPrefix(ctx context.Context, arg LedgerDebitsByMemoPrefixParams) (int64, error)
+	// §20 budget check: cumulative spend tagged 'project:{id}' in the memo.
+	LedgerDebitsForProject(ctx context.Context, arg LedgerDebitsForProjectParams) (int64, error)
 	// idempotent welfare disbursement: BenefitDisbursed is at-least-once —
 	// the consumer dedupes on the benefit-keyed memo.
 	LedgerMemoExists(ctx context.Context, arg LedgerMemoExistsParams) (bool, error)
@@ -592,6 +743,7 @@ type Querier interface {
 	// direct edge write for graph completeness at close (report document).
 	LinkEntitiesForProject(ctx context.Context, arg LinkEntitiesForProjectParams) error
 	LinkOAuthProvider(ctx context.Context, arg LinkOAuthProviderParams) error
+	ListAPIKeysForTenant(ctx context.Context, tenantID pgtype.UUID) ([]ListAPIKeysForTenantRow, error)
 	// never return hashed_key — prefix is the display-safe field.
 	ListAPIKeysForUser(ctx context.Context, userID pgtype.UUID) ([]ListAPIKeysForUserRow, error)
 	// $4 scopes the list to one assignee — §13 view_own: non-manage callers
@@ -609,6 +761,7 @@ type Querier interface {
 	ListAddonCatalog(ctx context.Context) ([]AddonCatalog, error)
 	ListAddonCatalogActive(ctx context.Context) ([]AddonCatalog, error)
 	ListAnnouncements(ctx context.Context, arg ListAnnouncementsParams) ([]Announcements, error)
+	ListAppeals(ctx context.Context, caseID pgtype.UUID) ([]DisciplineAppeals, error)
 	ListApplications(ctx context.Context, arg ListApplicationsParams) ([]ListApplicationsRow, error)
 	// Governance roster: appointment + position/term/officer display names.
 	ListAppointments(ctx context.Context, orgID pgtype.UUID) ([]ListAppointmentsRow, error)
@@ -621,6 +774,11 @@ type Querier interface {
 	ListAuditEvents(ctx context.Context, arg ListAuditEventsParams) ([]AuditEvents, error)
 	ListAudits(ctx context.Context, organizationID pgtype.UUID) ([]AssetAudits, error)
 	ListBenefits(ctx context.Context, caseID pgtype.UUID) ([]WelfareBenefits, error)
+	ListBlogPostsAdmin(ctx context.Context, arg ListBlogPostsAdminParams) ([]BlogPosts, error)
+	// Listing rows stay slim — body_md belongs to the detail read, not the index.
+	ListBlogPostsPublished(ctx context.Context, arg ListBlogPostsPublishedParams) ([]ListBlogPostsPublishedRow, error)
+	ListBudgetLines(ctx context.Context, budgetID pgtype.UUID) ([]BudgetLines, error)
+	ListBudgets(ctx context.Context, organizationID pgtype.UUID) ([]Budgets, error)
 	ListCandidates(ctx context.Context, electionID pgtype.UUID) ([]ListCandidatesRow, error)
 	ListCaseEvents(ctx context.Context, caseID pgtype.UUID) ([]WelfareCaseEvents, error)
 	ListClaims(ctx context.Context, arg ListClaimsParams) ([]PaymentClaims, error)
@@ -634,6 +792,7 @@ type Querier interface {
 	ListCustody(ctx context.Context, assetID pgtype.UUID) ([]CustodyAssignments, error)
 	// ---------- deployments ----------
 	ListDeployments(ctx context.Context, tenantID pgtype.UUID) ([]ListDeploymentsRow, error)
+	ListDisciplineCases(ctx context.Context, arg ListDisciplineCasesParams) ([]DisciplineCases, error)
 	ListDocuments(ctx context.Context, arg ListDocumentsParams) ([]Documents, error)
 	ListDonors(ctx context.Context, projectID pgtype.UUID) ([]ProjectDonors, error)
 	ListDrives(ctx context.Context, arg ListDrivesParams) ([]ContributionDrives, error)
@@ -644,20 +803,29 @@ type Querier interface {
 	ListDueSubscriptions(ctx context.Context) ([]ListDueSubscriptionsRow, error)
 	ListDuesSchedules(ctx context.Context, organizationID pgtype.UUID) ([]DuesSchedules, error)
 	ListElections(ctx context.Context, organizationID pgtype.UUID) ([]Elections, error)
+	ListExpenseApprovals(ctx context.Context, expenseID pgtype.UUID) ([]ExpenseApprovals, error)
+	ListExpenses(ctx context.Context, arg ListExpensesParams) ([]Expenses, error)
 	// sweep candidates: past-expiry live addons (each row is then CAS-expired
 	// and its AddonExpired emitted in ONE tx — Rule 12).
 	ListExpiringAddons(ctx context.Context) ([]ListExpiringAddonsRow, error)
 	// ---------- feature flags ----------
 	ListFeatureFlags(ctx context.Context) ([]FeatureFlags, error)
+	ListFieldGroups(ctx context.Context, arg ListFieldGroupsParams) ([]CustomFieldGroups, error)
+	ListFieldValues(ctx context.Context, arg ListFieldValuesParams) ([]ListFieldValuesRow, error)
+	ListFields(ctx context.Context, arg ListFieldsParams) ([]CustomFields, error)
 	ListGenerations(ctx context.Context, arg ListGenerationsParams) ([]AiGenerations, error)
 	ListHealthScores(ctx context.Context, organizationID pgtype.UUID) ([]HealthScores, error)
+	ListHearings(ctx context.Context, caseID pgtype.UUID) ([]DisciplineHearings, error)
 	ListInstallations(ctx context.Context, tenantID pgtype.UUID) ([]ListInstallationsRow, error)
+	ListInvoices(ctx context.Context, arg ListInvoicesParams) ([]Invoices, error)
 	// org-defined KPIs win over global (NULL-org) defaults by key.
 	ListKpiDefs(ctx context.Context, organizationID pgtype.UUID) ([]KpiDefinitions, error)
 	ListLedgerEntries(ctx context.Context, arg ListLedgerEntriesParams) ([]LedgerEntries, error)
+	ListLedgerEntriesPaged(ctx context.Context, arg ListLedgerEntriesPagedParams) ([]LedgerEntries, error)
 	ListMaintenance(ctx context.Context, assetID pgtype.UUID) ([]MaintenanceRecords, error)
 	ListMembers(ctx context.Context, arg ListMembersParams) ([]ListMembersRow, error)
 	ListMembersForExport(ctx context.Context, organizationID pgtype.UUID) ([]ListMembersForExportRow, error)
+	ListMembersPaged(ctx context.Context, arg ListMembersPagedParams) ([]ListMembersPagedRow, error)
 	ListMessages(ctx context.Context, conversationID pgtype.UUID) ([]AiMessages, error)
 	ListMilestones(ctx context.Context, projectID pgtype.UUID) ([]ProjectMilestones, error)
 	ListMinutes(ctx context.Context, arg ListMinutesParams) ([]Minutes, error)
@@ -670,6 +838,9 @@ type Querier interface {
 	ListPendingInvitations(ctx context.Context, organizationID pgtype.UUID) ([]ListPendingInvitationsRow, error)
 	// Ref: oga9-engineering/sections/07-entitlements-subscriptions.md
 	ListPlans(ctx context.Context) ([]ListPlansRow, error)
+	ListPlatformInvoices(ctx context.Context, arg ListPlatformInvoicesParams) ([]PlatformInvoices, error)
+	ListPollOptions(ctx context.Context, pollID pgtype.UUID) ([]PollOptions, error)
+	ListPolls(ctx context.Context, arg ListPollsParams) ([]Polls, error)
 	ListPositions(ctx context.Context, orgID pgtype.UUID) ([]ListPositionsRow, error)
 	ListProjects(ctx context.Context, arg ListProjectsParams) ([]Projects, error)
 	ListPublicOrgs(ctx context.Context) ([]ListPublicOrgsRow, error)
@@ -678,6 +849,7 @@ type Querier interface {
 	ListRenewals(ctx context.Context, membershipID pgtype.UUID) ([]ListRenewalsRow, error)
 	ListReportRuns(ctx context.Context, organizationID pgtype.UUID) ([]ReportRuns, error)
 	ListResolutions(ctx context.Context, orgID pgtype.UUID) ([]Resolutions, error)
+	ListRules(ctx context.Context, organizationID pgtype.UUID) ([]RuleDefinitions, error)
 	ListSponsors(ctx context.Context, membershipID pgtype.UUID) ([]ListSponsorsRow, error)
 	// Durable-row floor: imports recorded but never picked up (the enqueue
 	// died) or whose worker was archived mid-run — re-driven by the
@@ -690,6 +862,8 @@ type Querier interface {
 	ListStaleWebhookEvents(ctx context.Context) ([]pgtype.UUID, error)
 	// ---------- subscriptions / plans ----------
 	ListSubscriptions(ctx context.Context, dollar_1 string) ([]ListSubscriptionsRow, error)
+	ListSurveyResponses(ctx context.Context, surveyID pgtype.UUID) ([]SurveyResponses, error)
+	ListSurveys(ctx context.Context, arg ListSurveysParams) ([]Surveys, error)
 	ListTemplates(ctx context.Context) ([]ListTemplatesRow, error)
 	ListTenantAddons(ctx context.Context, tenantID pgtype.UUID) ([]ListTenantAddonsRow, error)
 	// ---------- tenants ----------
@@ -709,6 +883,7 @@ type Querier interface {
 	ListUserSessions(ctx context.Context, userID pgtype.UUID) ([]ListUserSessionsRow, error)
 	ListVendors(ctx context.Context, organizationID pgtype.UUID) ([]Vendors, error)
 	ListVisits(ctx context.Context, caseID pgtype.UUID) ([]WelfareVisits, error)
+	ListVolunteerRoles(ctx context.Context, arg ListVolunteerRolesParams) ([]VolunteerRoles, error)
 	ListWelfareCases(ctx context.Context, arg ListWelfareCasesParams) ([]WelfareCases, error)
 	// §15 banner: the impersonated user's client surfaces the active support
 	// session AND the operator identity — user-scoped read, live rows only.
@@ -717,6 +892,10 @@ type Querier interface {
 	// Serialize member-list mutations on the channel row (dm 2-seat cap) —
 	// two concurrent adds must not both pass the headcount.
 	LockChannel(ctx context.Context, id pgtype.UUID) (pgtype.UUID, error)
+	// serializes committee-capped spend across different projects sharing
+	// one mandate (pg advisory lock, released at tx end).
+	LockSpendScope(ctx context.Context, dollar_1 string) error
+	LockVolunteerRole(ctx context.Context, arg LockVolunteerRoleParams) (LockVolunteerRoleRow, error)
 	// Inserted FIRST inside the consumer's tx (§05 contract): 0 rows affected
 	// = already logged — the consumer body must be skipped, not replayed.
 	// The insert is the atomic dedupe check; the outer pre-check is a hint.
@@ -729,6 +908,7 @@ type Querier interface {
 	// ---------- attendance ----------
 	// bulk sheet upsert — one row per member per activity.
 	MarkAttendance(ctx context.Context, arg MarkAttendanceParams) error
+	MarkBenefitDisbursed(ctx context.Context, arg MarkBenefitDisbursedParams) (int64, error)
 	MarkChannelRead(ctx context.Context, arg MarkChannelReadParams) error
 	MarkEventDispatched(ctx context.Context, id pgtype.UUID) error
 	// approved → applied once the domain seam lands the draft.
@@ -742,7 +922,12 @@ type Querier interface {
 	MarkObligationsOverdue(ctx context.Context, graceDays int32) ([]MarkObligationsOverdueRow, error)
 	// daily sweep: open items past due_date flip to overdue.
 	MarkOverdueActionItems(ctx context.Context) ([]MarkOverdueActionItemsRow, error)
+	// provider settlement marks the tenant's issued invoices paid — scoped
+	// to a subscription and/or addon so unrelated issued rows stand.
+	MarkPlatformInvoicesPaid(ctx context.Context, arg MarkPlatformInvoicesPaidParams) (int64, error)
 	MarkReceiptProcessed(ctx context.Context, id pgtype.UUID) (int64, error)
+	// officer marks confirmed signups completed|no_show after the activity.
+	MarkSignup(ctx context.Context, arg MarkSignupParams) (VolunteerSignups, error)
 	// CAS: only a live/failed row finishes — a retry after a marked failure
 	// CAN complete (the blob is valid; 'failed' just records the last error).
 	MarkTenantExportDone(ctx context.Context, arg MarkTenantExportDoneParams) (int64, error)
@@ -758,6 +943,8 @@ type Querier interface {
 	// membership itself, its intake application, and its cards/renewals.
 	// Identity events on the user aggregate stay out of this surface.
 	MemberHistory(ctx context.Context, arg MemberHistoryParams) ([]MemberHistoryRow, error)
+	// §27 eligibility: active members of the unit or its descendants (§10 tree).
+	MemberInUnitTree(ctx context.Context, arg MemberInUnitTreeParams) (bool, error)
 	MembersWithOverdueObligations(ctx context.Context, organizationID pgtype.UUID) ([]MembersWithOverdueObligationsRow, error)
 	// weighted completion ratio → project.progress_pct.
 	MilestoneProgress(ctx context.Context, projectID pgtype.UUID) (MilestoneProgressRow, error)
@@ -771,17 +958,25 @@ type Querier interface {
 	MyCalendar(ctx context.Context, userID pgtype.UUID) ([]Activities, error)
 	// /me/claims — every claim the user filed across their memberships.
 	MyClaimsAll(ctx context.Context, userID pgtype.UUID) ([]PaymentClaims, error)
+	MyDisciplineCases(ctx context.Context, userID pgtype.UUID) ([]DisciplineCases, error)
 	// /me/finance — open obligations + payments across all of the user's
 	// memberships (cross-org member view; per-org reads stay org-scoped).
 	// Chronological interleave: payments sort by created_at, obligations by
 	// due_date — a single COALESCE key mixes both streams.
 	MyFinanceFeed(ctx context.Context, userID pgtype.UUID) ([]MyFinanceFeedRow, error)
 	MyNotifications(ctx context.Context, arg MyNotificationsParams) ([]Notifications, error)
+	MyNotificationsPaged(ctx context.Context, arg MyNotificationsPagedParams) ([]Notifications, error)
 	MyPreferences(ctx context.Context, userID pgtype.UUID) ([]NotificationPreferences, error)
+	MySurveyResponse(ctx context.Context, arg MySurveyResponseParams) (SurveyResponses, error)
+	// /me/volunteer-signups — the member's signups across orgs.
+	MyVolunteerSignups(ctx context.Context, userID pgtype.UUID) ([]MyVolunteerSignupsRow, error)
 	// /me/welfare — the member's own cases across orgs they belong to.
 	MyWelfareCases(ctx context.Context, userID pgtype.UUID) ([]WelfareCases, error)
 	// under the election row lock — gap-free ordering nonce.
 	NextCastSeq(ctx context.Context, electionID pgtype.UUID) (int32, error)
+	NextInvoiceNumber(ctx context.Context, id pgtype.UUID) (int64, error)
+	// ---------- invoices ----------
+	NextInvoiceSeq(ctx context.Context, id pgtype.UUID) (int32, error)
 	// Atomic per-org sequence for member_no ({SLUG}-{YYYY}-{seq5}); the lock
 	// serializes concurrent approvals so numbers are unique and never reused.
 	NextMemberNoSeq(ctx context.Context, id pgtype.UUID) (int64, error)
@@ -808,7 +1003,19 @@ type Querier interface {
 	// obligation, amount, paid-so-far, status — filterable by schedule/period/
 	// contribution type.
 	ObligationRollCall(ctx context.Context, arg ObligationRollCallParams) ([]ObligationRollCallRow, error)
+	// standby promotion: first-come signed_up row promotes when a slot frees.
+	OldestStandby(ctx context.Context, roleID pgtype.UUID) (VolunteerSignups, error)
+	// §16 handover section: every still-open/overdue item across the org's activities.
+	OpenActionItemsForOrg(ctx context.Context, organizationID pgtype.UUID) ([]ActionItems, error)
+	// §16 handover section: custody rows still open in the org (any term).
+	OpenCustodyForOrg(ctx context.Context, organizationID pgtype.UUID) ([]CustodyAssignments, error)
 	OpenObligationsForMember(ctx context.Context, membershipID pgtype.UUID) ([]Obligations, error)
+	// draft → open; the resolved audience snapshot is written back into the
+	// row (audience.resolved_members) — members joining after open are not
+	// retro-enfranchised (§26).
+	OpenPoll(ctx context.Context, arg OpenPollParams) (Polls, error)
+	OpenSurvey(ctx context.Context, arg OpenSurveyParams) (Surveys, error)
+	OrgByCustomDomain(ctx context.Context, lower string) (string, error)
 	// forward-looking org calendar (meetings + events, unit filter).
 	OrgCalendar(ctx context.Context, arg OrgCalendarParams) ([]Activities, error)
 	// §12 org statement: purse balance plus month/year inflow-outflow.
@@ -835,12 +1042,22 @@ type Querier interface {
 	// The key is globally unique; a replay scoped to another org must surface a
 	// conflict, not a 500 (Rule 9's marker is per-payer, not per-org).
 	PaymentOrgForIdempotencyKey(ctx context.Context, idempotencyKey pgtype.Text) (pgtype.UUID, error)
+	PaymentsForInvoiceTotal(ctx context.Context, invoiceID pgtype.UUID) (int32, error)
+	PendingBenefitForCase(ctx context.Context, caseID pgtype.UUID) (WelfareBenefits, error)
+	// §16 handover section: claims still awaiting officer review.
+	PendingClaimsForOrg(ctx context.Context, organizationID pgtype.UUID) ([]PaymentClaims, error)
+	PollOptionBelongs(ctx context.Context, arg PollOptionBelongsParams) (bool, error)
+	PollTally(ctx context.Context, pollID pgtype.UUID) ([]PollTallyRow, error)
+	PollTurnout(ctx context.Context, pollID pgtype.UUID) (int32, error)
+	// non-secret polls only — per-option voter list for the results view.
+	PollVoters(ctx context.Context, pollID pgtype.UUID) ([]PollVotersRow, error)
 	// ---------- ledger (append-only) ----------
 	PostLedgerEntry(ctx context.Context, arg PostLedgerEntryParams) (LedgerEntries, error)
 	PostMessage(ctx context.Context, arg PostMessageParams) (ChatMessages, error)
 	// org.welfare.once_per.{kind}_days — a repeat request inside the window is
 	// flagged (not auto-rejected; the flag rides on the case for reviewers).
 	PriorCaseInWindow(ctx context.Context, arg PriorCaseInWindowParams) (pgtype.UUID, error)
+	ProjectExpenseTotal(ctx context.Context, arg ProjectExpenseTotalParams) (int64, error)
 	// edges in both directions around the project node.
 	ProjectGraph(ctx context.Context, sourceID pgtype.UUID) ([]ProjectGraphRow, error)
 	// Owner user created by the provision pipeline — no password (welcome
@@ -853,6 +1070,11 @@ type Querier interface {
 	// locator/detail read — opted-in fields only (Rule: public directory
 	// exposes only opted-in fields).
 	PublicOrgBySlug(ctx context.Context, slug string) ([]PublicOrgBySlugRow, error)
+	// Portal profile: public fields + branding + EXCO roster (opted-in orgs only).
+	PublicOrgBySlugFull(ctx context.Context, slug string) (PublicOrgBySlugFullRow, error)
+	// Current-term executive roster for the public portal: position + display
+	// name only (no contact data — Rule: opted-in fields only).
+	PublicOrgExco(ctx context.Context, organizationID pgtype.UUID) ([]PublicOrgExcoRow, error)
 	// japa_sync_reconcile: listed orgs with no locator mapping yet.
 	PublicOrgNeedsSync(ctx context.Context) ([]pgtype.UUID, error)
 	// public showcase: non-abandoned projects, minimal fields.
@@ -861,6 +1083,7 @@ type Querier interface {
 	PublishAnnouncement(ctx context.Context, arg PublishAnnouncementParams) (Announcements, error)
 	QueuedSyncJobs(ctx context.Context) ([]SyncJobs, error)
 	ReceiptForPayment(ctx context.Context, paymentID pgtype.UUID) (Receipts, error)
+	ReconcileExpense(ctx context.Context, arg ReconcileExpenseParams) (int64, error)
 	ReconcilePayment(ctx context.Context, arg ReconcilePaymentParams) (Payments, error)
 	// Failed consumer pass — stays pending, retried after exponential backoff
 	// (10s * 2^attempts, capped at 1h — §05 "retry w/ backoff").
@@ -871,6 +1094,7 @@ type Querier interface {
 	// guard: an org that charges registration publishes a schedule for it.
 	RegistrationSchedules(ctx context.Context, organizationID pgtype.UUID) ([]DuesSchedules, error)
 	RejectClaim(ctx context.Context, arg RejectClaimParams) (PaymentClaims, error)
+	RejectExpense(ctx context.Context, arg RejectExpenseParams) (Expenses, error)
 	// ADR-015 "related" helper: bidirectional traversal of entity_links from a
 	// (type,id) seed, depth-capped to keep the walk bounded.
 	RelatedEntities(ctx context.Context, arg RelatedEntitiesParams) ([]RelatedEntitiesRow, error)
@@ -885,6 +1109,7 @@ type Querier interface {
 	ReportRunExists(ctx context.Context, arg ReportRunExistsParams) (bool, error)
 	// approval gate: the resolution must exist in this org and be passed.
 	ResolutionOutcome(ctx context.Context, arg ResolutionOutcomeParams) (string, error)
+	ResolveDisciplineCase(ctx context.Context, arg ResolveDisciplineCaseParams) (int64, error)
 	// Ref: oga9-engineering/sections/03-rbac-positions.md (Phase 04)
 	// RBAC + positions: permission resolution (group+direct+position+scope union),
 	// positions, terms, officer appointments, committee memberships.
@@ -895,6 +1120,9 @@ type Querier interface {
 	// chat:retention_sweep — org.chat.retention_days > 0 → messages past the
 	// window soft-delete (Rule 11; hard erase stays with the erasure task).
 	RetentionSweepChat(ctx context.Context) ([]RetentionSweepChatRow, error)
+	// retire, never hard-delete: CASCADE on custom_field_values would drop data
+	RetireField(ctx context.Context, arg RetireFieldParams) (int64, error)
+	RetireRule(ctx context.Context, arg RetireRuleParams) (int64, error)
 	RetractAnnouncement(ctx context.Context, arg RetractAnnouncementParams) (Announcements, error)
 	// §08 DLQ re-drive: dead letters are rows parked by the dispatcher —
 	// dispatched_at set AND attempts at cap. Reset makes them claimable again;
@@ -906,6 +1134,7 @@ type Querier interface {
 	// point the head back at a surviving version row (called after
 	// DropLatestVersion; the caller passes the previous version's key).
 	RevertDocumentHead(ctx context.Context, arg RevertDocumentHeadParams) error
+	RevokeAPIKeyForTenant(ctx context.Context, arg RevokeAPIKeyForTenantParams) (int64, error)
 	RevokeAPIKeyForUser(ctx context.Context, arg RevokeAPIKeyForUserParams) (int64, error)
 	RevokeAllUserSessions(ctx context.Context, userID pgtype.UUID) ([]pgtype.UUID, error)
 	// Terminal lifecycle events (expelled/deceased) pull the physical card —
@@ -916,6 +1145,7 @@ type Querier interface {
 	// end impersonation → the operator's minted session dies with the
 	// support_sessions row (explicit end must cut access, not just flag it).
 	RevokeSessionsForSupport(ctx context.Context, supportSessionID pgtype.UUID) (int64, error)
+	RoleRoster(ctx context.Context, roleID pgtype.UUID) ([]RoleRosterRow, error)
 	// partial-patch semantics: unset timestamps keep their previous value.
 	ScheduleElection(ctx context.Context, arg ScheduleElectionParams) (int64, error)
 	// §15: a self-serve downgrade schedules at period end instead of applying
@@ -925,13 +1155,23 @@ type Querier interface {
 	// Position grants carrying a branch or committee scope — feeds _branch /
 	// _committee suffix resolution.
 	ScopedPositionNodes(ctx context.Context, arg ScopedPositionNodesParams) ([]ScopedPositionNodesRow, error)
+	// §23: durable japa identity link — set once at locator-join intake,
+	// only on rows that don't already carry a subject.
+	SetApplicationJapaSubject(ctx context.Context, arg SetApplicationJapaSubjectParams) (int64, error)
 	// Decision flow only moves forward within the intake machine
 	// (applied→screened→approved|rejected|withdrawn); callers pass expected
 	// source states so a concurrent decision can't double-apply.
 	SetApplicationStatus(ctx context.Context, arg SetApplicationStatusParams) (SetApplicationStatusRow, error)
 	SetAssetState(ctx context.Context, arg SetAssetStateParams) (int64, error)
+	// Link the posted finance ledger entry back onto the benefit (payment_id
+	// is an unconstrained uuid pointer -> finance; ledger id is the link).
+	SetBenefitPaymentRef(ctx context.Context, arg SetBenefitPaymentRefParams) error
+	SetBlogPostStatus(ctx context.Context, arg SetBlogPostStatusParams) (BlogPosts, error)
 	SetCandidateState(ctx context.Context, arg SetCandidateStateParams) (int64, error)
 	SetConnectorEnabled(ctx context.Context, arg SetConnectorEnabledParams) (int64, error)
+	SetCustomDomain(ctx context.Context, arg SetCustomDomainParams) (int64, error)
+	// CAS transitions only — every move validates the expected from-state.
+	SetDisciplineCaseState(ctx context.Context, arg SetDisciplineCaseStateParams) (int64, error)
 	SetDriveState(ctx context.Context, arg SetDriveStateParams) (int64, error)
 	// ---------- dues standing + renewals ----------
 	SetDuesStanding(ctx context.Context, arg SetDuesStandingParams) (int64, error)
@@ -939,6 +1179,7 @@ type Querier interface {
 	SetGenerationState(ctx context.Context, arg SetGenerationStateParams) (int64, error)
 	// Org-scoped: an invitation id alone must not grant cross-org mutation.
 	SetInvitationStatus(ctx context.Context, arg SetInvitationStatusParams) (pgtype.UUID, error)
+	SetInvoiceState(ctx context.Context, arg SetInvoiceStateParams) (int64, error)
 	SetJapaconnectUserID(ctx context.Context, arg SetJapaconnectUserIDParams) error
 	SetMFASecret(ctx context.Context, arg SetMFASecretParams) error
 	SetMemberNo(ctx context.Context, arg SetMemberNoParams) error
@@ -948,6 +1189,8 @@ type Querier interface {
 	// waived/cancelled are terminal; 'paid' MAY reopen to open/partially_paid —
 	// a reversed payment legitimately un-pays the obligation (recompute-driven).
 	SetObligationStatus(ctx context.Context, arg SetObligationStatusParams) (int64, error)
+	SetOrgDescription(ctx context.Context, arg SetOrgDescriptionParams) (int64, error)
+	SetProjectBudgetID(ctx context.Context, arg SetProjectBudgetIDParams) (int64, error)
 	// milestone-weighted progress, recomputed on each completion.
 	SetProjectProgress(ctx context.Context, arg SetProjectProgressParams) error
 	SetProjectState(ctx context.Context, arg SetProjectStateParams) (int64, error)
@@ -970,6 +1213,8 @@ type Querier interface {
 	SetUserVerified(ctx context.Context, id pgtype.UUID) error
 	// CAS on the expected state — concurrent reviewers can't double-decide.
 	SetWelfareCaseState(ctx context.Context, arg SetWelfareCaseStateParams) (int64, error)
+	// ---------- signups ----------
+	SignupVolunteer(ctx context.Context, arg SignupVolunteerParams) (VolunteerSignups, error)
 	SoftDeleteDocument(ctx context.Context, arg SoftDeleteDocumentParams) (int64, error)
 	SoftDeleteMessage(ctx context.Context, arg SoftDeleteMessageParams) (int64, error)
 	// email-channel rows that never got delivered past the grace window —
@@ -984,8 +1229,12 @@ type Querier interface {
 	// The stored payload IS the retry unit — the redrive sweep re-enqueues
 	// tenant:provision and the claim path resumes from the checkpoints.
 	StaleProvisions(ctx context.Context) ([]TenantProvisions, error)
+	// one response per member on named surveys (NULL members don't dedupe at
+	// the DB — anonymous dedupe rides the oga9:survey:claim marker).
+	SubmitSurveyResponse(ctx context.Context, arg SubmitSurveyResponseParams) (SurveyResponses, error)
 	// (re)activate: a cancelled/expired row re-subscribes in place.
 	SubscribeTenantAddon(ctx context.Context, arg SubscribeTenantAddonParams) (TenantAddons, error)
+	SurveyResponseCount(ctx context.Context, surveyID pgtype.UUID) (int32, error)
 	TallyByPosition(ctx context.Context, electionID pgtype.UUID) ([]TallyByPositionRow, error)
 	TemplateExists(ctx context.Context, slug string) (bool, error)
 	// §15: recompute countable limits tenant-wide (storage.mb has no size
@@ -1022,28 +1271,39 @@ type Querier interface {
 	// handover sweep feed: custody still out when the term ended.
 	UnreturnedCustodyInTerm(ctx context.Context, termID pgtype.UUID) ([]UnreturnedCustodyInTermRow, error)
 	UpdateActivity(ctx context.Context, arg UpdateActivityParams) (int64, error)
+	UpdateBlogPost(ctx context.Context, arg UpdateBlogPostParams) (BlogPosts, error)
+	UpdateBudget(ctx context.Context, arg UpdateBudgetParams) (Budgets, error)
+	UpdateBudgetLine(ctx context.Context, arg UpdateBudgetLineParams) (int64, error)
 	// Open drives only: title/purpose/close-window edits (drives.manage PATCH).
 	// NULL args keep the column — a partial PATCH changes only what it sends.
 	UpdateDrive(ctx context.Context, arg UpdateDriveParams) (int64, error)
 	// Full edit surface (catalog PATCH): NULL args keep the column; explicit
 	// clear_ends_on writes NULL (the "ends_on": null PATCH semantic).
 	UpdateDuesSchedule(ctx context.Context, arg UpdateDuesScheduleParams) (int64, error)
+	UpdateField(ctx context.Context, arg UpdateFieldParams) (UpdateFieldRow, error)
+	UpdateFieldGroup(ctx context.Context, arg UpdateFieldGroupParams) (UpdateFieldGroupRow, error)
 	UpdateOrgProfile(ctx context.Context, arg UpdateOrgProfileParams) (pgtype.UUID, error)
 	UpdateUnit(ctx context.Context, arg UpdateUnitParams) (pgtype.UUID, error)
 	UpdateUserPassword(ctx context.Context, arg UpdateUserPasswordParams) error
+	UpdateVolunteerRole(ctx context.Context, arg UpdateVolunteerRoleParams) (int64, error)
 	UpsertAddon(ctx context.Context, arg UpsertAddonParams) (AddonCatalog, error)
 	UpsertAgenda(ctx context.Context, arg UpsertAgendaParams) (MeetingAgendas, error)
 	UpsertBranding(ctx context.Context, arg UpsertBrandingParams) error
 	UpsertCredential(ctx context.Context, arg UpsertCredentialParams) error
 	UpsertFeatureFlag(ctx context.Context, arg UpsertFeatureFlagParams) error
+	UpsertFieldValue(ctx context.Context, arg UpsertFieldValueParams) (pgtype.UUID, error)
 	UpsertHealthScore(ctx context.Context, arg UpsertHealthScoreParams) error
 	// committees only — the service validates org_units.type='committee'.
 	UpsertMandate(ctx context.Context, arg UpsertMandateParams) error
+	UpsertOrgRule(ctx context.Context, arg UpsertOrgRuleParams) (RuleDefinitions, error)
 	UpsertOrgSetting(ctx context.Context, arg UpsertOrgSettingParams) error
 	UpsertPlan(ctx context.Context, arg UpsertPlanParams) (Plans, error)
+	UpsertPlatformRule(ctx context.Context, arg UpsertPlatformRuleParams) (RuleDefinitions, error)
 	UpsertPreference(ctx context.Context, arg UpsertPreferenceParams) error
 	// Ref: oga9-engineering/sections/19-analytics.md
 	UpsertSnapshot(ctx context.Context, arg UpsertSnapshotParams) error
+	// ai:usage_rollup sync target — overwrite (rollup is authoritative).
+	UpsertUsageMeter(ctx context.Context, arg UpsertUsageMeterParams) error
 	UserCommitteeUnits(ctx context.Context, arg UserCommitteeUnitsParams) ([]pgtype.UUID, error)
 	// platform operator bypass (login + org-ctx suspend gates): ANY
 	// platform.* node on a NULL-tenant role counts — the check must not
@@ -1059,10 +1319,15 @@ type Querier interface {
 	UserRequiresMFA(ctx context.Context, userID pgtype.UUID) (bool, error)
 	UserUsageThisMonth(ctx context.Context, userID pgtype.UUID) (UserUsageThisMonthRow, error)
 	VoiceRoomParticipants(ctx context.Context, roomID pgtype.UUID) ([]VoiceRoomParticipants, error)
+	// pending-addon cancel voids its unsettled invoice.
+	VoidAddonIssuedInvoice(ctx context.Context, arg VoidAddonIssuedInvoiceParams) error
+	// void ≠ delete (Rule 19 spirit) — audited state change.
+	VoidInvoice(ctx context.Context, arg VoidInvoiceParams) (Invoices, error)
 	// Re-mark correction: revoke an open assessed fine for one member+period
 	// (e.g. 'attendance:{activity}') — a corrected mark must not keep the fine.
 	WaiveFineForPeriod(ctx context.Context, arg WaiveFineForPeriodParams) ([]pgtype.UUID, error)
 	WaiveObligation(ctx context.Context, arg WaiveObligationParams) (int64, error)
+	WebhookReceipt(ctx context.Context, id pgtype.UUID) (WebhookReceipts, error)
 	// the org.welfare.* org_settings namespace — the policies endpoint (Rule 23).
 	WelfareSettings(ctx context.Context, orgID pgtype.UUID) ([]WelfareSettingsRow, error)
 	// Self-service withdrawal: only the applicant's own row, and only while

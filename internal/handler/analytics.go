@@ -3,6 +3,7 @@ package handler
 
 import (
 	"errors"
+	"io"
 	"log"
 	"net/http"
 
@@ -35,14 +36,11 @@ func analyticsErr(w http.ResponseWriter, err error) {
 	}
 }
 
-// Dashboard — role-resolved snapshot; ?role= override for officers viewing
-// another seat's view (default 'member').
+// Dashboard — the viewer's role resolves server-side from their
+// permission nodes (§19); no ?role= override — a member can't read the
+// treasurer's seat view by asking (Rule 24).
 func (h *AnalyticsHandler) Dashboard(w http.ResponseWriter, r *http.Request) {
-	role := r.URL.Query().Get("role")
-	if role == "" {
-		role = "member"
-	}
-	raw, err := h.svc.Dashboard(r.Context(), middleware.OrgCtx(r.Context()), role)
+	raw, err := h.svc.Dashboard(r.Context(), middleware.OrgCtx(r.Context()))
 	if err != nil {
 		analyticsErr(w, err)
 		return
@@ -90,17 +88,20 @@ func (h *AnalyticsHandler) RunReport(w http.ResponseWriter, r *http.Request) {
 // DownloadReport — returns the run row; the document_id links to the
 // documents download route for the actual artifact.
 func (h *AnalyticsHandler) DownloadReport(w http.ResponseWriter, r *http.Request) {
-	rid, err := uuid.Parse(chi.URLParam(r, "report_id"))
+	rid, err := uuid.Parse(chi.URLParam(r, "rid"))
 	if err != nil {
 		httpx.WriteErr(w, 400, "invalid_id", "malformed identifier")
 		return
 	}
-	run, err := h.svc.GetRun(r.Context(), middleware.OrgCtx(r.Context()), rid)
+	rc, name, err := h.svc.DownloadReport(r.Context(), middleware.OrgCtx(r.Context()), rid)
 	if err != nil {
 		analyticsErr(w, err)
 		return
 	}
-	httpx.WriteData(w, 200, run)
+	defer rc.Close()
+	w.Header().Set("Content-Disposition", `attachment; filename="`+name+`"`)
+	w.Header().Set("Content-Type", "application/octet-stream")
+	_, _ = io.Copy(w, rc)
 }
 
 func (h *AnalyticsHandler) Consolidated(w http.ResponseWriter, r *http.Request) {

@@ -107,3 +107,15 @@ SELECT * FROM terms WHERE is_current AND ends_at < CURRENT_DATE;
 -- governance:handover_reminders — terms ending inside the reminder window.
 SELECT * FROM terms WHERE is_current
   AND ends_at BETWEEN CURRENT_DATE AND CURRENT_DATE + sqlc.arg(days)::int;
+
+-- name: HandoverCompletedExists :one
+SELECT EXISTS(SELECT 1 FROM domain_events
+  WHERE event_type = 'HandoverCompleted' AND aggregate_id = $1) AS e;
+
+-- name: GetMandateScoped :one
+-- org-scoped variant for request paths — a foreign-org unit id must not
+-- resolve a mandate (Rule 24).
+SELECT cm.* FROM committee_mandates cm
+JOIN org_units u ON u.id = cm.org_unit_id
+WHERE cm.org_unit_id = sqlc.arg(unit_id)::uuid
+  AND u.organization_id = sqlc.arg(org_id)::uuid;

@@ -9,6 +9,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strings"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -26,7 +27,23 @@ var docVisibility = map[string]bool{"public": true, "members": true, "exco": tru
 	"committee": true, "private": true}
 
 // SetStore wires the blob backend (disk under OGA9_UPLOADS_DIR for MVP).
-func (s *Service) SetStore(st *storage.Store) { s.store = st }
+func (s *Service) SetStore(st storage.BlobStore) { s.store = st }
+
+// PreviewURL returns an image preview URL through the store backend
+// (imgproxy+S3); empty when the backend can't preview or the document
+// isn't an image — callers omit the field then.
+func (s *Service) PreviewURL(d db.Documents) string {
+	if s.store == nil {
+		return ""
+	}
+	ext := strings.ToLower(d.StorageKey)
+	for _, e := range []string{".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif"} {
+		if strings.HasSuffix(ext, e) {
+			return s.store.PreviewURL(d.StorageKey, 640, 640)
+		}
+	}
+	return ""
+}
 
 // putCapped writes the blob enforcing limit.storage.mb (Rule 25) — the
 // env fallback (OGA9_UPLOAD_MAX_MB) covers dev/new plans; neither is

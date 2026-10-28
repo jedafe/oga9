@@ -118,6 +118,33 @@ func (q *Queries) CountApplicationSponsors(ctx context.Context, applicationID pg
 	return column_1, err
 }
 
+const countMembers = `-- name: CountMembers :one
+SELECT count(*) FROM organization_memberships m
+WHERE m.organization_id = $1::uuid
+  AND ($2 = '' OR m.category = $2)
+  AND ($3 = '' OR m.lifecycle_state = $3)
+  AND ($4::uuid IS NULL OR m.org_unit_id = $4::uuid)
+`
+
+type CountMembersParams struct {
+	OrgID    pgtype.UUID `json:"org_id"`
+	Category interface{} `json:"category"`
+	State    interface{} `json:"state"`
+	UnitID   pgtype.UUID `json:"unit_id"`
+}
+
+func (q *Queries) CountMembers(ctx context.Context, arg CountMembersParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countMembers,
+		arg.OrgID,
+		arg.Category,
+		arg.State,
+		arg.UnitID,
+	)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const countSponsors = `-- name: CountSponsors :one
 SELECT count(*) FROM member_sponsors WHERE membership_id = $1 AND kind = 'sponsor'
 `
@@ -389,7 +416,7 @@ func (q *Queries) GetActiveCard(ctx context.Context, membershipID pgtype.UUID) (
 }
 
 const getApplication = `-- name: GetApplication :one
-SELECT id, organization_id, user_id, email, phone, answers, sponsor_member_id, status, created_at
+SELECT id, organization_id, user_id, email, phone, answers, sponsor_member_id, status, japa_subject, created_at
 FROM membership_applications WHERE id = $1
 `
 
@@ -402,6 +429,7 @@ type GetApplicationRow struct {
 	Answers         []byte             `json:"answers"`
 	SponsorMemberID pgtype.UUID        `json:"sponsor_member_id"`
 	Status          string             `json:"status"`
+	JapaSubject     pgtype.Text        `json:"japa_subject"`
 	CreatedAt       pgtype.Timestamptz `json:"created_at"`
 }
 
@@ -417,6 +445,7 @@ func (q *Queries) GetApplication(ctx context.Context, id pgtype.UUID) (GetApplic
 		&i.Answers,
 		&i.SponsorMemberID,
 		&i.Status,
+		&i.JapaSubject,
 		&i.CreatedAt,
 	)
 	return i, err
@@ -636,7 +665,7 @@ func (q *Queries) LinkApplicationUser(ctx context.Context, arg LinkApplicationUs
 }
 
 const listApplications = `-- name: ListApplications :many
-SELECT id, user_id, email, phone, status, sponsor_member_id, answers, created_at, decided_at
+SELECT id, user_id, email, phone, status, sponsor_member_id, answers, japa_subject, created_at, decided_at
 FROM membership_applications
 WHERE organization_id = $1::uuid AND status = $2
 ORDER BY created_at
@@ -655,6 +684,7 @@ type ListApplicationsRow struct {
 	Status          string             `json:"status"`
 	SponsorMemberID pgtype.UUID        `json:"sponsor_member_id"`
 	Answers         []byte             `json:"answers"`
+	JapaSubject     pgtype.Text        `json:"japa_subject"`
 	CreatedAt       pgtype.Timestamptz `json:"created_at"`
 	DecidedAt       pgtype.Timestamptz `json:"decided_at"`
 }
@@ -676,6 +706,7 @@ func (q *Queries) ListApplications(ctx context.Context, arg ListApplicationsPara
 			&i.Status,
 			&i.SponsorMemberID,
 			&i.Answers,
+			&i.JapaSubject,
 			&i.CreatedAt,
 			&i.DecidedAt,
 		); err != nil {
@@ -792,6 +823,79 @@ func (q *Queries) ListMembersForExport(ctx context.Context, organizationID pgtyp
 			&i.LifecycleState,
 			&i.DuesStanding,
 			&i.JoinedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listMembersPaged = `-- name: ListMembersPaged :many
+SELECT m.id, m.user_id, m.member_no, m.category, m.lifecycle_state, m.dues_standing,
+       m.joined_at, m.org_unit_id, u.display_name, u.email
+FROM organization_memberships m
+JOIN users u ON u.id = m.user_id
+WHERE m.organization_id = $1::uuid
+  AND ($2 = '' OR m.category = $2)
+  AND ($3 = '' OR m.lifecycle_state = $3)
+  AND ($4::uuid IS NULL OR m.org_unit_id = $4::uuid)
+ORDER BY u.display_name
+LIMIT $6 OFFSET $5
+`
+
+type ListMembersPagedParams struct {
+	OrgID    pgtype.UUID `json:"org_id"`
+	Category interface{} `json:"category"`
+	State    interface{} `json:"state"`
+	UnitID   pgtype.UUID `json:"unit_id"`
+	Off      int32       `json:"off"`
+	Lim      int32       `json:"lim"`
+}
+
+type ListMembersPagedRow struct {
+	ID             pgtype.UUID        `json:"id"`
+	UserID         pgtype.UUID        `json:"user_id"`
+	MemberNo       pgtype.Text        `json:"member_no"`
+	Category       string             `json:"category"`
+	LifecycleState string             `json:"lifecycle_state"`
+	DuesStanding   string             `json:"dues_standing"`
+	JoinedAt       pgtype.Timestamptz `json:"joined_at"`
+	OrgUnitID      pgtype.UUID        `json:"org_unit_id"`
+	DisplayName    string             `json:"display_name"`
+	Email          string             `json:"email"`
+}
+
+func (q *Queries) ListMembersPaged(ctx context.Context, arg ListMembersPagedParams) ([]ListMembersPagedRow, error) {
+	rows, err := q.db.Query(ctx, listMembersPaged,
+		arg.OrgID,
+		arg.Category,
+		arg.State,
+		arg.UnitID,
+		arg.Off,
+		arg.Lim,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListMembersPagedRow
+	for rows.Next() {
+		var i ListMembersPagedRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.UserID,
+			&i.MemberNo,
+			&i.Category,
+			&i.LifecycleState,
+			&i.DuesStanding,
+			&i.JoinedAt,
+			&i.OrgUnitID,
+			&i.DisplayName,
+			&i.Email,
 		); err != nil {
 			return nil, err
 		}
@@ -1096,6 +1200,26 @@ WHERE membership_id = $1 AND revoked_at IS NULL
 func (q *Queries) RevokeCards(ctx context.Context, membershipID pgtype.UUID) error {
 	_, err := q.db.Exec(ctx, revokeCards, membershipID)
 	return err
+}
+
+const setApplicationJapaSubject = `-- name: SetApplicationJapaSubject :execrows
+UPDATE membership_applications SET japa_subject = $2
+WHERE id = $1 AND (japa_subject IS NULL OR japa_subject = '')
+`
+
+type SetApplicationJapaSubjectParams struct {
+	ID          pgtype.UUID `json:"id"`
+	JapaSubject pgtype.Text `json:"japa_subject"`
+}
+
+// §23: durable japa identity link — set once at locator-join intake,
+// only on rows that don't already carry a subject.
+func (q *Queries) SetApplicationJapaSubject(ctx context.Context, arg SetApplicationJapaSubjectParams) (int64, error) {
+	result, err := q.db.Exec(ctx, setApplicationJapaSubject, arg.ID, arg.JapaSubject)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const setApplicationStatus = `-- name: SetApplicationStatus :one

@@ -32,9 +32,11 @@ import (
 	"github.com/jedafe/oga9/internal/assets"
 	"github.com/jedafe/oga9/internal/auth"
 	"github.com/jedafe/oga9/internal/billing"
+	"github.com/jedafe/oga9/internal/blog"
 	"github.com/jedafe/oga9/internal/chat"
 	"github.com/jedafe/oga9/internal/comms"
 	"github.com/jedafe/oga9/internal/config"
+	"github.com/jedafe/oga9/internal/db"
 	"github.com/jedafe/oga9/internal/elections"
 	"github.com/jedafe/oga9/internal/entitlements"
 	"github.com/jedafe/oga9/internal/events"
@@ -49,6 +51,7 @@ import (
 	"github.com/jedafe/oga9/internal/platform"
 	"github.com/jedafe/oga9/internal/projects"
 	"github.com/jedafe/oga9/internal/realtime"
+	"github.com/jedafe/oga9/internal/search"
 	"github.com/jedafe/oga9/internal/secrets"
 	"github.com/jedafe/oga9/internal/storage"
 	"github.com/jedafe/oga9/internal/tasks"
@@ -116,6 +119,9 @@ func main() {
 	// resolved client IP must land in ctx BEFORE obs logging and every
 	// rate-limit bucket — otherwise the proxy's addr is what gets counted.
 	r.Use(middleware.ResolveIP(cfg.TrustedProxies))
+	// Browser-direct API calls (SvelteKit PWA on app.{base} subdomains):
+	// allowlisted-origin CORS — Bearer auth means no credential sharing.
+	r.Use(middleware.CORS(middleware.CORSOrigins(cfg.BaseDomain, cfg.AppURL, cfg.Env != "production")))
 	// §13.05: structured access log + per-route latency reservoir.
 	r.Use(obs.Metrics)
 	r.Use(obs.RequestLog)
@@ -143,6 +149,7 @@ func main() {
 	entSvc := entitlements.NewService(pool, vk)
 	billSvc := billing.NewService(pool, cfg.LicenseSignKey, cfg.WebhookSecret)
 	orgSvc := tenant.NewService(pool, vk)
+	orgSvc.SetBaseDomain(cfg.BaseDomain) // §04 custom_domain hijack guard
 	finSvc := finance.NewService(pool, vk)
 	// §07: limit.members.active gate at membership activation (Rule 25).
 	orgSvc.SetEntitlements(entSvc)
@@ -161,10 +168,16 @@ func main() {
 	finSvc.SetActivityGate(actSvc.ActivityInOrg)
 	actH := handler.NewActivitiesHandler(actSvc, orgSvc)
 	commsSvc := comms.NewService(pool)
+	commsSvc.SetValkey(vk)
 	// §16 governance — motions/resolutions/constitution/mandates/handover.
 	// Seams keep module boundaries (Rule 26): quorum checks go through
 	// activities' service, handover archives through documents.
 	govSvc := governance.NewService(pool)
+	// §16 discipline 'suspension' sanction lands as a real lifecycle
+	// transition through the members seam (Rule 26).
+	govSvc.SetSuspension(func(ctx context.Context, oc *tenant.OrgCtx, memberID uuid.UUID) error {
+		return orgSvc.TransitionMember(ctx, oc, memberID, "suspend")
+	})
 	govSvc.SetQuorum(func(ctx context.Context, oc *tenant.OrgCtx, aid uuid.UUID) (bool, error) {
 		met, _, err := actSvc.EvaluateQuorum(ctx, oc, aid)
 		return met, err
@@ -173,6 +186,8 @@ func main() {
 		_, err := commsSvc.Upload(ctx, oc, "archive", title, "exco", uuid.Nil, r)
 		return err
 	})
+	// §16 fine sanctions post through the §12 fine seam — never off-ledger.
+	govSvc.SetFine(finSvc.AssessFine)
 	// §17 welfare — cases/approvals/disbursement/visits.
 	welSvc := welfare.NewService(pool)
 	welH := handler.NewWelfareHandler(welSvc)
@@ -189,15 +204,171 @@ func main() {
 	anaSvc.SetMe(func(ctx context.Context, uid uuid.UUID) (any, error) {
 		return orgSvc.MyMemberships(ctx, uid)
 	})
+	anaSvc.SetPermissions(func(ctx context.Context, uid, oid uuid.UUID, node string) bool {
+		return orgSvc.HasPermission(ctx, uid, oid, node)
+	})
+	anaSvc.SetDocArtifact(func(ctx context.Context, oc *tenant.OrgCtx, docID uuid.UUID) (io.ReadCloser, string, error) {
+		rc, doc, err := commsSvc.Download(ctx, oc, docID, false)
+		if err != nil {
+			return nil, "", err
+		}
+		return rc, doc.Title, nil
+	})
+	// §19 consolidated: per-branch roll-up — members + activity counts for
+	// every org_units row of type 'branch'.
+	anaSvc.SetBranches(func(ctx context.Context, oc *tenant.OrgCtx) ([]map[string]any, error) {
+		units, err := orgSvc.ListUnits(ctx, oc.OrgID)
+		if err != nil {
+			return nil, err
+		}
+		var out []map[string]any
+		for _, u := range units {
+			if u.Type != "branch" {
+				continue
+			}
+			uid := u.ID
+			ms, _ := orgSvc.Members(ctx, oc, "", "", uid)
+			acts, _ := actSvc.List(ctx, oc, "", "", uid)
+			out = append(out, map[string]any{
+				"unit_id": uid, "name": u.Name,
+				"members": len(ms), "activities": len(acts)})
+		}
+		return out, nil
+	})
+	// §19 dashboard sections + health components — real reads from the
+	// owning modules' services (Rule 26), not fabricated zeros.
+	anaSvc.SetSection("members", func(ctx context.Context, oc *tenant.OrgCtx, role string) (any, error) {
+		return orgSvc.Members(ctx, oc, "", "", uuid.Nil)
+	})
+	anaSvc.SetSection("activities", func(ctx context.Context, oc *tenant.OrgCtx, role string) (any, error) {
+		return actSvc.List(ctx, oc, "", "", uuid.Nil)
+	})
+	anaSvc.SetSection("finance", func(ctx context.Context, oc *tenant.OrgCtx, role string) (any, error) {
+		if role != "treasurer" && role != "president" {
+			return nil, nil // org.finance.reports.read-scoped data
+		}
+		return finSvc.Statement(ctx, oc)
+	})
+	anaSvc.SetSection("welfare", func(ctx context.Context, oc *tenant.OrgCtx, role string) (any, error) {
+		// welfare cases are org.welfare.view_any data — officer seats
+		// only; a plain member's snapshot must not embed them (§19:
+		// content filtered by the viewer's permission nodes).
+		if role == "member" {
+			return nil, nil
+		}
+		return welSvc.ListCases(ctx, oc, "")
+	})
+	// health.* producers: 0-100 component scores from real org signals.
+	anaSvc.SetSection("health.membership", func(ctx context.Context, oc *tenant.OrgCtx, _ string) (any, error) {
+		all, err := orgSvc.Members(ctx, oc, "", "", uuid.Nil)
+		if err != nil || len(all) == 0 {
+			return int64(0), err
+		}
+		var active int64
+		for _, m := range all {
+			if m.LifecycleState == "active" {
+				active++
+			}
+		}
+		return int64(active * 100 / int64(len(all))), nil
+	})
+	anaSvc.SetSection("health.attendance", func(ctx context.Context, oc *tenant.OrgCtx, _ string) (any, error) {
+		// proxy: share of recent meetings that actually happened
+		// (held/closed vs cancelled) in the activity list.
+		list, err := actSvc.List(ctx, oc, "meeting", "", uuid.Nil)
+		if err != nil || len(list) == 0 {
+			return int64(50), err // no meetings → neutral, not zero
+		}
+		var held, total int64
+		for _, a := range list {
+			if a.Status == "cancelled" {
+				continue
+			}
+			total++
+			if a.Status == "completed" || a.Status == "held" || a.Status == "closed" {
+				held++
+			}
+		}
+		if total == 0 {
+			return int64(50), nil
+		}
+		return int64(held * 100 / total), nil
+	})
+	anaSvc.SetSection("health.finance", func(ctx context.Context, oc *tenant.OrgCtx, _ string) (any, error) {
+		all, err := orgSvc.Members(ctx, oc, "", "", uuid.Nil)
+		if err != nil {
+			return int64(0), err
+		}
+		def, err := finSvc.Defaulters(ctx, oc)
+		if err != nil {
+			return int64(0), err
+		}
+		if len(all) == 0 {
+			return int64(100), nil
+		}
+		good := int64(len(all) - len(def))
+		if good < 0 {
+			good = 0
+		}
+		return int64(good * 100 / int64(len(all))), nil
+	})
+	anaSvc.SetSection("health.engagement", func(ctx context.Context, oc *tenant.OrgCtx, _ string) (any, error) {
+		// recent domain-event volume as the engagement proxy — scaled
+		// 0-100 over a modest baseline (10 events/mo = fully engaged).
+		act, err := actSvc.List(ctx, oc, "", "", uuid.Nil)
+		if err != nil {
+			return int64(0), err
+		}
+		n := int64(len(act) + 1)
+		if n > 10 {
+			n = 10
+		}
+		return int64(n * 10), nil
+	})
 	anaH := handler.NewAnalyticsHandler(anaSvc)
 	// §18 assets — registry, term-scoped custody, audits, credential refs.
 	astSvc := assets.NewService(pool)
 	astH := handler.NewAssetsHandler(astSvc)
+	// §16 handover report sections — each produced by the owning module's
+	// service (Rule 26): open action items, open custody, pending
+	// approvals, finances snapshot.
+	govSvc.SetHandoverSection("action_items", func(ctx context.Context, oc *tenant.OrgCtx) (any, error) {
+		return actSvc.OpenActionItemsForOrg(ctx, oc)
+	})
+	govSvc.SetHandoverSection("custody", func(ctx context.Context, oc *tenant.OrgCtx) (any, error) {
+		return astSvc.OpenCustody(ctx, oc)
+	})
+	govSvc.SetHandoverSection("pending_approvals", func(ctx context.Context, oc *tenant.OrgCtx) (any, error) {
+		cases, err := welSvc.ListCases(ctx, oc, "requested")
+		if err != nil {
+			return nil, err
+		}
+		reviewing, err := welSvc.ListCases(ctx, oc, "reviewing")
+		if err != nil {
+			return nil, err
+		}
+		claims, err := finSvc.PendingClaims(ctx, oc)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"welfare_requested": cases, "welfare_reviewing": reviewing, "payment_claims": claims}, nil
+	})
+	govSvc.SetHandoverSection("finance", func(ctx context.Context, oc *tenant.OrgCtx) (any, error) {
+		return finSvc.Statement(ctx, oc)
+	})
+
 	// §20 projects — resolution-gated delivery, completion reports via
 	// the documents seam.
 	prjSvc := projects.NewService(pool)
 	prjSvc.SetArchive(func(ctx context.Context, oc *tenant.OrgCtx, title string, r io.Reader) (uuid.UUID, error) {
 		return commsSvc.Upload(ctx, oc, "report", title, "committee", uuid.Nil, r)
+	})
+	// §16+§20: mandate enforcement via the governance seam; spend totals
+	// come from project_expenses reservations (same-tx, race-free caps).
+	prjSvc.SetSpendGate(govSvc.MandateLimit)
+	finSvc.SetMandateLimit(govSvc.MandateLimit) // §25 committee-capped expenses
+	prjSvc.SetPaymentVerifier(func(ctx context.Context, orgID, pid uuid.UUID) (bool, error) {
+		return finSvc.PaymentExists(ctx, orgID, pid)
 	})
 	prjH := handler.NewProjectsHandler(prjSvc)
 	// §21 elections — nominations, secret ballots (participation vs choice),
@@ -211,6 +382,15 @@ func main() {
 	// Secrets resolve via credential_ref → env lookup in dev; the locator
 	// join lands as a membership application via the tenant seam.
 	intSvc := integrations.NewService(pool)
+	// §23 oga9:ics:{org_id} feed cache (Rule 4 catalogued key).
+	intSvc.SetFeedCache(
+		func(ctx context.Context, orgID uuid.UUID) (string, error) {
+			b, err := vk.Do(ctx, vk.B().Get().Key("oga9:ics:"+orgID.String()).Build()).AsBytes()
+			return string(b), err
+		},
+		func(ctx context.Context, orgID uuid.UUID, feed string) error {
+			return vk.Do(ctx, vk.B().Set().Key("oga9:ics:"+orgID.String()).Value(feed).Ex(time.Hour).Build()).Error()
+		})
 	// credential_ref resolves through the secrets seam — env: and file:
 	// schemes only; raw secrets are never stored (§23 rule).
 	intSvc.SetSecret(secrets.Resolve)
@@ -256,7 +436,7 @@ func main() {
 		}
 		return nil
 	})
-	intH := handler.NewIntegrationsHandler(intSvc)
+	intH := handler.NewIntegrationsHandler(intSvc, queue, cfg.BaseDomain)
 	// §22 ai — provider/apply/limit seams; permission-scoped answers,
 	// HITL drafts, limit.ai.requests metering. The OpenAI-compatible
 	// adapter wires only when configured — unconfigured → 503
@@ -270,8 +450,117 @@ func main() {
 	aiSvc.SetLimit(func(ctx context.Context, tenantID uuid.UUID, key string) int64 {
 		return entSvc.Limit(ctx, tenantID, key)
 	})
-	aiH := handler.NewAIHandler(aiSvc)
-	commsSvc.SetStore(storage.New(cfg.UploadsDir))
+	aiSvc.SetPermissions(func(ctx context.Context, uid, oid uuid.UUID, node string) bool {
+		return orgSvc.HasPermission(ctx, uid, oid, node)
+	})
+	// feature_flags wins (the /platform/flags surface writes there —
+	// e.g. platform.ai_assistant.enabled); system_settings is the fallback.
+	aiSvc.SetFlag(func(ctx context.Context, key string) bool {
+		q := db.New(pool)
+		if enabled, err := q.GetFeatureFlag(ctx, key); err == nil {
+			return enabled
+		}
+		v, err := q.GetSystemSetting(ctx, key)
+		if err != nil {
+			return false // unset → disabled; post-MVP flags ship off (flag convention)
+		}
+		var b bool
+		if json.Unmarshal(v, &b) == nil {
+			return b
+		}
+		return false
+	})
+	aiSvc.SetCostRate(cfg.AICostPer1KMicroUSD)
+	// §22 HITL apply: approved drafts land in their domain through the
+	// owning services (Rule 26) — AI never writes domain tables.
+	aiSvc.SetApply(func(ctx context.Context, oc *tenant.OrgCtx, g db.AiGenerations) error {
+		var d struct {
+			Title    string `json:"title"`
+			Body     string `json:"body"`
+			TargetID string `json:"target_id"`
+		}
+		_ = json.Unmarshal(g.Draft, &d)
+		tid, _ := uuid.Parse(d.TargetID)
+		switch g.Kind {
+		case "agenda":
+			if tid == uuid.Nil {
+				return fmt.Errorf("agenda draft needs a target meeting")
+			}
+			items, _ := json.Marshal([]map[string]any{{"order": 1, "title": d.Title, "body": d.Body}})
+			return actSvc.SetAgenda(ctx, oc, tid, items)
+		case "minutes":
+			if tid == uuid.Nil {
+				return fmt.Errorf("minutes draft needs a target meeting")
+			}
+			_, err := actSvc.DraftMinutes(ctx, oc, tid, d.Body)
+			return err
+		case "announcement":
+			_, err := commsSvc.Publish(ctx, oc, d.Title, d.Body, comms.Audience{All: true}, true)
+			return err
+		case "report", "insight":
+			_, err := commsSvc.Upload(ctx, oc, "report", "ai-"+g.Kind+"-"+g.ID.String()[:8],
+				"exco", uuid.Nil, strings.NewReader(d.Body))
+			return err
+		}
+		return nil
+	})
+	// §22 context assembly: permission-scoped grounding sources — the
+	// asker only ever sees entities their nodes cover.
+	aiSvc.AddContextSource("org.governance.view", func(ctx context.Context, oc *tenant.OrgCtx) (string, []ai.Citation, error) {
+		ms, err := govSvc.ListMotions(ctx, oc, "")
+		if err != nil || len(ms) == 0 {
+			return "", nil, err
+		}
+		var b strings.Builder
+		var cs []ai.Citation
+		for i, m := range ms {
+			if i >= 10 {
+				break
+			}
+			fmt.Fprintf(&b, "motion %s: %s (%s)\n", m.ID, m.Title, m.State)
+			cs = append(cs, ai.Citation{Type: "motion", ID: uuid.UUID(m.ID.Bytes), Label: m.Title})
+		}
+		return b.String(), cs, nil
+	})
+	aiSvc.AddContextSource("org.finance.reports.read", func(ctx context.Context, oc *tenant.OrgCtx) (string, []ai.Citation, error) {
+		st, err := finSvc.Statement(ctx, oc)
+		if err != nil {
+			return "", nil, err
+		}
+		raw, _ := json.Marshal(st)
+		return "finance statement: " + string(raw), nil, nil
+	})
+	aiSvc.AddContextSource("org.activities.view", func(ctx context.Context, oc *tenant.OrgCtx) (string, []ai.Citation, error) {
+		list, err := actSvc.List(ctx, oc, "", "", uuid.Nil)
+		if err != nil || len(list) == 0 {
+			return "", nil, err
+		}
+		var b strings.Builder
+		var cs []ai.Citation
+		for i, a := range list {
+			if i >= 10 {
+				break
+			}
+			fmt.Fprintf(&b, "activity %s: %s (%s, %s)\n", a.ID, a.Title, a.Kind, a.Status)
+			cs = append(cs, ai.Citation{Type: "activity", ID: uuid.UUID(a.ID.Bytes), Label: a.Title})
+		}
+		return b.String(), cs, nil
+	})
+	aiSvc.AddContextSource("org.members.view", func(ctx context.Context, oc *tenant.OrgCtx) (string, []ai.Citation, error) {
+		ms, err := orgSvc.Members(ctx, oc, "", "", uuid.Nil)
+		if err != nil {
+			return "", nil, err
+		}
+		return fmt.Sprintf("member count: %d", len(ms)), nil, nil
+	})
+	aiH := handler.NewAIHandler(aiSvc, queue)
+	// §14/ADR-019: S3-compatible blob backend (SeaweedFS) when configured;
+	// local disk stays the default so self-hosted never needs it (Rule 29).
+	if cfg.S3Endpoint != "" {
+		commsSvc.SetStore(storage.NewS3(cfg.S3Endpoint, cfg.S3Bucket, cfg.S3AccessKey, cfg.S3SecretKey).WithImgproxy(cfg.ImgproxyURL))
+	} else {
+		commsSvc.SetStore(storage.New(cfg.UploadsDir))
+	}
 	commsSvc.SetLimitFn(entSvc.Limit)
 	commsSvc.SetUploadFallbackMB(cfg.UploadMaxMB)
 	// Rule-26 read seams — comms never reads activities/finance tables.
@@ -372,6 +661,8 @@ func main() {
 	}
 	oauthH := handler.NewOAuthHandler(authSvc, vk, providers, cfg.BaseURL, cfg.AppURL, queue, cfg.JWTSecret, orgSvc)
 	orgH := handler.NewOrgHandler(orgSvc, entSvc)
+	fieldsH := handler.NewFieldsHandler(orgSvc)
+	blogH := handler.NewBlogHandler(blog.NewService(pool), "https://"+cfg.BaseDomain) // platform blog lives on the marketing surface
 	finH := handler.NewFinanceHandler(finSvc, orgSvc)
 
 	// §06/§07 app framework + entitlements/billing
@@ -402,10 +693,23 @@ func main() {
 	// finance posts the debit ledger entry (Rule 12/19 outbox pattern).
 	dispatcher.Register("welfare_member_deceased", welSvc.MemberDeceasedConsumer)
 	dispatcher.Register("welfare_disbursement", finSvc.WelfareDisbursementConsumer)
+	// §16: term close (manual or sweep) generates the handover archive —
+	// deduped per term alongside the 14-day reminders window.
+	dispatcher.Register("governance_handover", govSvc.TermEndHandoverConsumer)
 	// §18: term close flags unreturned custody to the incoming EXCO;
 	// disposal sales post a credit ledger entry.
 	dispatcher.Register("assets_term_ended", astSvc.TermEndedConsumer)
 	dispatcher.Register("assets_disposal", finSvc.AssetDisposalConsumer)
+	dispatcher.Register("project_expense", finSvc.ProjectExpenseConsumer)
+	// ADR-019: search consumer (documents indexing); §27 volunteer cascade.
+	if searchSvc := search.New(cfg.MeilisearchURL, cfg.MeilisearchKey); searchSvc != nil {
+		if err := searchSvc.EnsureIndex(ctx); err != nil {
+			log.Printf("meilisearch index: %v", err)
+		}
+		dispatcher.Register("search", searchSvc.Consumer)
+	}
+	dispatcher.Register("volunteer_cancel", actSvc.ActivityCancelledConsumer)
+	dispatcher.Register("poll_survey_notify", commsSvc.PollSurveyNotifyConsumer)
 	mux.HandleFunc(events.TypeDispatchOutbox, dispatcher.ProcessTask)
 	if _, err := scheduler.Register(
 		"@every "+cfg.OutboxInterval.String(),
@@ -534,6 +838,11 @@ func main() {
 		// §23: org profile detail + locator join (JapaConnect intake),
 		// plus provider webhook endpoints (verify→persist→200, Rule 9).
 		r.With(middleware.RateLimit(vk, "directory", 60, time.Minute)).Get("/directory/orgs/{slug}", intH.OrgProfile)
+		r.With(middleware.RateLimit(vk, "directory", 60, time.Minute)).Get("/directory/resolve", intH.ResolveHost)
+		// §28 platform blog — public published reads + RSS
+		r.With(middleware.RateLimit(vk, "directory", 60, time.Minute)).Get("/blog/posts", blogH.Posts)
+		r.With(middleware.RateLimit(vk, "directory", 60, time.Minute)).Get("/blog/posts/{slug}", blogH.Post)
+		r.With(middleware.RateLimit(vk, "directory", 30, time.Minute)).Get("/blog/rss.xml", blogH.RSS)
 		r.With(middleware.RateLimit(vk, "directory_apply", 10, time.Minute)).Post("/directory/orgs/{slug}/join", intH.LocatorJoin)
 		r.With(middleware.RateLimit(vk, "webhook", 60, time.Minute)).Post("/webhooks/{provider}", intH.Webhook)
 
@@ -541,6 +850,13 @@ func main() {
 		// the signed material / HMAC signature is the credential (Rules 9/29).
 		r.With(middleware.RateLimit(vk, "license", 30, time.Minute)).Post("/license/validate", billH.ValidateLicense)
 		r.With(middleware.RateLimit(vk, "webhook", 300, time.Minute)).Post("/webhooks/billing/{provider}", billH.Webhook)
+
+		// §24 WS upgrade — outside the RequireAuth group: browser upgrades
+		// carry no headers, so the ticket-aware middleware resolves Bearer
+		// OR ?ticket= (single-use, minted by POST /ws/ticket above).
+		r.With(middleware.APIKeyAuth(intSvc),
+			middleware.RateLimit(vk, "ws", 30, time.Minute),
+			middleware.RequireAuthOrWSTicket(authSvc, vk, cfg.JWTSecret)).Get("/ws", wsGw.ServeWS)
 
 		// authed — session JWT or mfa_token both reach the mfa enrollment routes
 		r.Group(func(r chi.Router) {
@@ -575,6 +891,11 @@ func main() {
 			r.With(middleware.RequirePlatformNode(pool, "platform.tenants.manage")).Get("/platform/tenants/{tenant_id}/exports/{export_id}", platH.DownloadTenantExport)
 			r.With(middleware.RequirePlatformNode(pool, "platform.tenants.manage"), middleware.RateLimit(vk, "platform", 30, time.Minute)).Post("/platform/tenants", platH.CreateTenant)
 			r.With(middleware.RequirePlatformNode(pool, "platform.tenants.manage")).Get("/platform/provisions/{request_id}", platH.ProvisionStatus)
+			// §23 tenant-scoped api keys — control-plane issues keys for
+			// the tenant itself (user_id NULL on the row).
+			r.With(middleware.RequirePlatformNode(pool, "platform.tenants.manage")).Get("/platform/tenants/{tenant_id}/api-keys", intH.ListTenantKeys)
+			r.With(middleware.RequirePlatformNode(pool, "platform.tenants.manage")).Post("/platform/tenants/{tenant_id}/api-keys", intH.IssueTenantKey)
+			r.With(middleware.RequirePlatformNode(pool, "platform.tenants.manage")).Delete("/platform/tenants/{tenant_id}/api-keys/{key_id}", intH.RevokeTenantKey)
 			r.With(middleware.RequirePlatformNode(pool, "platform.tenants.manage")).Post("/platform/tenants/{tenant_id}/suspend", platH.SuspendTenant)
 			r.With(middleware.RequirePlatformNode(pool, "platform.tenants.manage")).Post("/platform/tenants/{tenant_id}/reinstate", platH.ReinstateTenant)
 			r.With(middleware.RequirePlatformNode(pool, "platform.subscriptions.manage")).Get("/platform/subscriptions", platH.Subscriptions)
@@ -593,6 +914,14 @@ func main() {
 			r.With(middleware.RequirePlatformNode(pool, "platform.analytics.view")).Get("/platform/usage", platH.Usage)
 			r.With(middleware.RequirePlatformNode(pool, "platform.analytics.view")).Get("/platform/metrics", handler.Metrics(cfg.ValkeyAddr, pool))
 			r.With(middleware.RequirePlatformNode(pool, "platform.ai.usage.view")).Get("/platform/ai/usage", aiH.TenantUsage)
+			// §28 platform blog — control-plane authored, platform.blog.manage node
+			r.With(middleware.RequirePlatformNode(pool, "platform.blog.manage")).Get("/platform/blog", blogH.AdminList)
+			r.With(middleware.RequirePlatformNode(pool, "platform.blog.manage")).Post("/platform/blog", blogH.AdminCreate)
+			r.With(middleware.RequirePlatformNode(pool, "platform.blog.manage")).Get("/platform/blog/{post_id}", blogH.AdminGet)
+			r.With(middleware.RequirePlatformNode(pool, "platform.blog.manage")).Patch("/platform/blog/{post_id}", blogH.AdminPatch)
+			r.With(middleware.RequirePlatformNode(pool, "platform.blog.manage")).Post("/platform/blog/{post_id}/publish", blogH.AdminPublish)
+			r.With(middleware.RequirePlatformNode(pool, "platform.blog.manage")).Post("/platform/blog/{post_id}/unpublish", blogH.AdminUnpublish)
+			r.With(middleware.RequirePlatformNode(pool, "platform.blog.manage")).Delete("/platform/blog/{post_id}", blogH.AdminDelete)
 			r.With(middleware.RequirePlatformNode(pool, "platform.flags.manage")).Get("/platform/flags", platH.Flags)
 			r.With(middleware.RequirePlatformNode(pool, "platform.flags.manage")).Post("/platform/flags/{key}", platH.SetFlag)
 			// §07 billing — tenant resolves server-side from the caller's
@@ -615,17 +944,20 @@ func main() {
 			r.Get("/me/finance", finH.MyFinance) // cross-org member view
 			r.Get("/me/claims", finH.MyClaims)
 			r.Get("/me/calendar", actH.MyCalendar)
+			r.Get("/me/volunteer-signups", actH.MyVolunteerSignups)
 			r.Get("/me/action-items", actH.MyItems)
 			r.Get("/me/notifications", commsH.MyNotifications)
-			r.Get("/me/welfare", welH.MyCases)   // §17 member's own cases
-			r.Get("/me/analytics", anaH.Me)      // §19 member analytics
-			r.Get("/me/api-keys", intH.ListKeys) // §23 api keys
+			r.Get("/me/welfare", welH.MyCases)    // §17 member's own cases
+			r.Get("/me/discipline", govH.MyCases) // §16 member's own discipline cases
+			r.Get("/me/analytics", anaH.Me)       // §19 member analytics
+			r.Get("/me/api-keys", intH.ListKeys)  // §23 api keys
 			r.Post("/me/api-keys", intH.IssueKey)
 			r.Delete("/me/api-keys/{key_id}", intH.RevokeKey)
 			r.Get("/me/ai/usage", aiH.MyUsage) // §22 usage meter
 			r.Post("/me/notifications/{notification_id}/read", commsH.ReadNotification)
 			r.Get("/me/preferences", commsH.GetPrefs)
-			r.With(middleware.RateLimit(vk, "ws", 30, time.Minute)).Get("/ws", wsGw.ServeWS)
+			r.With(middleware.RateLimit(vk, "ws_ticket", 10, time.Minute)).Post("/ws/ticket", wsGw.Ticket)
+
 			r.Patch("/me/preferences", commsH.SetPrefs)
 			r.Get("/org-templates", orgH.Templates)
 			r.Post("/orgs", orgH.Create)
@@ -639,9 +971,20 @@ func main() {
 			r.Group(func(r chi.Router) {
 				r.Use(middleware.RequireOrgCtx(orgSvc))
 				r.With(middleware.RequireOrgPermission(orgSvc, "org.members.view")).Get("/orgs/{org_id}", orgH.Get)
+				r.Get("/orgs/{org_id}/me", orgH.Me)
 				r.With(middleware.RequireOrgPermission(orgSvc, "org.admin.settings")).Patch("/orgs/{org_id}", orgH.Patch)
 				r.With(middleware.RequireOrgPermission(orgSvc, "org.members.view")).Get("/orgs/{org_id}/structure", orgH.Structure)
 				r.With(middleware.RequireOrgPermission(orgSvc, "org.members.view")).Get("/orgs/{org_id}/units", orgH.Units)
+				r.With(middleware.RequireOrgPermission(orgSvc, "org.members.view")).Get("/orgs/{org_id}/fields/groups", fieldsH.Groups)
+				r.With(middleware.RequireOrgPermission(orgSvc, "org.fields.manage")).Post("/orgs/{org_id}/fields/groups", fieldsH.CreateGroup)
+				r.With(middleware.RequireOrgPermission(orgSvc, "org.fields.manage")).Patch("/orgs/{org_id}/fields/groups/{group_id}", fieldsH.PatchGroup)
+				r.With(middleware.RequireOrgPermission(orgSvc, "org.fields.manage")).Delete("/orgs/{org_id}/fields/groups/{group_id}", fieldsH.DeleteGroup)
+				r.With(middleware.RequireOrgPermission(orgSvc, "org.members.view")).Get("/orgs/{org_id}/fields", fieldsH.Fields)
+				r.With(middleware.RequireOrgPermission(orgSvc, "org.fields.manage")).Post("/orgs/{org_id}/fields", fieldsH.CreateField)
+				r.With(middleware.RequireOrgPermission(orgSvc, "org.fields.manage")).Patch("/orgs/{org_id}/fields/{field_id}", fieldsH.PatchField)
+				r.With(middleware.RequireOrgPermission(orgSvc, "org.fields.manage")).Delete("/orgs/{org_id}/fields/{field_id}", fieldsH.DeleteField)
+				r.With(middleware.RequireOrgPermission(orgSvc, "org.members.view")).Get("/orgs/{org_id}/fields/schema", fieldsH.Schema)
+				r.Patch("/orgs/{org_id}/fields/values", fieldsH.SetValues) // entity-scoped — inside
 				r.With(middleware.RequireOrgPermission(orgSvc, "org.structure.manage")).Post("/orgs/{org_id}/units", orgH.CreateUnit)
 				r.With(middleware.RequireOrgPermission(orgSvc, "org.structure.manage")).Patch("/orgs/{org_id}/units/{unit_id}", orgH.UpdateUnit)
 				r.With(middleware.RequireOrgPermission(orgSvc, "org.structure.manage")).Delete("/orgs/{org_id}/units/{unit_id}", orgH.ArchiveUnit)
@@ -654,17 +997,23 @@ func main() {
 				r.With(middleware.RequireOrgPermission(orgSvc, "org.admin.settings")).Get("/orgs/{org_id}/apps", appsH.OrgApps)
 				r.With(middleware.RequireOrgPermission(orgSvc, "org.admin.settings")).Post("/orgs/{org_id}/apps/{app_id}", appsH.Activate)
 				r.With(middleware.RequireOrgPermission(orgSvc, "org.admin.settings")).Delete("/orgs/{org_id}/apps/{app_id}", appsH.Deactivate)
-				r.With(middleware.RequireOrgPermission(orgSvc, "org.members.view")).Get("/orgs/{org_id}/positions", orgH.ListPositions)
-				r.With(middleware.RequireOrgPermission(orgSvc, "org.members.view")).Get("/orgs/{org_id}/terms", orgH.ListTerms)
-				r.With(middleware.RequireOrgPermission(orgSvc, "org.members.view")).Get("/orgs/{org_id}/appointments", orgH.ListAppointments)
-				r.With(middleware.RequireOrgPermission(orgSvc, "org.members.view")).Get("/orgs/{org_id}/units/{unit_id}/members", orgH.ListMembers)
-				r.With(middleware.RequireOrgPermission(orgSvc, "org.governance.positions.manage")).Post("/orgs/{org_id}/positions", orgH.CreatePosition)
-				r.With(middleware.RequireOrgPermission(orgSvc, "org.governance.terms.manage")).Post("/orgs/{org_id}/terms", orgH.CreateTerm)
-				r.With(middleware.RequireOrgPermission(orgSvc, "org.governance.terms.manage")).Post("/orgs/{org_id}/terms/{term_id}/close", orgH.CloseTerm)
-				r.With(middleware.RequireOrgPermission(orgSvc, "org.governance.appointments.manage")).Post("/orgs/{org_id}/appointments", orgH.Appoint)
-				r.With(middleware.RequireOrgPermission(orgSvc, "org.governance.appointments.manage")).Delete("/orgs/{org_id}/appointments/{appointment_id}", orgH.EndAppointment)
-				r.With(middleware.RequireOrgPermission(orgSvc, "org.governance.committees.manage")).Post("/orgs/{org_id}/units/{unit_id}/members", orgH.AddCommitteeMember)
-				r.With(middleware.RequireOrgPermission(orgSvc, "org.governance.committees.manage")).Delete("/orgs/{org_id}/units/{unit_id}/members/{cm_id}", orgH.RemoveCommitteeMember)
+				// §16 API table: governance reads gate on org.governance.view.
+				r.With(middleware.RequireOrgPermission(orgSvc, "org.governance.view")).Get("/orgs/{org_id}/positions", orgH.ListPositions)
+				r.With(middleware.RequireOrgPermission(orgSvc, "org.governance.view")).Get("/orgs/{org_id}/terms", orgH.ListTerms)
+				r.With(middleware.RequireOrgPermission(orgSvc, "org.governance.view")).Get("/orgs/{org_id}/appointments", orgH.ListAppointments)
+				r.With(middleware.RequireOrgPermission(orgSvc, "org.governance.view")).Get("/orgs/{org_id}/units/{unit_id}/members", orgH.ListMembers)
+				// §16: positions/terms/appointments/committee roster are
+				// governance-app surfaces — gated like the rest of §16.
+				r.Group(func(r chi.Router) {
+					r.Use(middleware.RequireAppActive(orgSvc, "governance"))
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.governance.positions.manage")).Post("/orgs/{org_id}/positions", orgH.CreatePosition)
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.governance.terms.manage")).Post("/orgs/{org_id}/terms", orgH.CreateTerm)
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.governance.terms.manage")).Post("/orgs/{org_id}/terms/{term_id}/close", orgH.CloseTerm)
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.governance.appointments.manage")).Post("/orgs/{org_id}/appointments", orgH.Appoint)
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.governance.appointments.manage")).Delete("/orgs/{org_id}/appointments/{appointment_id}", orgH.EndAppointment)
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.governance.committees.manage")).Post("/orgs/{org_id}/units/{unit_id}/members", orgH.AddCommitteeMember)
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.governance.committees.manage")).Delete("/orgs/{org_id}/units/{unit_id}/members/{cm_id}", orgH.RemoveCommitteeMember)
+				})
 
 				// §16 governance — gated on the `governance` app (§06).
 				// Motions → resolutions, constitution versions, committee
@@ -681,6 +1030,22 @@ func main() {
 					r.With(middleware.RequireOrgPermission(orgSvc, "org.governance.committees.manage")).Put("/orgs/{org_id}/units/{unit_id}/mandate", govH.UpsertMandate)
 					r.With(middleware.RequireOrgPermission(orgSvc, "org.governance.view")).Get("/orgs/{org_id}/mandates", govH.ListMandates)
 					r.With(middleware.RequireOrgPermission(orgSvc, "org.governance.view")).Get("/orgs/{org_id}/handover", govH.Handover)
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.governance.terms.manage")).Post("/orgs/{org_id}/handover/{term_id}/complete", govH.CompleteHandover)
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.governance.resolutions.record")).Post("/orgs/{org_id}/motions/{motion_id}/debate", govH.DebateMotion)
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.governance.resolutions.record")).Post("/orgs/{org_id}/motions/{motion_id}/withdraw", govH.WithdrawMotion)
+					// §16 discipline casework — investigation → hearing →
+					// resolution → appeal → sanction.
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.discipline.view")).Get("/orgs/{org_id}/discipline/cases", govH.ListCases)
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.discipline.manage")).Post("/orgs/{org_id}/discipline/cases", govH.OpenCase)
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.discipline.view")).Get("/orgs/{org_id}/discipline/cases/{case_id}", govH.GetCase)
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.discipline.manage")).Patch("/orgs/{org_id}/discipline/cases/{case_id}", govH.AdvanceCase)
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.discipline.view")).Get("/orgs/{org_id}/discipline/cases/{case_id}/hearings", govH.ListHearings)
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.discipline.hear")).Post("/orgs/{org_id}/discipline/cases/{case_id}/hearings", govH.ScheduleHearing)
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.discipline.hear")).Post("/orgs/{org_id}/discipline/cases/{case_id}/hearings/{hearing_id}/complete", govH.CompleteHearing)
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.discipline.view")).Get("/orgs/{org_id}/discipline/cases/{case_id}/appeals", govH.ListAppeals)
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.discipline.hear")).Post("/orgs/{org_id}/discipline/cases/{case_id}/resolve", govH.ResolveCase)
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.discipline.appeal_own")).Post("/orgs/{org_id}/discipline/cases/{case_id}/appeals", govH.FileAppeal)
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.discipline.hear")).Post("/orgs/{org_id}/discipline/appeals/{appeal_id}/decide", govH.DecideAppeal)
 				})
 
 				// §17 welfare — cases, approvals, disbursement, visits.
@@ -708,7 +1073,7 @@ func main() {
 					r.With(middleware.RequireOrgPermission(orgSvc, "org.analytics.view")).Get("/orgs/{org_id}/analytics/health", anaH.Health)
 					r.With(middleware.RequireOrgPermission(orgSvc, "org.analytics.view")).Get("/orgs/{org_id}/reports", anaH.ListReports)
 					r.With(middleware.RequireOrgPermission(orgSvc, "org.analytics.reports.generate")).Post("/orgs/{org_id}/reports", anaH.RunReport)
-					r.With(middleware.RequireOrgPermission(orgSvc, "org.analytics.view")).Get("/orgs/{org_id}/reports/{report_id}/download", anaH.DownloadReport)
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.analytics.export")).Get("/orgs/{org_id}/reports/{report_id}/download", anaH.DownloadReport)
 					r.With(middleware.RequireOrgPermission(orgSvc, "org.analytics.consolidated")).Get("/orgs/{org_id}/analytics/consolidated", anaH.Consolidated)
 				})
 
@@ -737,7 +1102,7 @@ func main() {
 					r.With(middleware.RequireOrgPermission(orgSvc, "org.projects.propose")).Post("/orgs/{org_id}/projects", prjH.Propose)
 					r.With(middleware.RequireOrgPermission(orgSvc, "org.projects.view")).Get("/orgs/{org_id}/projects/{project_id}", prjH.Get)
 					r.With(middleware.RequireOrgPermission(orgSvc, "org.projects.manage")).Post("/orgs/{org_id}/projects/{project_id}/transition", prjH.Transition)
-					r.With(middleware.RequireOrgPermission(orgSvc, "org.projects.approve")).Post("/orgs/{org_id}/projects/{project_id}/approve", prjH.Transition)
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.projects.approve")).Post("/orgs/{org_id}/projects/{project_id}/approve", prjH.Approve)
 					r.With(middleware.RequireOrgPermission(orgSvc, "org.projects.view")).Get("/orgs/{org_id}/projects/{project_id}/milestones", prjH.ListMilestones)
 					r.With(middleware.RequireOrgPermission(orgSvc, "org.projects.manage")).Post("/orgs/{org_id}/projects/{project_id}/milestones", prjH.AddMilestone)
 					r.With(middleware.RequireOrgPermission(orgSvc, "org.projects.manage")).Post("/orgs/{org_id}/projects/{project_id}/milestones/{milestone_id}/complete", prjH.CompleteMilestone)
@@ -746,6 +1111,9 @@ func main() {
 					r.With(middleware.RequireOrgPermission(orgSvc, "org.vendors.manage")).Get("/orgs/{org_id}/vendors", prjH.ListVendors)
 					r.With(middleware.RequireOrgPermission(orgSvc, "org.vendors.manage")).Post("/orgs/{org_id}/vendors", prjH.AddVendor)
 					r.With(middleware.RequireOrgPermission(orgSvc, "org.projects.manage")).Post("/orgs/{org_id}/projects/{project_id}/donors", prjH.RecordDonor)
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.projects.manage")).Post("/orgs/{org_id}/projects/{project_id}/spend", prjH.RecordSpend)
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.projects.manage")).Post("/orgs/{org_id}/projects/{project_id}/budget", prjH.SetBudget)
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.projects.view")).Get("/orgs/{org_id}/projects/{project_id}/budget", prjH.GetBudget)
 					r.With(middleware.RequireOrgPermission(orgSvc, "org.projects.view")).Get("/orgs/{org_id}/projects/{project_id}/graph", prjH.Graph)
 					r.With(middleware.RequireOrgPermission(orgSvc, "org.projects.manage")).Post("/orgs/{org_id}/projects/{project_id}/close", prjH.Close)
 				})
@@ -843,6 +1211,24 @@ func main() {
 					r.With(middleware.RequireOrgPermission(orgSvc, "org.finance.claims.review")).Get("/orgs/{org_id}/finance/claims", finH.Claims)
 					r.With(middleware.RequireOrgPermission(orgSvc, "org.finance.claims.review")).Post("/orgs/{org_id}/finance/claims/{claim_id}/confirm", finH.ConfirmClaim)
 					r.With(middleware.RequireOrgPermission(orgSvc, "org.finance.claims.review")).Post("/orgs/{org_id}/finance/claims/{claim_id}/reject", finH.RejectClaim)
+					// §25 finance full — budgets, expenses, invoices.
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.finance.reports.read")).Get("/orgs/{org_id}/finance/budgets", finH.Budgets)
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.finance.budgets.manage")).Post("/orgs/{org_id}/finance/budgets", finH.CreateBudget)
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.finance.reports.read")).Get("/orgs/{org_id}/finance/budgets/{budget_id}", finH.GetBudget)
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.finance.budgets.manage")).Patch("/orgs/{org_id}/finance/budgets/{budget_id}", finH.PatchBudget)
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.finance.budgets.manage")).Post("/orgs/{org_id}/finance/budgets/{budget_id}/adopt", finH.AdoptBudget)
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.finance.budgets.manage")).Post("/orgs/{org_id}/finance/budgets/{budget_id}/close", finH.CloseBudget)
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.finance.reports.read")).Get("/orgs/{org_id}/finance/budgets/{budget_id}/vs-actual", finH.VsActual)
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.finance.reports.read")).Get("/orgs/{org_id}/finance/expenses", finH.Expenses)
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.finance.expenses.request")).Post("/orgs/{org_id}/finance/expenses", finH.RequestExpense)
+					r.Get("/orgs/{org_id}/finance/expenses/{expense_id}", finH.GetExpense)
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.finance.expenses.approve")).Post("/orgs/{org_id}/finance/expenses/{expense_id}/approve", finH.ApproveExpense)
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.finance.expenses.approve")).Post("/orgs/{org_id}/finance/expenses/{expense_id}/reject", finH.RejectExpense)
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.finance.expenses.disburse")).Post("/orgs/{org_id}/finance/expenses/{expense_id}/disburse", finH.DisburseExpense)
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.finance.reports.read")).Get("/orgs/{org_id}/finance/invoices", finH.Invoices)
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.finance.invoices.manage")).Post("/orgs/{org_id}/finance/invoices", finH.CreateInvoice)
+					r.Get("/orgs/{org_id}/finance/invoices/{invoice_id}", finH.GetInvoice)
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.finance.invoices.manage")).Post("/orgs/{org_id}/finance/invoices/{invoice_id}/void", finH.VoidInvoice)
 				})
 
 				// §13 events & meetings — meetings are governance, events are
@@ -873,6 +1259,16 @@ func main() {
 					r.With(middleware.RequireOrgPermission(orgSvc, "org.activities.view")).Get("/orgs/{org_id}/calendar", actH.Calendar)
 					r.With(middleware.RequireOrgPermission(orgSvc, "org.activities.view")).Get("/orgs/{org_id}/recurrences", actH.Recurrences)
 					r.With(middleware.RequireOrgPermission(orgSvc, "org.meetings.manage")).Post("/orgs/{org_id}/recurrences", actH.CreateRecurrence)
+					// §27 volunteers — roles on activities + signup lifecycle.
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.volunteers.view")).Get("/orgs/{org_id}/activities/{activity_id}/volunteer-roles", actH.VolunteerRoles)
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.volunteers.manage")).Post("/orgs/{org_id}/activities/{activity_id}/volunteer-roles", actH.CreateVolunteerRole)
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.volunteers.manage")).Patch("/orgs/{org_id}/activities/{activity_id}/volunteer-roles/{role_id}", actH.PatchVolunteerRole)
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.volunteers.manage")).Delete("/orgs/{org_id}/activities/{activity_id}/volunteer-roles/{role_id}", actH.DeleteVolunteerRole)
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.volunteers.signup_own")).Post("/orgs/{org_id}/activities/{activity_id}/volunteer-roles/{role_id}/signup", actH.VolunteerSignup)
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.volunteers.signup_own")).Delete("/orgs/{org_id}/activities/{activity_id}/volunteer-signups/{signup_id}", actH.WithdrawSignup)
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.volunteers.manage")).Post("/orgs/{org_id}/activities/{activity_id}/volunteer-signups/{signup_id}/confirm", actH.ConfirmSignup)
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.volunteers.manage")).Post("/orgs/{org_id}/activities/{activity_id}/volunteer-signups/{signup_id}/mark", actH.MarkSignup)
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.volunteers.view")).Get("/orgs/{org_id}/activities/{activity_id}/volunteer-roster", actH.VolunteerRoster)
 				})
 
 				// §14 comms & documents — announcements gated on the app.
@@ -901,11 +1297,35 @@ func main() {
 					r.With(middleware.RequireOrgPermission(orgSvc, "org.chat.use")).Delete("/orgs/{org_id}/channels/{channel_id}/messages/{message_id}", chatH.DeleteMessage)
 					r.With(middleware.RequireOrgPermission(orgSvc, "org.chat.use")).Post("/orgs/{org_id}/channels/{channel_id}/read", chatH.MarkRead)
 					r.With(middleware.RequireOrgPermission(orgSvc, "org.chat.use")).Post("/orgs/{org_id}/channels/{channel_id}/mute", chatH.Mute)
+					// §26 polls & surveys — consultative member voice.
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.comms.view")).Get("/orgs/{org_id}/polls", commsH.Polls)
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.comms.polls.manage")).Post("/orgs/{org_id}/polls", commsH.CreatePoll)
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.comms.view")).Get("/orgs/{org_id}/polls/{poll_id}", commsH.GetPoll)
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.comms.polls.manage")).Post("/orgs/{org_id}/polls/{poll_id}/open", commsH.OpenPoll)
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.comms.polls.vote_own")).Post("/orgs/{org_id}/polls/{poll_id}/vote", commsH.Vote)
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.comms.polls.manage")).Post("/orgs/{org_id}/polls/{poll_id}/close", commsH.ClosePoll)
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.comms.polls.manage")).Get("/orgs/{org_id}/polls/{poll_id}/results", commsH.PollResults)
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.comms.view")).Get("/orgs/{org_id}/surveys", commsH.Surveys)
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.comms.surveys.manage")).Post("/orgs/{org_id}/surveys", commsH.CreateSurvey)
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.comms.view")).Get("/orgs/{org_id}/surveys/{survey_id}", commsH.GetSurvey)
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.comms.surveys.manage")).Post("/orgs/{org_id}/surveys/{survey_id}/open", commsH.OpenSurvey)
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.comms.surveys.respond_own")).Post("/orgs/{org_id}/surveys/{survey_id}/respond", commsH.Respond)
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.comms.surveys.manage")).Post("/orgs/{org_id}/surveys/{survey_id}/close", commsH.CloseSurvey)
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.comms.surveys.manage")).Get("/orgs/{org_id}/surveys/{survey_id}/results", commsH.SurveyResults)
+				})
+
+				// §24 voice rooms — staged app: gated on `voice-rooms`
+				// (its requires:[comms_documents] resolves via the §06 app
+				// dependency graph on activation).
+				r.Group(func(r chi.Router) {
+					r.Use(middleware.RequireAppActive(orgSvc, "voice-rooms"))
 					r.With(middleware.RequireOrgPermission(orgSvc, "org.chat.use")).Get("/orgs/{org_id}/voice-rooms", chatH.LiveRooms)
 					r.With(middleware.RequireOrgPermission(orgSvc, "org.voice.start")).Post("/orgs/{org_id}/voice-rooms", chatH.StartRoom)
 					r.With(middleware.RequireOrgPermission(orgSvc, "org.voice.join")).Post("/orgs/{org_id}/voice-rooms/{room_id}/join", chatH.JoinRoom)
 					r.With(middleware.RequireOrgPermission(orgSvc, "org.voice.join")).Post("/orgs/{org_id}/voice-rooms/{room_id}/leave", chatH.LeaveRoom)
-					r.With(middleware.RequireOrgPermission(orgSvc, "org.chat.use")).Post("/orgs/{org_id}/voice-rooms/{room_id}/end", chatH.EndRoom)
+					// end = room starter or moderator — the starter check
+					// is inside EndRoom; the route admits plausible actors.
+					r.With(middleware.RequireAnyOrgPermission(orgSvc, "org.voice.start", "org.chat.moderate")).Post("/orgs/{org_id}/voice-rooms/{room_id}/end", chatH.EndRoom)
 				})
 			})
 		})

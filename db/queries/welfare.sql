@@ -80,10 +80,14 @@ ON CONFLICT DO NOTHING;
 
 -- name: CompleteVisit :execrows
 UPDATE welfare_visits SET completed_at = now(), report = $2
-WHERE id = $1 AND completed_at IS NULL;
+WHERE id = $1 AND case_id = $3 AND completed_at IS NULL;
 
 -- name: ListVisits :many
 SELECT * FROM welfare_visits WHERE case_id = $1 ORDER BY scheduled_at;
+
+-- name: AutoSuggestedCaseExists :one
+SELECT EXISTS(SELECT 1 FROM welfare_cases
+  WHERE membership_id = $1 AND kind = 'bereavement' AND auto_suggested);
 
 -- name: AddBenefit :one
 INSERT INTO welfare_benefits (case_id, kind, amount_minor, currency, disbursed_at)
@@ -105,3 +109,24 @@ ORDER BY key;
 SELECT kind, count(*)::bigint AS n FROM welfare_cases
 WHERE organization_id = sqlc.arg(org_id)::uuid
 GROUP BY kind ORDER BY n DESC;
+
+-- name: SetBenefitPaymentRef :exec
+-- Link the posted finance ledger entry back onto the benefit (payment_id
+-- is an unconstrained uuid pointer -> finance; ledger id is the link).
+UPDATE welfare_benefits SET payment_id = $2 WHERE id = $1 AND payment_id IS NULL;
+
+-- name: PendingBenefitForCase :one
+SELECT * FROM welfare_benefits WHERE case_id = $1 AND disbursed_at IS NULL
+ORDER BY id LIMIT 1;
+
+-- name: MarkBenefitDisbursed :execrows
+UPDATE welfare_benefits SET kind = $2, amount_minor = sqlc.narg(amount_minor),
+  currency = sqlc.narg(currency), disbursed_at = now()
+WHERE id = $1 AND disbursed_at IS NULL;
+
+-- name: AddPendingBenefit :one
+-- §17 approve-time expense request: pending until MarkBenefitDisbursed.
+INSERT INTO welfare_benefits (case_id, kind, amount_minor, currency)
+VALUES (sqlc.arg(case_id)::uuid, sqlc.arg(kind), sqlc.narg(amount_minor),
+  sqlc.narg(currency))
+RETURNING id;

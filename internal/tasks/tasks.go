@@ -94,8 +94,13 @@ const (
 	// first). Catalog-reserved stub so an early enqueue fails visibly.
 	TypePaymentsProviderWebhook = "payments:provider_webhook"
 	TypeGenRecurrences          = "activities:generate_recurrences"
-	TypeRemindUpcoming          = "activities:remind_upcoming"
-	TypeOverdueItems            = "activities:overdue_action_items"
+	// §26/§27 + Rule 11
+	TypeCloseDuePolls   = "comms:close_due_polls"
+	TypeCloseDueSurveys = "comms:close_due_surveys"
+	TypeVolunteerRemind = "activities:volunteer_remind"
+	TypeDataErasure     = "platform:data_erasure"
+	TypeRemindUpcoming  = "activities:remind_upcoming"
+	TypeOverdueItems    = "activities:overdue_action_items"
 )
 
 type SendEmailPayload struct {
@@ -322,6 +327,32 @@ func RegisterSweeps(d Deps) {
 	OnTick(func(ctx context.Context) error {
 		return presenceScan(d.Valkey)(ctx)
 	})
+	// §26 poll/survey auto-close (per-tick, cheap scans) + §27 volunteer
+	// reminders + Rule-11 erasure purge (daily).
+	OnTick(func(ctx context.Context) error {
+		if d.Comms == nil {
+			return nil
+		}
+		if _, err := d.Comms.CloseDuePolls(ctx); err != nil {
+			return err
+		}
+		_, err := d.Comms.CloseDueSurveys(ctx)
+		return err
+	})
+	OnTick(func(ctx context.Context) error {
+		if d.Activities == nil || d.Comms == nil {
+			return nil
+		}
+		_, err := d.Activities.VolunteerRemind(ctx, d.Comms.NotifyOnce)
+		return err
+	})
+	OnTick(dailyGate(d.Valkey, "data_erasure", func(ctx context.Context) error {
+		if d.Platform == nil {
+			return nil
+		}
+		_, err := d.Platform.PurgeExpired(ctx, d.Platform.ErasureGraceDays(ctx))
+		return err
+	}))
 	// member_imports rows are the durable work record — an enqueue that
 	// died leaves the row stranded at 'processing', so the sweep
 	// re-drives it (webhook stale-redrive parity).
@@ -453,6 +484,46 @@ func Handlers(d Deps) map[string]asynq.HandlerFunc {
 		TypeTenantProvision:         tenantProvision(d.Platform),
 		TypeTenantExport:            tenantExport(d.Platform),
 		TypePaymentsProviderWebhook: stub(TypePaymentsProviderWebhook, "payment gateways (ADR-012)"),
+		// §26/§27 sweeps + Rule-11 erasure.
+		TypeCloseDuePolls: func(ctx context.Context, t *asynq.Task) error {
+			if d.Comms == nil {
+				return nil
+			}
+			_, e := d.Comms.CloseDuePolls(ctx)
+			return e
+		},
+		TypeCloseDueSurveys: func(ctx context.Context, t *asynq.Task) error {
+			if d.Comms == nil {
+				return nil
+			}
+			_, e := d.Comms.CloseDueSurveys(ctx)
+			return e
+		},
+		TypeVolunteerRemind: func(ctx context.Context, t *asynq.Task) error {
+			if d.Activities == nil || d.Comms == nil {
+				return nil
+			}
+			_, e := d.Activities.VolunteerRemind(ctx, d.Comms.NotifyOnce)
+			return e
+		},
+		TypeDataErasure: func(ctx context.Context, t *asynq.Task) error {
+			if d.Platform == nil {
+				return nil
+			}
+			var p struct {
+				UserID string `json:"user_id"`
+			}
+			_ = json.Unmarshal(t.Payload(), &p)
+			if p.UserID != "" {
+				uid, err := uuid.Parse(p.UserID)
+				if err != nil {
+					return nil
+				}
+				return d.Platform.EraseUser(ctx, uid)
+			}
+			_, err := d.Platform.PurgeExpired(ctx, d.Platform.ErasureGraceDays(ctx))
+			return err
+		},
 	}
 }
 
@@ -1336,10 +1407,11 @@ func aiDraft(svc *ai.Service) asynq.HandlerFunc {
 			return nil
 		}
 		var p struct {
-			OrgID  string `json:"org_id"`
-			UserID string `json:"user_id"`
-			Kind   string `json:"kind"`
-			Prompt string `json:"prompt"`
+			OrgID    string `json:"org_id"`
+			UserID   string `json:"user_id"`
+			Kind     string `json:"kind"`
+			Prompt   string `json:"prompt"`
+			TargetID string `json:"target_id"`
 		}
 		if err := json.Unmarshal(t.Payload(), &p); err != nil {
 			return err
@@ -1348,7 +1420,8 @@ func aiDraft(svc *ai.Service) asynq.HandlerFunc {
 		if err != nil {
 			return err
 		}
-		_, err = svc.Draft(ctx, oc, p.Kind, p.Prompt)
+		tid, _ := uuid.Parse(p.TargetID)
+		_, err = svc.Draft(ctx, oc, p.Kind, p.Prompt, tid)
 		return err
 	}
 }

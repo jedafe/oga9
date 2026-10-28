@@ -21,6 +21,7 @@ import (
 
 	"github.com/jedafe/oga9/internal/db"
 	"github.com/jedafe/oga9/internal/events"
+	"github.com/jedafe/oga9/internal/rules"
 	"github.com/jedafe/oga9/internal/tenant"
 )
 
@@ -35,6 +36,7 @@ var (
 )
 
 type Service struct {
+	ru   *rules.Service // ADR-016 rules engine — org_settings resolve through it (Rule 23)
 	pool *pgxpool.Pool
 	q    *db.Queries
 	// fineHook posts a penalty obligation in finance (Rule 26: activities
@@ -45,7 +47,9 @@ type Service struct {
 	fineRevokeFn func(ctx context.Context, orgID, memberID uuid.UUID, period string)
 }
 
-func NewService(pool *pgxpool.Pool) *Service { return &Service{pool: pool, q: db.New(pool)} }
+func NewService(pool *pgxpool.Pool) *Service {
+	return &Service{ru: rules.New(pool), pool: pool, q: db.New(pool)}
+}
 
 // SetFineHook wires the finance fine-assessment seam.
 func (s *Service) SetFineHook(fn func(ctx context.Context, orgID, memberID uuid.UUID, amount int64, currency, period string)) {
@@ -84,8 +88,20 @@ func (s *Service) withTx(ctx context.Context, fn func(*db.Queries) error) error 
 	return tx.Commit(ctx)
 }
 
+func (s *Service) orgSettingBool(ctx context.Context, orgID uuid.UUID, key string, fallback bool) bool {
+	raw, err := s.ru.Value(ctx, orgID, key)
+	if err != nil {
+		return fallback
+	}
+	var b bool
+	if json.Unmarshal(raw, &b) != nil {
+		return fallback
+	}
+	return b
+}
+
 func (s *Service) orgSettingInt(ctx context.Context, orgID uuid.UUID, key string, fallback int64) int64 {
-	raw, err := s.q.GetOrgSetting(ctx, db.GetOrgSettingParams{OrganizationID: toPg(orgID), Key: key})
+	raw, err := s.ru.Value(ctx, orgID, key)
 	if err != nil {
 		return fallback
 	}
@@ -541,8 +557,7 @@ func (s *Service) fineAssess(orgID uuid.UUID, marks []MarkIn, aid uuid.UUID, lat
 		return
 	}
 	cur := "NGN"
-	if raw, err := s.q.GetOrgSetting(context.Background(),
-		db.GetOrgSettingParams{OrganizationID: toPg(orgID), Key: "org.dues.currency"}); err == nil {
+	if raw, err := s.ru.Value(context.Background(), orgID, "org.dues.currency"); err == nil {
 		var c string
 		if json.Unmarshal(raw, &c) == nil && c != "" {
 			cur = c
@@ -1073,4 +1088,11 @@ func expandRRule(rrule string, anchor, after, horizon time.Time, existing int) [
 		}
 	}
 	return out
+}
+
+// OpenActionItemsForOrg — §16 handover section: every still-open item
+// across the org's activities (the governance module consumes this via
+// its handover-section seam, Rule 26).
+func (s *Service) OpenActionItemsForOrg(ctx context.Context, oc *tenant.OrgCtx) ([]db.ActionItems, error) {
+	return s.q.OpenActionItemsForOrg(ctx, toPg(oc.OrgID))
 }

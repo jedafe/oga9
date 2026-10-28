@@ -55,7 +55,7 @@ func TestDashboardServe(t *testing.T) {
 	ctx := context.Background()
 	oc := mkOrg(t, svc.pool)
 
-	raw, err := svc.Dashboard(ctx, oc, "member")
+	raw, err := svc.Dashboard(ctx, oc)
 	if err != nil {
 		t.Fatal(err)
 	}

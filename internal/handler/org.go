@@ -140,10 +140,12 @@ func (h *OrgHandler) Get(w http.ResponseWriter, r *http.Request) {
 
 func (h *OrgHandler) Patch(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Name           string `json:"name"`
-		Country        string `json:"country"`
-		City           string `json:"city"`
-		IsPublicListed bool   `json:"is_public_listed"`
+		Name           string  `json:"name"`
+		Country        string  `json:"country"`
+		City           string  `json:"city"`
+		IsPublicListed bool    `json:"is_public_listed"`
+		Description    *string `json:"description"`
+		CustomDomain   *string `json:"custom_domain"`
 	}
 	if err := httpx.Decode(w, r, &req); err != nil || req.Name == "" {
 		httpx.WriteErr(w, 400, "validation_failed", "name required")
@@ -153,6 +155,18 @@ func (h *OrgHandler) Patch(w http.ResponseWriter, r *http.Request) {
 		req.Name, req.Country, req.City, req.IsPublicListed); err != nil {
 		orgErr(w, err)
 		return
+	}
+	if req.Description != nil {
+		if err := h.svc.SetOrgDescription(r.Context(), middleware.OrgCtx(r.Context()), *req.Description); err != nil {
+			orgErr(w, err)
+			return
+		}
+	}
+	if req.CustomDomain != nil {
+		if err := h.svc.SetCustomDomain(r.Context(), middleware.OrgCtx(r.Context()), *req.CustomDomain); err != nil {
+			orgErr(w, err)
+			return
+		}
 	}
 	httpx.WriteData(w, 200, map[string]any{"updated": true})
 }
@@ -531,4 +545,17 @@ func (h *OrgHandler) RemoveCommitteeMember(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	httpx.WriteData(w, 200, map[string]any{"removed": true})
+}
+
+// Me — GET /orgs/{id}/me: the caller's org-scoped access profile —
+// membership, effective permission nodes (incl. _branch/_committee forms)
+// and active apps. The frontend gates nav and actions on this; it never
+// checks position names (Rule 20) nor probes endpoints for 403s.
+func (h *OrgHandler) Me(w http.ResponseWriter, r *http.Request) {
+	out, err := h.svc.MyOrgAccess(r.Context(), middleware.OrgCtx(r.Context()))
+	if err != nil {
+		orgErr(w, err)
+		return
+	}
+	httpx.WriteData(w, 200, out)
 }

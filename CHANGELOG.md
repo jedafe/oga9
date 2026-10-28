@@ -3,6 +3,108 @@
 All notable changes to the OGA9 platform. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 entries reference engineering phases in `.oos/roadmaps/ROADMAP-BACKEND.md`.
 
+## Post-MVP app capabilities — plan seeding gap fix
+
+### Fixed
+- **`app.projects` / `app.assets` / `app.integrations` / `app.voice_rooms`
+  were un-activatable on cloud** — the feature keys are checked at app
+  activation (Rule 25) but no plan or addon granted them, so activation
+  always answered `not_entitled`. Catalogued as professional+ bundle
+  (same tier as governance/elections) in
+  `plans-entitlements-catalog.md` and seeded via migration
+  000193 (professional, business, enterprise — the resolution union has
+  no lower-tier inheritance). `app.ai_assistant` stays addon-only per
+  the add-on catalog.
+
+## Platform blog (§28) — staff-authored control-plane content
+
+### Added
+- **`internal/blog` + `blog_posts`** (000191) — platform-scoped posts
+  (markdown body, tags, draft→published→archived); public reads
+  `GET /blog/posts[/{slug}]` + `GET /blog/rss.xml` (RSS 2.0);
+  `platform.blog.manage` gates `/platform/blog*` admin CRUD +
+  publish/unpublish/archive. Slug immutable after publish (SEO); delete
+  archives (soft). `platform.blog.manage` seeded + granted to platform_admin.
+
+## Frontend readiness — browser WS auth, CORS, UI introspection, fields API, billing history
+
+### Added
+- **Browser WS auth (§24)** — `POST /api/v1/ws/ticket` (session) mints a
+  single-use `oga9:ws_ticket:{nonce}` (60s TTL, GETDEL-consumed at
+  `GET /ws?ticket=`); Bearer auth stays for non-browser clients. Browsers
+  can't set headers on WS upgrade and session JWTs must never sit in URLs.
+- **CORS middleware** — allowlisted origins (`{base_domain}` + subdomains +
+  `OGA9_APP_URL`; localhost in non-prod) echo back on preflight + responses;
+  unlisted origins get no CORS headers. Bearer auth means no credential
+  sharing — Allow-Origin never `*` on authed surfaces.
+- **`GET /orgs/{id}/me`** — the caller's org-scoped access profile:
+  membership + effective permission nodes (`_branch`/`_committee` forms
+  flattened to match `HasPermission`) + active apps. The frontend gates
+  nav/actions on nodes (Rule 20) instead of probing for 403s.
+- **Custom fields API (§10, ADR-022)** — `/fields/groups` + `/fields` CRUD
+  (`org.fields.manage`), `GET /fields/schema` merged layout (cached at
+  `oga9:fields:schema:{org}:{entity}`, invalidated on mutations),
+  `PATCH /fields/values` entity-scoped writer (member-visible self-write or
+  `org.fields.manage`). Fields RETIRE (`retired_at`, 000192 — CASCADE would
+  drop values); definitions filter to caller visibility tier on all read
+  paths; `CustomField*` events emit same-tx.
+- **`platform_invoices`** (000190) — durable billing history written in-tx
+  on subscription create, immediate plan changes, and addon subscribes
+  (`INV-{seq}` numbering per tenant); `GET /billing/invoices` serves real
+  paged rows instead of a stub.
+- **Portal enrichment (§04/ADR-021)** — `organizations.description` +
+  `custom_domain` (lower-unique); `GET /directory/orgs/{slug}` now returns
+  branding + current-term EXCO roster; `GET /directory/resolve?host=` maps
+  `{slug}.{base}` and custom domains to a listed org.
+- **Pagination + `meta`** on the unbounded lists — `GET /orgs/{id}/members`,
+  `GET /me/notifications`, `GET /orgs/{id}/finance/ledger` accept
+  `?page=`/`?per_page=` (cap 200) and return `meta{page,per_page,total}`
+  per the response convention.
+
+### Fixed
+- `POST /orgs/{id}/finance/claims` now requires `Idempotency-Key` (Rule 9
+  parity with payments — a claim initiates a financial transaction);
+  replays return the original claim, cross-org key reuse conflicts.
+
+## Phase 15.09–15.12 — post-MVP closeout (deferred infra, finance full, polls/surveys, volunteers)
+
+### Added
+- **Rules engine (ADR-016)** — `rule_definitions` table (g26, 000186) +
+  `internal/rules` evaluator: org rule → org_settings → catalog default;
+  `{value}` pins, `{min,max,default}` bounds clamp; rule hits log
+  `rule_eval` for auditability. All org_settings reads now resolve through
+  it (Rule 23).
+- **S3 storage backend (ADR-019)** — `storage.BlobStore` seam + SigV4-signed
+  `S3Store` (SeaweedFS via `OGA9_S3_*`); local disk stays default
+  (Rule 29). `storage.ImgproxyURL` for image previews.
+- **Meilisearch consumer** — `internal/search` indexes live documents on
+  `DocumentUploaded`/`DocumentVersioned`/`DocumentAccessChanged`; private
+  and soft-deleted rows drop out. Unconfigured = no-op (phased service).
+- **`platform:data_erasure`** — the only hard-delete path (Rule 11):
+  `{user_id}` anonymizes PII + clears sessions/OAuth after an audit_events
+  write; `{}` sweeps soft-deleted rows past `platform.erasure.grace_days`.
+- **§25 finance full** (000187) — budgets + lines (term-scoped adoption),
+  expense request→approve→disburse with three-role separation and
+  committee `MandateLimit` seam, disbursement posts ledger + spent
+  projection + `ExpenseDisbursed` in one tx, budget overrun warns or
+  hard-blocks on `org.finance.budget.hard_block`; invoices (`INV-YYYY-NNNNN`)
+  settle through payments only, state derives from confirmed money.
+- **§26 polls & surveys** (000188) — draft→open→closed; audience snapshot
+  frozen at open; structural secrecy (ballots vs votes); anonymous surveys
+  dedupe via `oga9:survey:claim:*` markers; `comms:close_due_polls` +
+  `comms:close_due_surveys` sweeps.
+- **§27 volunteers** (000189) — activity roles with slots + unit-restricted
+  eligibility (unit-tree check), signup lifecycle with standby promotion,
+  `activities:volunteer_remind`, `ActivityCancelled` consumer cancels
+  signups.
+- Permission nodes + scoped role grants + app-manifest updates for §25/26/27
+  (`org.finance.{budgets,expenses,invoices}.*`, `org.comms.{polls,surveys}.*`,
+  `org.volunteers.*`); catalog additions: `ExpenseRejected`,
+  `ExpenseCancelled`, `InvoiceVoided`, `BudgetClosed`,
+  `platform:data_erasure`, `oga9:survey:claim:*`,
+  `platform.erasure.grace_days`, g26 in MIGRATION-ORDER.
+- Cross-tenant isolation tests for budgets/expenses/polls/volunteers.
+
 ## Phase 12–15 — Review fixes
 
 ### Fixed — `tenant:provision` end-to-end break

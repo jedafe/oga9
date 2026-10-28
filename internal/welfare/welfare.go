@@ -15,16 +15,16 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/jedafe/oga9/internal/db"
 	"github.com/jedafe/oga9/internal/events"
+	"github.com/jedafe/oga9/internal/rules"
 	"github.com/jedafe/oga9/internal/tenant"
 )
 
 var (
-	ErrNotFound     = errors.New("not found")
-	ErrBadValue     = errors.New("bad value")
-	ErrBadState     = errors.New("bad_case_state")
-	ErrIneligible   = errors.New("welfare_ineligible")
-	ErrDuplicate    = errors.New("already_decided")
-	ErrAboveCapNeed = errors.New("needs_additional_approval")
+	ErrNotFound   = errors.New("not found")
+	ErrBadValue   = errors.New("bad value")
+	ErrBadState   = errors.New("bad_case_state")
+	ErrIneligible = errors.New("welfare_ineligible")
+	ErrDuplicate  = errors.New("already_decided")
 )
 
 var welfareKinds = map[string]bool{"medical": true, "bereavement": true, "marriage": true,
@@ -36,12 +36,13 @@ func pgText(s string) pgtype.Text    { return pgtype.Text{String: s, Valid: s !=
 func nInt(v int64) pgtype.Int8       { return pgtype.Int8{Int64: v, Valid: v != 0} }
 
 type Service struct {
+	ru   *rules.Service // ADR-016 rules engine — org_settings resolve through it (Rule 23)
 	pool *pgxpool.Pool
 	q    *db.Queries
 }
 
 func NewService(pool *pgxpool.Pool) *Service {
-	return &Service{pool: pool, q: db.New(pool)}
+	return &Service{ru: rules.New(pool), pool: pool, q: db.New(pool)}
 }
 
 func (s *Service) withTx(ctx context.Context, fn func(*db.Queries) error) error {
@@ -59,7 +60,7 @@ func (s *Service) withTx(ctx context.Context, fn func(*db.Queries) error) error 
 // settingInt reads an org.welfare.* numeric rule (Rule 23 — org_settings,
 // never hardcoded). Missing/odd values fall back to the default.
 func (s *Service) settingInt(ctx context.Context, orgID uuid.UUID, key string, def int64) int64 {
-	raw, err := s.q.GetOrgSetting(ctx, db.GetOrgSettingParams{OrganizationID: toPg(orgID), Key: key})
+	raw, err := s.ru.Value(ctx, orgID, key)
 	if err != nil {
 		return def
 	}
@@ -80,7 +81,7 @@ func (s *Service) settingInt(ctx context.Context, orgID uuid.UUID, key string, d
 }
 
 func (s *Service) settingBool(ctx context.Context, orgID uuid.UUID, key string) bool {
-	raw, err := s.q.GetOrgSetting(ctx, db.GetOrgSettingParams{OrganizationID: toPg(orgID), Key: key})
+	raw, err := s.ru.Value(ctx, orgID, key)
 	if err != nil {
 		return false
 	}
@@ -124,7 +125,9 @@ func (s *Service) CreateCase(ctx context.Context, oc *tenant.OrgCtx, kind, title
 			return uuid.Nil, ErrIneligible
 		}
 	}
-	if s.settingBool(ctx, oc.OrgID, "org.welfare.requires_good_standing") && oc.State != "active" {
+	// "good standing" is dues standing (§11/§22 semantics — the same
+	// notion §21 eligibility uses), not lifecycle state.
+	if s.settingBool(ctx, oc.OrgID, "org.welfare.requires_good_standing") && m.DuesStanding != "good" {
 		return uuid.Nil, ErrIneligible
 	}
 	var repeatNote string
@@ -276,6 +279,14 @@ func (s *Service) Decide(ctx context.Context, oc *tenant.OrgCtx, cid uuid.UUID,
 			ID: c.ID, ToState: "approved", FromState: c.State}); err != nil {
 			return err
 		}
+		// §17: approval materializes the expense request — a pending
+		// benefit row (no ledger write yet; disburse fulfills it and the
+		// BenefitDisbursed consumer posts the ledger entry, Rule 19).
+		if _, err := q.AddPendingBenefit(ctx, db.AddPendingBenefitParams{
+			CaseID: c.ID, Kind: "cash",
+			AmountMinor: nInt(amount), Currency: pgText(currency)}); err != nil {
+			return err
+		}
 		approved = true
 		if err := s.auditCase(ctx, q, cid, oc.MembershipID, "approved", note); err != nil {
 			return err
@@ -310,15 +321,30 @@ func (s *Service) Disburse(ctx context.Context, oc *tenant.OrgCtx, cid uuid.UUID
 	}
 	var bid uuid.UUID
 	err = s.withTx(ctx, func(q *db.Queries) error {
-		b, err := q.AddBenefit(ctx, db.AddBenefitParams{
-			CaseID: c.ID, Kind: kind, AmountMinor: nInt(amountMinor), Currency: pgText(currency)})
-		if err != nil {
-			return err
+		if pend, err := q.PendingBenefitForCase(ctx, c.ID); err == nil {
+			// fulfill the approve-time expense request
+			n, err := q.MarkBenefitDisbursed(ctx, db.MarkBenefitDisbursedParams{
+				ID: pend.ID, Kind: kind, AmountMinor: nInt(amountMinor), Currency: pgText(currency)})
+			if err != nil {
+				return err
+			}
+			if n == 0 {
+				return ErrBadState // raced — already disbursed
+			}
+			bid = fromPg(pend.ID)
+		} else {
+			b, err := q.AddBenefit(ctx, db.AddBenefitParams{
+				CaseID: c.ID, Kind: kind, AmountMinor: nInt(amountMinor), Currency: pgText(currency)})
+			if err != nil {
+				return err
+			}
+			bid = fromPg(b)
 		}
-		bid = fromPg(b)
-		if _, err := q.SetWelfareCaseState(ctx, db.SetWelfareCaseStateParams{
+		if n, err := q.SetWelfareCaseState(ctx, db.SetWelfareCaseStateParams{
 			ID: c.ID, ToState: "disbursed", FromState: "approved"}); err != nil {
 			return err
+		} else if n == 0 {
+			return ErrBadState // raced — another disbursal won the CAS
 		}
 		if err := s.auditCase(ctx, q, cid, oc.MembershipID, "disbursed", kind); err != nil {
 			return err
@@ -344,6 +370,13 @@ func (s *Service) ScheduleVisit(ctx context.Context, oc *tenant.OrgCtx, cid uuid
 	}
 	if c.State == "closed" || c.State == "rejected" {
 		return uuid.Nil, ErrBadState
+	}
+	// every delegate must be a member of THIS org.
+	for _, d := range delegates {
+		m, err := s.q.GetMembershipByID(ctx, toPg(d))
+		if err != nil || fromPg(m.OrganizationID) != oc.OrgID {
+			return uuid.Nil, ErrNotFound
+		}
 	}
 	var vid uuid.UUID
 	err = s.withTx(ctx, func(q *db.Queries) error {
@@ -376,7 +409,7 @@ func (s *Service) CompleteVisit(ctx context.Context, oc *tenant.OrgCtx, cid, vis
 	}
 	return s.withTx(ctx, func(q *db.Queries) error {
 		n, err := q.CompleteVisit(ctx, db.CompleteVisitParams{
-			ID: toPg(visitID), Report: pgText(report)})
+			ID: toPg(visitID), Report: pgText(report), CaseID: toPg(cid)})
 		if err != nil {
 			return err
 		}
@@ -404,9 +437,11 @@ func (s *Service) CloseCase(ctx context.Context, oc *tenant.OrgCtx, cid uuid.UUI
 		return nil // idempotent
 	}
 	return s.withTx(ctx, func(q *db.Queries) error {
-		if _, err := q.SetWelfareCaseState(ctx, db.SetWelfareCaseStateParams{
+		if n, err := q.SetWelfareCaseState(ctx, db.SetWelfareCaseStateParams{
 			ID: c.ID, ToState: "closed", FromState: c.State}); err != nil {
 			return err
+		} else if n == 0 {
+			return ErrBadState // raced — state moved under us
 		}
 		if err := s.auditCase(ctx, q, cid, oc.MembershipID, "closed", note); err != nil {
 			return err
@@ -458,6 +493,13 @@ func (s *Service) MemberDeceasedConsumer(ctx context.Context, q *db.Queries, e e
 	tid, err := q.OrgTenantID(ctx, m.OrganizationID)
 	if err != nil {
 		return err
+	}
+	// at-least-once safety: one auto-suggested bereavement per member —
+	// a re-delivered MemberDeceased must not spawn duplicates.
+	if exists, err := q.AutoSuggestedCaseExists(ctx, m.ID); err != nil {
+		return err
+	} else if exists {
+		return nil
 	}
 	cid, err := q.CreateWelfareCase(ctx, db.CreateWelfareCaseParams{
 		OrgID: m.OrganizationID, MembershipID: m.ID, Kind: "bereavement",

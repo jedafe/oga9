@@ -35,9 +35,12 @@ WHERE kind = $1 AND enabled
 ORDER BY (organization_id = sqlc.narg(org_id)::uuid) DESC NULLS LAST LIMIT 1;
 
 -- name: InsertWebhookReceipt :one
-INSERT INTO webhook_receipts (provider, raw, signature_ok)
-VALUES (sqlc.arg(provider), sqlc.arg(raw), sqlc.arg(signature_ok))
+INSERT INTO webhook_receipts (provider, raw, signature_ok, organization_id)
+VALUES (sqlc.arg(provider), sqlc.arg(raw), sqlc.arg(signature_ok), sqlc.narg(organization_id))
 RETURNING id;
+
+-- name: WebhookReceipt :one
+SELECT * FROM webhook_receipts WHERE id = $1;
 
 -- name: MarkReceiptProcessed :execrows
 UPDATE webhook_receipts SET processed_at = now() WHERE id = $1 AND processed_at IS NULL;
@@ -110,3 +113,42 @@ WHERE o.is_public_listed AND o.deleted_at IS NULL
     WHERE em.internal_type = 'organization' AND em.internal_id = o.id
       AND em.external_type = 'japaconnect:locator')
 LIMIT 200;
+
+-- name: ClaimSyncJob :execrows
+-- CAS claim so concurrent drains can't double-deliver (Rule 27).
+UPDATE sync_jobs SET state = 'running' WHERE id = $1 AND state = 'queued';
+
+-- name: ListAPIKeysForTenant :many
+SELECT id, prefix, scopes, rate_tier, created_at FROM api_keys
+WHERE tenant_id = $1 ORDER BY created_at DESC;
+
+-- name: RevokeAPIKeyForTenant :execrows
+UPDATE api_keys SET revoked_at = now() WHERE id = $1 AND tenant_id = $2 AND revoked_at IS NULL;
+
+-- name: EnabledIcsOrgs :many
+SELECT c.organization_id AS org_id FROM connectors c
+WHERE c.kind = 'ics' AND c.enabled AND c.organization_id IS NOT NULL;
+
+-- name: PublicOrgBySlugFull :one
+-- Portal profile: public fields + branding + EXCO roster (opted-in orgs only).
+SELECT o.id, o.name, o.slug, o.city, o.country_code, o.maturity_level, o.description,
+  (SELECT count(*) FROM organization_memberships m WHERE m.organization_id = o.id
+    AND m.lifecycle_state = 'active')::int AS member_count,
+  b.primary_color, b.secondary_color, b.motto, b.founded_year
+FROM organizations o
+LEFT JOIN org_branding b ON b.organization_id = o.id
+WHERE o.slug = $1 AND o.is_public_listed AND o.deleted_at IS NULL;
+
+-- name: PublicOrgExco :many
+-- Current-term executive roster for the public portal: position + display
+-- name only (no contact data — Rule: opted-in fields only).
+SELECT p.name AS position_name, u.display_name
+FROM officer_appointments oa
+JOIN terms t ON t.id = oa.term_id AND t.is_current
+JOIN org_positions p ON p.id = oa.position_id AND p.is_executive
+JOIN organization_memberships m ON m.id = oa.member_id
+JOIN users u ON u.id = m.user_id
+WHERE oa.organization_id = $1
+  AND (oa.ends_at IS NULL OR oa.ends_at >= CURRENT_DATE)
+  AND m.lifecycle_state = 'active'
+ORDER BY p.name;

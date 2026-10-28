@@ -54,7 +54,7 @@ func (q *Queries) ActiveDuesSchedules(ctx context.Context) ([]DuesSchedules, err
 }
 
 const activityDonations = `-- name: ActivityDonations :many
-SELECT id, organization_id, membership_id, obligation_id, amount_minor, currency, channel, status, provider_ref, external_ref, benefit_member_id, activity_id, idempotency_key, claim_id, drive_id, recorded_by, approved_by, confirmed_at, created_at FROM payments WHERE organization_id = $1 AND activity_id = $2
+SELECT id, organization_id, membership_id, obligation_id, amount_minor, currency, channel, status, provider_ref, external_ref, benefit_member_id, activity_id, idempotency_key, claim_id, drive_id, recorded_by, approved_by, confirmed_at, created_at, invoice_id FROM payments WHERE organization_id = $1 AND activity_id = $2
   AND status IN ('confirmed','reconciled') ORDER BY created_at
 `
 
@@ -94,6 +94,7 @@ func (q *Queries) ActivityDonations(ctx context.Context, arg ActivityDonationsPa
 			&i.ApprovedBy,
 			&i.ConfirmedAt,
 			&i.CreatedAt,
+			&i.InvoiceID,
 		); err != nil {
 			return nil, err
 		}
@@ -140,10 +141,57 @@ func (q *Queries) AdjustFineForPeriod(ctx context.Context, arg AdjustFineForPeri
 	return result.RowsAffected(), nil
 }
 
+const claimByIdempotencyKey = `-- name: ClaimByIdempotencyKey :one
+SELECT id, organization_id, membership_id, drive_id, obligation_id, amount_minor, currency, channel, external_ref, receipt_media_id, note, state, reviewed_by, reviewed_at, review_note, payment_id, created_at, hide_contributor, idempotency_key FROM payment_claims WHERE organization_id = $1 AND idempotency_key = $2
+`
+
+type ClaimByIdempotencyKeyParams struct {
+	OrganizationID pgtype.UUID `json:"organization_id"`
+	IdempotencyKey pgtype.Text `json:"idempotency_key"`
+}
+
+func (q *Queries) ClaimByIdempotencyKey(ctx context.Context, arg ClaimByIdempotencyKeyParams) (PaymentClaims, error) {
+	row := q.db.QueryRow(ctx, claimByIdempotencyKey, arg.OrganizationID, arg.IdempotencyKey)
+	var i PaymentClaims
+	err := row.Scan(
+		&i.ID,
+		&i.OrganizationID,
+		&i.MembershipID,
+		&i.DriveID,
+		&i.ObligationID,
+		&i.AmountMinor,
+		&i.Currency,
+		&i.Channel,
+		&i.ExternalRef,
+		&i.ReceiptMediaID,
+		&i.Note,
+		&i.State,
+		&i.ReviewedBy,
+		&i.ReviewedAt,
+		&i.ReviewNote,
+		&i.PaymentID,
+		&i.CreatedAt,
+		&i.HideContributor,
+		&i.IdempotencyKey,
+	)
+	return i, err
+}
+
+const claimOrgForIdempotencyKey = `-- name: ClaimOrgForIdempotencyKey :one
+SELECT organization_id FROM payment_claims WHERE idempotency_key = $1
+`
+
+func (q *Queries) ClaimOrgForIdempotencyKey(ctx context.Context, idempotencyKey pgtype.Text) (pgtype.UUID, error) {
+	row := q.db.QueryRow(ctx, claimOrgForIdempotencyKey, idempotencyKey)
+	var organization_id pgtype.UUID
+	err := row.Scan(&organization_id)
+	return organization_id, err
+}
+
 const confirmClaim = `-- name: ConfirmClaim :one
 UPDATE payment_claims SET state = 'confirmed', reviewed_by = $3, reviewed_at = now(),
   review_note = $4, payment_id = $5
-WHERE id = $1 AND organization_id = $2 AND state = 'submitted' RETURNING id, organization_id, membership_id, drive_id, obligation_id, amount_minor, currency, channel, external_ref, receipt_media_id, note, state, reviewed_by, reviewed_at, review_note, payment_id, created_at, hide_contributor
+WHERE id = $1 AND organization_id = $2 AND state = 'submitted' RETURNING id, organization_id, membership_id, drive_id, obligation_id, amount_minor, currency, channel, external_ref, receipt_media_id, note, state, reviewed_by, reviewed_at, review_note, payment_id, created_at, hide_contributor, idempotency_key
 `
 
 type ConfirmClaimParams struct {
@@ -182,6 +230,7 @@ func (q *Queries) ConfirmClaim(ctx context.Context, arg ConfirmClaimParams) (Pay
 		&i.PaymentID,
 		&i.CreatedAt,
 		&i.HideContributor,
+		&i.IdempotencyKey,
 	)
 	return i, err
 }
@@ -190,7 +239,7 @@ const confirmPayment = `-- name: ConfirmPayment :one
 UPDATE payments SET status = 'confirmed', approved_by = $3, confirmed_at = now()
 WHERE id = $1 AND organization_id = $2 AND status = 'initiated'
   AND (recorded_by IS NULL OR recorded_by <> $3)
-RETURNING id, organization_id, membership_id, obligation_id, amount_minor, currency, channel, status, provider_ref, external_ref, benefit_member_id, activity_id, idempotency_key, claim_id, drive_id, recorded_by, approved_by, confirmed_at, created_at
+RETURNING id, organization_id, membership_id, obligation_id, amount_minor, currency, channel, status, provider_ref, external_ref, benefit_member_id, activity_id, idempotency_key, claim_id, drive_id, recorded_by, approved_by, confirmed_at, created_at, invoice_id
 `
 
 type ConfirmPaymentParams struct {
@@ -222,6 +271,7 @@ func (q *Queries) ConfirmPayment(ctx context.Context, arg ConfirmPaymentParams) 
 		&i.ApprovedBy,
 		&i.ConfirmedAt,
 		&i.CreatedAt,
+		&i.InvoiceID,
 	)
 	return i, err
 }
@@ -298,6 +348,23 @@ func (q *Queries) ContributionTotals(ctx context.Context, organizationID pgtype.
 	return items, nil
 }
 
+const countLedgerEntries = `-- name: CountLedgerEntries :one
+SELECT count(*) FROM ledger_entries WHERE organization_id = $1
+  AND ($2::text = '' OR account = $2)
+`
+
+type CountLedgerEntriesParams struct {
+	OrganizationID pgtype.UUID `json:"organization_id"`
+	Column2        string      `json:"column_2"`
+}
+
+func (q *Queries) CountLedgerEntries(ctx context.Context, arg CountLedgerEntriesParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countLedgerEntries, arg.OrganizationID, arg.Column2)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const countTenantActiveMembers = `-- name: CountTenantActiveMembers :one
 SELECT count(*) FROM organization_memberships m
 JOIN organizations o ON o.id = m.organization_id
@@ -315,12 +382,14 @@ func (q *Queries) CountTenantActiveMembers(ctx context.Context, dollar_1 pgtype.
 
 const createClaim = `-- name: CreateClaim :one
 INSERT INTO payment_claims (organization_id, membership_id, drive_id, obligation_id,
-  amount_minor, currency, channel, external_ref, receipt_media_id, note, hide_contributor)
+  amount_minor, currency, channel, external_ref, receipt_media_id, note, hide_contributor,
+  idempotency_key)
 VALUES ($1, $2, $3,
   $4, $5, $6, $7,
-  $8, $9, $10, $11)
+  $8, $9, $10, $11,
+  $12::text)
 ON CONFLICT (membership_id, external_ref) WHERE external_ref IS NOT NULL AND state <> 'rejected' DO NOTHING
-RETURNING id, organization_id, membership_id, drive_id, obligation_id, amount_minor, currency, channel, external_ref, receipt_media_id, note, state, reviewed_by, reviewed_at, review_note, payment_id, created_at, hide_contributor
+RETURNING id, organization_id, membership_id, drive_id, obligation_id, amount_minor, currency, channel, external_ref, receipt_media_id, note, state, reviewed_by, reviewed_at, review_note, payment_id, created_at, hide_contributor, idempotency_key
 `
 
 type CreateClaimParams struct {
@@ -335,6 +404,7 @@ type CreateClaimParams struct {
 	ReceiptMediaID  pgtype.UUID `json:"receipt_media_id"`
 	Note            pgtype.Text `json:"note"`
 	HideContributor bool        `json:"hide_contributor"`
+	IdempotencyKey  pgtype.Text `json:"idempotency_key"`
 }
 
 // ---------- claims ----------
@@ -351,6 +421,7 @@ func (q *Queries) CreateClaim(ctx context.Context, arg CreateClaimParams) (Payme
 		arg.ReceiptMediaID,
 		arg.Note,
 		arg.HideContributor,
+		arg.IdempotencyKey,
 	)
 	var i PaymentClaims
 	err := row.Scan(
@@ -372,6 +443,7 @@ func (q *Queries) CreateClaim(ctx context.Context, arg CreateClaimParams) (Payme
 		&i.PaymentID,
 		&i.CreatedAt,
 		&i.HideContributor,
+		&i.IdempotencyKey,
 	)
 	return i, err
 }
@@ -579,13 +651,14 @@ func (q *Queries) CreateObligation(ctx context.Context, arg CreateObligationPara
 const createPayment = `-- name: CreatePayment :one
 INSERT INTO payments (organization_id, membership_id, obligation_id, amount_minor,
   currency, channel, external_ref, benefit_member_id, drive_id, activity_id,
-  idempotency_key, claim_id, recorded_by)
+  idempotency_key, claim_id, recorded_by, invoice_id)
 VALUES ($1, $2, $3,
   $4, $5, $6, $7,
   $8, $9, $10::uuid,
-  $11, $12, $13)
+  $11, $12, $13,
+  $14::uuid)
 ON CONFLICT (idempotency_key) DO NOTHING
-RETURNING id, organization_id, membership_id, obligation_id, amount_minor, currency, channel, status, provider_ref, external_ref, benefit_member_id, activity_id, idempotency_key, claim_id, drive_id, recorded_by, approved_by, confirmed_at, created_at
+RETURNING id, organization_id, membership_id, obligation_id, amount_minor, currency, channel, status, provider_ref, external_ref, benefit_member_id, activity_id, idempotency_key, claim_id, drive_id, recorded_by, approved_by, confirmed_at, created_at, invoice_id
 `
 
 type CreatePaymentParams struct {
@@ -602,6 +675,7 @@ type CreatePaymentParams struct {
 	IdempotencyKey  pgtype.Text `json:"idempotency_key"`
 	ClaimID         pgtype.UUID `json:"claim_id"`
 	RecordedBy      pgtype.UUID `json:"recorded_by"`
+	InvoiceID       pgtype.UUID `json:"invoice_id"`
 }
 
 // ---------- payments (Rule 9 idempotency) ----------
@@ -620,6 +694,7 @@ func (q *Queries) CreatePayment(ctx context.Context, arg CreatePaymentParams) (P
 		arg.IdempotencyKey,
 		arg.ClaimID,
 		arg.RecordedBy,
+		arg.InvoiceID,
 	)
 	var i Payments
 	err := row.Scan(
@@ -642,6 +717,7 @@ func (q *Queries) CreatePayment(ctx context.Context, arg CreatePaymentParams) (P
 		&i.ApprovedBy,
 		&i.ConfirmedAt,
 		&i.CreatedAt,
+		&i.InvoiceID,
 	)
 	return i, err
 }
@@ -779,7 +855,7 @@ func (q *Queries) DriveContributionRows(ctx context.Context, driveID pgtype.UUID
 }
 
 const drivePayments = `-- name: DrivePayments :many
-SELECT id, organization_id, membership_id, obligation_id, amount_minor, currency, channel, status, provider_ref, external_ref, benefit_member_id, activity_id, idempotency_key, claim_id, drive_id, recorded_by, approved_by, confirmed_at, created_at FROM payments WHERE drive_id = $1
+SELECT id, organization_id, membership_id, obligation_id, amount_minor, currency, channel, status, provider_ref, external_ref, benefit_member_id, activity_id, idempotency_key, claim_id, drive_id, recorded_by, approved_by, confirmed_at, created_at, invoice_id FROM payments WHERE drive_id = $1
   AND status IN ('confirmed','reconciled') ORDER BY created_at
 `
 
@@ -812,6 +888,7 @@ func (q *Queries) DrivePayments(ctx context.Context, driveID pgtype.UUID) ([]Pay
 			&i.ApprovedBy,
 			&i.ConfirmedAt,
 			&i.CreatedAt,
+			&i.InvoiceID,
 		); err != nil {
 			return nil, err
 		}
@@ -900,7 +977,7 @@ func (q *Queries) FailPayment(ctx context.Context, arg FailPaymentParams) (int64
 }
 
 const getClaim = `-- name: GetClaim :one
-SELECT id, organization_id, membership_id, drive_id, obligation_id, amount_minor, currency, channel, external_ref, receipt_media_id, note, state, reviewed_by, reviewed_at, review_note, payment_id, created_at, hide_contributor FROM payment_claims WHERE id = $1 AND organization_id = $2
+SELECT id, organization_id, membership_id, drive_id, obligation_id, amount_minor, currency, channel, external_ref, receipt_media_id, note, state, reviewed_by, reviewed_at, review_note, payment_id, created_at, hide_contributor, idempotency_key FROM payment_claims WHERE id = $1 AND organization_id = $2
 `
 
 type GetClaimParams struct {
@@ -930,6 +1007,7 @@ func (q *Queries) GetClaim(ctx context.Context, arg GetClaimParams) (PaymentClai
 		&i.PaymentID,
 		&i.CreatedAt,
 		&i.HideContributor,
+		&i.IdempotencyKey,
 	)
 	return i, err
 }
@@ -1105,7 +1183,7 @@ func (q *Queries) GetOrgTenantID(ctx context.Context, id pgtype.UUID) (pgtype.UU
 }
 
 const getPayment = `-- name: GetPayment :one
-SELECT id, organization_id, membership_id, obligation_id, amount_minor, currency, channel, status, provider_ref, external_ref, benefit_member_id, activity_id, idempotency_key, claim_id, drive_id, recorded_by, approved_by, confirmed_at, created_at FROM payments WHERE id = $1 AND organization_id = $2
+SELECT id, organization_id, membership_id, obligation_id, amount_minor, currency, channel, status, provider_ref, external_ref, benefit_member_id, activity_id, idempotency_key, claim_id, drive_id, recorded_by, approved_by, confirmed_at, created_at, invoice_id FROM payments WHERE id = $1 AND organization_id = $2
 `
 
 type GetPaymentParams struct {
@@ -1136,12 +1214,13 @@ func (q *Queries) GetPayment(ctx context.Context, arg GetPaymentParams) (Payment
 		&i.ApprovedBy,
 		&i.ConfirmedAt,
 		&i.CreatedAt,
+		&i.InvoiceID,
 	)
 	return i, err
 }
 
 const getPaymentAny = `-- name: GetPaymentAny :one
-SELECT id, organization_id, membership_id, obligation_id, amount_minor, currency, channel, status, provider_ref, external_ref, benefit_member_id, activity_id, idempotency_key, claim_id, drive_id, recorded_by, approved_by, confirmed_at, created_at FROM payments WHERE id = $1
+SELECT id, organization_id, membership_id, obligation_id, amount_minor, currency, channel, status, provider_ref, external_ref, benefit_member_id, activity_id, idempotency_key, claim_id, drive_id, recorded_by, approved_by, confirmed_at, created_at, invoice_id FROM payments WHERE id = $1
 `
 
 // Task context — the org is read from the row itself (issue_receipt retry).
@@ -1168,6 +1247,7 @@ func (q *Queries) GetPaymentAny(ctx context.Context, id pgtype.UUID) (Payments, 
 		&i.ApprovedBy,
 		&i.ConfirmedAt,
 		&i.CreatedAt,
+		&i.InvoiceID,
 	)
 	return i, err
 }
@@ -1197,6 +1277,42 @@ func (q *Queries) GetReceiptByIDOrg(ctx context.Context, arg GetReceiptByIDOrgPa
 	return i, err
 }
 
+const ledgerDebitsByMemoPrefix = `-- name: LedgerDebitsByMemoPrefix :one
+SELECT COALESCE(sum(amount_minor),0)::bigint AS total FROM ledger_entries
+WHERE organization_id = $1 AND direction = 'debit' AND memo LIKE $2 || '%'
+`
+
+type LedgerDebitsByMemoPrefixParams struct {
+	OrganizationID pgtype.UUID `json:"organization_id"`
+	Column2        pgtype.Text `json:"column_2"`
+}
+
+// §16 committee-mandate enforcement: cumulative committee-tagged spend.
+func (q *Queries) LedgerDebitsByMemoPrefix(ctx context.Context, arg LedgerDebitsByMemoPrefixParams) (int64, error) {
+	row := q.db.QueryRow(ctx, ledgerDebitsByMemoPrefix, arg.OrganizationID, arg.Column2)
+	var total int64
+	err := row.Scan(&total)
+	return total, err
+}
+
+const ledgerDebitsForProject = `-- name: LedgerDebitsForProject :one
+SELECT COALESCE(sum(amount_minor),0)::bigint FROM ledger_entries
+WHERE organization_id = $1 AND direction = 'debit' AND memo LIKE '%project:' || $2
+`
+
+type LedgerDebitsForProjectParams struct {
+	OrganizationID pgtype.UUID `json:"organization_id"`
+	Column2        pgtype.Text `json:"column_2"`
+}
+
+// §20 budget check: cumulative spend tagged 'project:{id}' in the memo.
+func (q *Queries) LedgerDebitsForProject(ctx context.Context, arg LedgerDebitsForProjectParams) (int64, error) {
+	row := q.db.QueryRow(ctx, ledgerDebitsForProject, arg.OrganizationID, arg.Column2)
+	var column_1 int64
+	err := row.Scan(&column_1)
+	return column_1, err
+}
+
 const ledgerMemoExists = `-- name: LedgerMemoExists :one
 SELECT EXISTS(SELECT 1 FROM ledger_entries WHERE organization_id = $1 AND memo = $2)
 `
@@ -1216,7 +1332,7 @@ func (q *Queries) LedgerMemoExists(ctx context.Context, arg LedgerMemoExistsPara
 }
 
 const listClaims = `-- name: ListClaims :many
-SELECT id, organization_id, membership_id, drive_id, obligation_id, amount_minor, currency, channel, external_ref, receipt_media_id, note, state, reviewed_by, reviewed_at, review_note, payment_id, created_at, hide_contributor FROM payment_claims WHERE organization_id = $1
+SELECT id, organization_id, membership_id, drive_id, obligation_id, amount_minor, currency, channel, external_ref, receipt_media_id, note, state, reviewed_by, reviewed_at, review_note, payment_id, created_at, hide_contributor, idempotency_key FROM payment_claims WHERE organization_id = $1
   AND ($2::text = '' OR state = $2) ORDER BY created_at DESC LIMIT 500
 `
 
@@ -1253,6 +1369,7 @@ func (q *Queries) ListClaims(ctx context.Context, arg ListClaimsParams) ([]Payme
 			&i.PaymentID,
 			&i.CreatedAt,
 			&i.HideContributor,
+			&i.IdempotencyKey,
 		); err != nil {
 			return nil, err
 		}
@@ -1377,7 +1494,7 @@ func (q *Queries) ListDuesSchedules(ctx context.Context, organizationID pgtype.U
 }
 
 const listLedgerEntries = `-- name: ListLedgerEntries :many
-SELECT id, organization_id, payment_id, reversal_of, direction, account, amount_minor, currency, memo, posted_by, posted_at FROM ledger_entries WHERE organization_id = $1
+SELECT id, organization_id, payment_id, reversal_of, direction, account, amount_minor, currency, memo, posted_by, posted_at, budget_line_id, expense_id FROM ledger_entries WHERE organization_id = $1
   AND ($2::text = '' OR account = $2)
 ORDER BY posted_at DESC LIMIT 500
 `
@@ -1408,6 +1525,60 @@ func (q *Queries) ListLedgerEntries(ctx context.Context, arg ListLedgerEntriesPa
 			&i.Memo,
 			&i.PostedBy,
 			&i.PostedAt,
+			&i.BudgetLineID,
+			&i.ExpenseID,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listLedgerEntriesPaged = `-- name: ListLedgerEntriesPaged :many
+SELECT id, organization_id, payment_id, reversal_of, direction, account, amount_minor, currency, memo, posted_by, posted_at, budget_line_id, expense_id FROM ledger_entries WHERE organization_id = $1
+  AND ($2::text = '' OR account = $2)
+ORDER BY posted_at DESC LIMIT $3 OFFSET $4
+`
+
+type ListLedgerEntriesPagedParams struct {
+	OrganizationID pgtype.UUID `json:"organization_id"`
+	Column2        string      `json:"column_2"`
+	Limit          int32       `json:"limit"`
+	Offset         int32       `json:"offset"`
+}
+
+func (q *Queries) ListLedgerEntriesPaged(ctx context.Context, arg ListLedgerEntriesPagedParams) ([]LedgerEntries, error) {
+	rows, err := q.db.Query(ctx, listLedgerEntriesPaged,
+		arg.OrganizationID,
+		arg.Column2,
+		arg.Limit,
+		arg.Offset,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []LedgerEntries
+	for rows.Next() {
+		var i LedgerEntries
+		if err := rows.Scan(
+			&i.ID,
+			&i.OrganizationID,
+			&i.PaymentID,
+			&i.ReversalOf,
+			&i.Direction,
+			&i.Account,
+			&i.AmountMinor,
+			&i.Currency,
+			&i.Memo,
+			&i.PostedBy,
+			&i.PostedAt,
+			&i.BudgetLineID,
+			&i.ExpenseID,
 		); err != nil {
 			return nil, err
 		}
@@ -1544,7 +1715,7 @@ func (q *Queries) MembersWithOverdueObligations(ctx context.Context, organizatio
 }
 
 const myClaimsAll = `-- name: MyClaimsAll :many
-SELECT c.id, c.organization_id, c.membership_id, c.drive_id, c.obligation_id, c.amount_minor, c.currency, c.channel, c.external_ref, c.receipt_media_id, c.note, c.state, c.reviewed_by, c.reviewed_at, c.review_note, c.payment_id, c.created_at, c.hide_contributor FROM payment_claims c
+SELECT c.id, c.organization_id, c.membership_id, c.drive_id, c.obligation_id, c.amount_minor, c.currency, c.channel, c.external_ref, c.receipt_media_id, c.note, c.state, c.reviewed_by, c.reviewed_at, c.review_note, c.payment_id, c.created_at, c.hide_contributor, c.idempotency_key FROM payment_claims c
 JOIN organization_memberships m ON m.id = c.membership_id
 WHERE m.user_id = $1 ORDER BY c.created_at DESC
 `
@@ -1578,6 +1749,7 @@ func (q *Queries) MyClaimsAll(ctx context.Context, userID pgtype.UUID) ([]Paymen
 			&i.PaymentID,
 			&i.CreatedAt,
 			&i.HideContributor,
+			&i.IdempotencyKey,
 		); err != nil {
 			return nil, err
 		}
@@ -1918,7 +2090,7 @@ func (q *Queries) OrgPaymentTotals(ctx context.Context, organizationID pgtype.UU
 }
 
 const paymentByIdempotencyKey = `-- name: PaymentByIdempotencyKey :one
-SELECT id, organization_id, membership_id, obligation_id, amount_minor, currency, channel, status, provider_ref, external_ref, benefit_member_id, activity_id, idempotency_key, claim_id, drive_id, recorded_by, approved_by, confirmed_at, created_at FROM payments WHERE organization_id = $1 AND idempotency_key = $2
+SELECT id, organization_id, membership_id, obligation_id, amount_minor, currency, channel, status, provider_ref, external_ref, benefit_member_id, activity_id, idempotency_key, claim_id, drive_id, recorded_by, approved_by, confirmed_at, created_at, invoice_id FROM payments WHERE organization_id = $1 AND idempotency_key = $2
 `
 
 type PaymentByIdempotencyKeyParams struct {
@@ -1949,12 +2121,13 @@ func (q *Queries) PaymentByIdempotencyKey(ctx context.Context, arg PaymentByIdem
 		&i.ApprovedBy,
 		&i.ConfirmedAt,
 		&i.CreatedAt,
+		&i.InvoiceID,
 	)
 	return i, err
 }
 
 const paymentCreditEntry = `-- name: PaymentCreditEntry :one
-SELECT id, organization_id, payment_id, reversal_of, direction, account, amount_minor, currency, memo, posted_by, posted_at FROM ledger_entries WHERE payment_id = $1 AND direction = 'credit'
+SELECT id, organization_id, payment_id, reversal_of, direction, account, amount_minor, currency, memo, posted_by, posted_at, budget_line_id, expense_id FROM ledger_entries WHERE payment_id = $1 AND direction = 'credit'
   AND reversal_of IS NULL ORDER BY posted_at LIMIT 1
 `
 
@@ -1973,6 +2146,8 @@ func (q *Queries) PaymentCreditEntry(ctx context.Context, paymentID pgtype.UUID)
 		&i.Memo,
 		&i.PostedBy,
 		&i.PostedAt,
+		&i.BudgetLineID,
+		&i.ExpenseID,
 	)
 	return i, err
 }
@@ -1990,13 +2165,60 @@ func (q *Queries) PaymentOrgForIdempotencyKey(ctx context.Context, idempotencyKe
 	return organization_id, err
 }
 
+const pendingClaimsForOrg = `-- name: PendingClaimsForOrg :many
+SELECT id, organization_id, membership_id, drive_id, obligation_id, amount_minor, currency, channel, external_ref, receipt_media_id, note, state, reviewed_by, reviewed_at, review_note, payment_id, created_at, hide_contributor, idempotency_key FROM payment_claims WHERE organization_id = $1 AND state = 'pending'
+ORDER BY created_at
+`
+
+// §16 handover section: claims still awaiting officer review.
+func (q *Queries) PendingClaimsForOrg(ctx context.Context, organizationID pgtype.UUID) ([]PaymentClaims, error) {
+	rows, err := q.db.Query(ctx, pendingClaimsForOrg, organizationID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []PaymentClaims
+	for rows.Next() {
+		var i PaymentClaims
+		if err := rows.Scan(
+			&i.ID,
+			&i.OrganizationID,
+			&i.MembershipID,
+			&i.DriveID,
+			&i.ObligationID,
+			&i.AmountMinor,
+			&i.Currency,
+			&i.Channel,
+			&i.ExternalRef,
+			&i.ReceiptMediaID,
+			&i.Note,
+			&i.State,
+			&i.ReviewedBy,
+			&i.ReviewedAt,
+			&i.ReviewNote,
+			&i.PaymentID,
+			&i.CreatedAt,
+			&i.HideContributor,
+			&i.IdempotencyKey,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const postLedgerEntry = `-- name: PostLedgerEntry :one
 INSERT INTO ledger_entries (organization_id, payment_id, reversal_of, direction,
-  account, amount_minor, currency, memo, posted_by)
+  account, amount_minor, currency, memo, posted_by, budget_line_id, expense_id)
 VALUES ($1, $2, $3,
   $4, $5, $6, $7,
-  $8, $9)
-RETURNING id, organization_id, payment_id, reversal_of, direction, account, amount_minor, currency, memo, posted_by, posted_at
+  $8, $9, $10::uuid,
+  $11::uuid)
+RETURNING id, organization_id, payment_id, reversal_of, direction, account, amount_minor, currency, memo, posted_by, posted_at, budget_line_id, expense_id
 `
 
 type PostLedgerEntryParams struct {
@@ -2009,6 +2231,8 @@ type PostLedgerEntryParams struct {
 	Currency       string      `json:"currency"`
 	Memo           pgtype.Text `json:"memo"`
 	PostedBy       pgtype.UUID `json:"posted_by"`
+	BudgetLineID   pgtype.UUID `json:"budget_line_id"`
+	ExpenseID      pgtype.UUID `json:"expense_id"`
 }
 
 // ---------- ledger (append-only) ----------
@@ -2023,6 +2247,8 @@ func (q *Queries) PostLedgerEntry(ctx context.Context, arg PostLedgerEntryParams
 		arg.Currency,
 		arg.Memo,
 		arg.PostedBy,
+		arg.BudgetLineID,
+		arg.ExpenseID,
 	)
 	var i LedgerEntries
 	err := row.Scan(
@@ -2037,6 +2263,8 @@ func (q *Queries) PostLedgerEntry(ctx context.Context, arg PostLedgerEntryParams
 		&i.Memo,
 		&i.PostedBy,
 		&i.PostedAt,
+		&i.BudgetLineID,
+		&i.ExpenseID,
 	)
 	return i, err
 }
@@ -2062,7 +2290,7 @@ func (q *Queries) ReceiptForPayment(ctx context.Context, paymentID pgtype.UUID) 
 const reconcilePayment = `-- name: ReconcilePayment :one
 UPDATE payments SET status = 'reconciled'
 WHERE id = $1 AND organization_id = $2 AND status = 'confirmed'
-RETURNING id, organization_id, membership_id, obligation_id, amount_minor, currency, channel, status, provider_ref, external_ref, benefit_member_id, activity_id, idempotency_key, claim_id, drive_id, recorded_by, approved_by, confirmed_at, created_at
+RETURNING id, organization_id, membership_id, obligation_id, amount_minor, currency, channel, status, provider_ref, external_ref, benefit_member_id, activity_id, idempotency_key, claim_id, drive_id, recorded_by, approved_by, confirmed_at, created_at, invoice_id
 `
 
 type ReconcilePaymentParams struct {
@@ -2093,6 +2321,7 @@ func (q *Queries) ReconcilePayment(ctx context.Context, arg ReconcilePaymentPara
 		&i.ApprovedBy,
 		&i.ConfirmedAt,
 		&i.CreatedAt,
+		&i.InvoiceID,
 	)
 	return i, err
 }
@@ -2140,7 +2369,7 @@ func (q *Queries) RegistrationSchedules(ctx context.Context, organizationID pgty
 const rejectClaim = `-- name: RejectClaim :one
 UPDATE payment_claims SET state = 'rejected', reviewed_by = $3, reviewed_at = now(),
   review_note = $4
-WHERE id = $1 AND organization_id = $2 AND state = 'submitted' RETURNING id, organization_id, membership_id, drive_id, obligation_id, amount_minor, currency, channel, external_ref, receipt_media_id, note, state, reviewed_by, reviewed_at, review_note, payment_id, created_at, hide_contributor
+WHERE id = $1 AND organization_id = $2 AND state = 'submitted' RETURNING id, organization_id, membership_id, drive_id, obligation_id, amount_minor, currency, channel, external_ref, receipt_media_id, note, state, reviewed_by, reviewed_at, review_note, payment_id, created_at, hide_contributor, idempotency_key
 `
 
 type RejectClaimParams struct {
@@ -2177,6 +2406,7 @@ func (q *Queries) RejectClaim(ctx context.Context, arg RejectClaimParams) (Payme
 		&i.PaymentID,
 		&i.CreatedAt,
 		&i.HideContributor,
+		&i.IdempotencyKey,
 	)
 	return i, err
 }
@@ -2196,7 +2426,7 @@ func (q *Queries) RetryPaymentByID(ctx context.Context, id pgtype.UUID) (int64, 
 const reversePayment = `-- name: ReversePayment :one
 UPDATE payments SET status = 'reversed'
 WHERE id = $1 AND organization_id = $2 AND status IN ('confirmed','reconciled')
-RETURNING id, organization_id, membership_id, obligation_id, amount_minor, currency, channel, status, provider_ref, external_ref, benefit_member_id, activity_id, idempotency_key, claim_id, drive_id, recorded_by, approved_by, confirmed_at, created_at
+RETURNING id, organization_id, membership_id, obligation_id, amount_minor, currency, channel, status, provider_ref, external_ref, benefit_member_id, activity_id, idempotency_key, claim_id, drive_id, recorded_by, approved_by, confirmed_at, created_at, invoice_id
 `
 
 type ReversePaymentParams struct {
@@ -2227,6 +2457,7 @@ func (q *Queries) ReversePayment(ctx context.Context, arg ReversePaymentParams) 
 		&i.ApprovedBy,
 		&i.ConfirmedAt,
 		&i.CreatedAt,
+		&i.InvoiceID,
 	)
 	return i, err
 }

@@ -17,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/jedafe/oga9/internal/db"
 	"github.com/jedafe/oga9/internal/events"
+	"github.com/jedafe/oga9/internal/rules"
 	"github.com/jedafe/oga9/internal/tenant"
 )
 
@@ -25,6 +26,9 @@ var (
 	ErrBadValue     = errors.New("bad value")
 	ErrBadState     = errors.New("bad_project_state")
 	ErrNoResolution = errors.New("resolution_required") // activate needs a passed resolution
+	ErrOverMandate  = errors.New("over_mandate_limit")  // §16 committee budget cap
+	ErrBadPayment   = errors.New("payment_not_found")   // donor link must be a real payment
+	ErrOverBudget   = errors.New("over_project_budget") // §20: spend exceeds the project budget
 )
 
 func toPg(u uuid.UUID) pgtype.UUID   { return pgtype.UUID{Bytes: u, Valid: u != uuid.Nil} }
@@ -35,14 +39,20 @@ func nInt32(v int32) pgtype.Int4     { return pgtype.Int4{Int32: v, Valid: v != 
 func nInt(v int64) pgtype.Int8       { return pgtype.Int8{Int64: v, Valid: v != 0} }
 
 type Service struct {
+	ru   *rules.Service // ADR-016 rules engine — org_settings resolve through it (Rule 23)
 	pool *pgxpool.Pool
 	q    *db.Queries
 	// archiveFn lands the completion report in documents (Rule 26 seam).
 	archiveFn func(ctx context.Context, oc *tenant.OrgCtx, title string, r io.Reader) (uuid.UUID, error)
+	// mandateFn is the §16 governance seam (Rule 26); spend totals are
+	// read from this module's own project_expenses reservations, which
+	// the spend tx writes atomically — no cross-module reads needed.
+	mandateFn func(ctx context.Context, unitID uuid.UUID) (int64, string, bool)
+	paymentFn func(ctx context.Context, orgID, paymentID uuid.UUID) (bool, error)
 }
 
 func NewService(pool *pgxpool.Pool) *Service {
-	return &Service{pool: pool, q: db.New(pool)}
+	return &Service{ru: rules.New(pool), pool: pool, q: db.New(pool)}
 }
 
 func (s *Service) SetArchive(fn func(context.Context, *tenant.OrgCtx, string, io.Reader) (uuid.UUID, error)) {
@@ -62,7 +72,7 @@ func (s *Service) withTx(ctx context.Context, fn func(*db.Queries) error) error 
 }
 
 func (s *Service) settingInt(ctx context.Context, orgID uuid.UUID, key string) int64 {
-	raw, err := s.q.GetOrgSetting(ctx, db.GetOrgSettingParams{OrganizationID: toPg(orgID), Key: key})
+	raw, err := s.ru.Value(ctx, orgID, key)
 	if err != nil {
 		return 0
 	}
@@ -81,6 +91,14 @@ func (s *Service) Propose(ctx context.Context, oc *tenant.OrgCtx, title, descrip
 	unitID uuid.UUID, startsOn, targetOn time.Time) (uuid.UUID, error) {
 	if title == "" {
 		return uuid.Nil, ErrBadValue
+	}
+	if unitID != uuid.Nil {
+		// the owning unit must belong to THIS org — a foreign-org unit id
+		// would graft cross-org custody/mandate links (Rule 24 pattern).
+		if _, err := s.q.GetCommitteeUnit(ctx, db.GetCommitteeUnitParams{
+			ID: toPg(unitID), OrganizationID: toPg(oc.OrgID)}); err != nil {
+			return uuid.Nil, ErrNotFound
+		}
 	}
 	var id uuid.UUID
 	err := s.withTx(ctx, func(q *db.Queries) error {
@@ -172,7 +190,7 @@ func (s *Service) Transition(ctx context.Context, oc *tenant.OrgCtx, pid uuid.UU
 	case "suspend":
 		to, from, ev = "suspended", "active", "ProjectSuspended"
 	case "abandon":
-		to, ev = "abandoned", "ProjectSuspended"
+		to, ev = "abandoned", "ProjectAbandoned"
 		if p.State != "proposed" && p.State != "approved" && p.State != "suspended" {
 			return ErrBadState
 		}
@@ -323,6 +341,24 @@ func (s *Service) RecordDonor(ctx context.Context, oc *tenant.OrgCtx, pid uuid.U
 	if donorName == "" {
 		return uuid.Nil, ErrBadValue
 	}
+	if membershipID != uuid.Nil {
+		m, err := s.q.GetMembershipByID(ctx, toPg(membershipID))
+		if err != nil || fromPg(m.OrganizationID) != oc.OrgID {
+			return uuid.Nil, ErrNotFound // donor member must be of this org
+		}
+	}
+	if paymentID != uuid.Nil {
+		if s.paymentFn == nil {
+			return uuid.Nil, ErrBadValue
+		}
+		ok, err := s.paymentFn(ctx, oc.OrgID, paymentID)
+		if err != nil {
+			return uuid.Nil, err
+		}
+		if !ok {
+			return uuid.Nil, ErrBadPayment // donor link must be a real confirmed payment
+		}
+	}
 	var id uuid.UUID
 	err = s.withTx(ctx, func(q *db.Queries) error {
 		did, err := q.AddDonor(ctx, db.AddDonorParams{
@@ -412,4 +448,144 @@ func (s *Service) PublicProjects(ctx context.Context, slug string) ([]db.PublicO
 		return nil, fmt.Errorf("%w", ErrBadValue)
 	}
 	return s.q.PublicOrgProjects(ctx, slug)
+}
+
+// ---------- spend (§20 + §16 mandate enforcement) ----------
+
+// SetSpendGate wires the §16 governance mandate seam (Rule 26). Spend
+// totals are read from project_expenses reservations — written in the
+// spend tx itself, so cap checks see committed+in-flight spend atomically.
+func (s *Service) SetSpendGate(fn func(ctx context.Context, unitID uuid.UUID) (int64, string, bool)) {
+	s.mandateFn = fn
+}
+
+// SetPaymentVerifier wires the finance payment-existence seam — donor
+// records only accept a verified, confirmed, same-org payment (Rule 26).
+func (s *Service) SetPaymentVerifier(fn func(ctx context.Context, orgID, paymentID uuid.UUID) (bool, error)) {
+	s.paymentFn = fn
+}
+
+// RecordSpend — §20: project spending posts to finance (never off-ledger).
+// The reservation lands in the same tx as the cap checks — serialized
+// by the project row lock (and a per-committee advisory lock for the
+// shared §16 mandate), so racing spends can't both pass a cap.
+// The event consumer then lands the ledger debit (Rule 12 same-tx outbox).
+func (s *Service) RecordSpend(ctx context.Context, oc *tenant.OrgCtx, pid uuid.UUID,
+	amountMinor int64, currency, memo string) (uuid.UUID, error) {
+	if amountMinor <= 0 || currency == "" {
+		return uuid.Nil, ErrBadValue
+	}
+	var expenseID uuid.UUID
+	err := s.withTx(ctx, func(q *db.Queries) error {
+		p, err := q.GetProjectForUpdate(ctx, db.GetProjectForUpdateParams{
+			ID: toPg(pid), OrgID: toPg(oc.OrgID)})
+		if err != nil {
+			return ErrNotFound
+		}
+		if p.State != "active" {
+			return ErrBadState
+		}
+		if p.UnitID.Valid {
+			// serialize spend against a SHARED committee mandate — a row
+			// lock on this project alone wouldn't stop a sibling project
+			// on the same unit racing the cap.
+			if err := q.LockSpendScope(ctx, "committee:"+uuid.UUID(p.UnitID.Bytes).String()); err != nil {
+				return err
+			}
+		}
+		if p.BudgetID.Valid {
+			b, err := q.GetProjectBudget(ctx, db.GetProjectBudgetParams{
+				ProjectID: p.ID, OrganizationID: toPg(oc.OrgID)})
+			if err == nil {
+				spent, err := q.ProjectExpenseTotal(ctx, db.ProjectExpenseTotalParams{
+					OrgID: toPg(oc.OrgID), ProjectID: p.ID})
+				if err != nil {
+					return err
+				}
+				if spent+amountMinor > b.AmountMinor {
+					return ErrOverBudget
+				}
+			}
+		}
+		if p.UnitID.Valid && s.mandateFn != nil {
+			limit, _, ok := s.mandateFn(ctx, fromPg(p.UnitID))
+			if ok {
+				cspent, err := q.CommitteeExpenseTotal(ctx, db.CommitteeExpenseTotalParams{
+					OrgID: toPg(oc.OrgID), UnitID: p.UnitID})
+				if err != nil {
+					return err
+				}
+				if cspent+amountMinor > limit {
+					return ErrOverMandate
+				}
+			}
+		}
+		eid, err := q.InsertProjectExpense(ctx, db.InsertProjectExpenseParams{
+			OrgID: toPg(oc.OrgID), ProjectID: p.ID, UnitID: p.UnitID,
+			AmountMinor: amountMinor, Currency: currency, Memo: pgText(memo)})
+		if err != nil {
+			return err
+		}
+		expenseID = fromPg(eid)
+		return events.Emit(ctx, q, oc.TenantID, oc.OrgID, "ProjectExpenseRecorded",
+			"project", pid, oc.UserID, true,
+			map[string]any{"expense_id": expenseID.String(), "project_id": pid,
+				"unit_id": fromPg(p.UnitID), "amount_minor": amountMinor,
+				"currency": currency, "memo": memo, "posted_by": oc.MembershipID})
+	})
+	return expenseID, err
+}
+
+// ---------- budget (§20) ----------
+
+// SetBudget — one budget per project (UNIQUE on project_id); sets
+// projects.budget_id to the new row (CAS — re-set requires no existing
+// link; a change lands via a correcting record, not an edit).
+func (s *Service) SetBudget(ctx context.Context, oc *tenant.OrgCtx, pid uuid.UUID,
+	amountMinor int64, currency, note string) (uuid.UUID, error) {
+	if amountMinor <= 0 || currency == "" {
+		return uuid.Nil, ErrBadValue
+	}
+	p, err := s.q.GetProject(ctx, db.GetProjectParams{ID: toPg(pid), OrganizationID: toPg(oc.OrgID)})
+	if err != nil {
+		return uuid.Nil, ErrNotFound
+	}
+	var id uuid.UUID
+	err = s.withTx(ctx, func(q *db.Queries) error {
+		bid, err := q.CreateProjectBudget(ctx, db.CreateProjectBudgetParams{
+			OrganizationID: toPg(oc.OrgID), ProjectID: p.ID,
+			AmountMinor: amountMinor, Currency: currency,
+			Note: pgText(note), CreatedBy: toPg(oc.MembershipID)})
+		if err != nil {
+			return err
+		}
+		if _, err := q.SetProjectBudgetID(ctx, db.SetProjectBudgetIDParams{
+			ID: p.ID, BudgetID: bid}); err != nil {
+			return err
+		}
+		id = fromPg(bid)
+		return nil
+	})
+	return id, err
+}
+
+// Budget — the budget row plus live spend/remaining from the
+// project_expenses reservations (the same rows the caps enforce on).
+func (s *Service) Budget(ctx context.Context, oc *tenant.OrgCtx, pid uuid.UUID) (map[string]any, error) {
+	p, err := s.q.GetProject(ctx, db.GetProjectParams{ID: toPg(pid), OrganizationID: toPg(oc.OrgID)})
+	if err != nil {
+		return nil, ErrNotFound
+	}
+	b, err := s.q.GetProjectBudget(ctx, db.GetProjectBudgetParams{
+		ProjectID: p.ID, OrganizationID: toPg(oc.OrgID)})
+	if err != nil {
+		return nil, ErrNotFound
+	}
+	spent, err := s.q.ProjectExpenseTotal(ctx, db.ProjectExpenseTotalParams{
+		OrgID: toPg(oc.OrgID), ProjectID: p.ID})
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{"budget": b, "spent_minor": spent,
+		"remaining_minor": b.AmountMinor - spent}, nil
 }

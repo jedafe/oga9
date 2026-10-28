@@ -11,6 +11,7 @@ import (
 	"github.com/jedafe/oga9/internal/auth"
 	"github.com/jedafe/oga9/internal/db"
 	"github.com/jedafe/oga9/internal/httpx"
+	valkey "github.com/valkey-io/valkey-go"
 )
 
 type ctxKey string
@@ -56,8 +57,8 @@ func resolveSessionToken(r *http.Request, svc *auth.Service, jwtSecret, token st
 func RequireAuth(svc *auth.Service, jwtSecret string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if UserID(r.Context()) != uuid.Nil {
-				next.ServeHTTP(w, r) // pre-resolved by APIKeyAuth
+			if UserID(r.Context()) != uuid.Nil || TenantID(r.Context()) != uuid.Nil {
+				next.ServeHTTP(w, r) // pre-resolved by APIKeyAuth (user or tenant key)
 				return
 			}
 			token, ok := bearerToken(r)
@@ -108,6 +109,15 @@ func UserID(ctx context.Context) uuid.UUID {
 	}
 	return uuid.Nil
 }
+
+// TenantID returns the api-key-resolved tenant identity (tenant-scoped
+// keys carry no user — §23). Nil for user sessions.
+func TenantID(ctx context.Context) uuid.UUID {
+	if v, ok := ctx.Value(CtxTenantID).(uuid.UUID); ok {
+		return v
+	}
+	return uuid.Nil
+}
 func SessionJTI(ctx context.Context) uuid.UUID {
 	if v, ok := ctx.Value(CtxSessionJTI).(uuid.UUID); ok {
 		return v
@@ -153,6 +163,36 @@ func APIKeyAuth(svc APIKeyResolver) func(http.Handler) http.Handler {
 				ctx = context.WithValue(ctx, CtxUserID, uuid.UUID(k.UserID.Bytes))
 			}
 			next.ServeHTTP(w, r.WithContext(ctx))
+		})
+	}
+}
+
+// RequireAuthOrWSTicket — §24: browser WebSocket upgrades can't set headers.
+// Accepts the session Bearer JWT OR a single-use ?ticket= minted by
+// POST /ws/ticket (oga9:ws_ticket:{nonce}, 60s TTL, GETDEL so replay fails).
+func RequireAuthOrWSTicket(svc *auth.Service, vk valkey.Client, jwtSecret string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if UserID(r.Context()) != uuid.Nil {
+				next.ServeHTTP(w, r)
+				return
+			}
+			if token, ok := bearerToken(r); ok {
+				if ctx, ok := resolveSessionToken(r, svc, jwtSecret, token); ok {
+					next.ServeHTTP(w, r.WithContext(ctx))
+					return
+				}
+			}
+			if t := r.URL.Query().Get("ticket"); t != "" {
+				raw, err := vk.Do(r.Context(), vk.B().Getdel().Key("oga9:ws_ticket:"+t).Build()).AsBytes()
+				if err == nil {
+					if uid, perr := uuid.Parse(strings.Trim(string(raw), `"`)); perr == nil {
+						next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), CtxUserID, uid)))
+						return
+					}
+				}
+			}
+			httpx.WriteErr(w, 401, "unauthorized", "session or ws ticket required")
 		})
 	}
 }

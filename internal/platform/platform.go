@@ -95,12 +95,12 @@ type Service struct {
 	// auth.CreateSupportSession (Rule 26: platform never writes
 	// user_sessions itself).
 	sessionFn func(ctx context.Context, supportSessionID, targetUserID uuid.UUID, ttl time.Duration, ip, ua string) (token string, sessionID uuid.UUID, err error)
-	trial     int64          // default trial days — operator may override per request
-	store     *storage.Store // tenant_exports blob backend (§13.06 async export)
+	trial     int64             // default trial days — operator may override per request
+	store     storage.BlobStore // tenant_exports blob backend (§13.06 async export)
 }
 
 // SetStore wires the export blob backend (same uploads dir as documents).
-func (s *Service) SetStore(st *storage.Store) { s.store = st }
+func (s *Service) SetStore(st storage.BlobStore) { s.store = st }
 
 func NewService(pool *pgxpool.Pool) *Service {
 	return &Service{pool: pool, q: db.New(pool), trial: 14}

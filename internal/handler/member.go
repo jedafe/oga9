@@ -82,12 +82,14 @@ func (h *MemberHandler) Members(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	rows, err := h.svc.Members(r.Context(), oc, r.URL.Query().Get("category"), r.URL.Query().Get("state"), unitID)
+	page, per := httpx.PageParams(r)
+	rows, total, err := h.svc.MembersPage(r.Context(), oc, r.URL.Query().Get("category"),
+		r.URL.Query().Get("state"), unitID, int32(per), int32((page-1)*per))
 	if err != nil {
 		memberErr(w, err)
 		return
 	}
-	httpx.WriteData(w, 200, rows)
+	httpx.WritePage(w, 200, rows, page, per, total)
 }
 
 // Member — GET /orgs/{id}/members/{mid}: view_any, or the member's own row.
@@ -356,7 +358,7 @@ func (h *MemberHandler) PublicApply(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteErr(w, 400, "validation_failed", "invalid body")
 		return
 	}
-	id, err := h.svc.PublicApply(r.Context(), chi.URLParam(r, "slug"), req.Email, req.Phone, req.Answers)
+	id, err := h.svc.PublicApply(r.Context(), chi.URLParam(r, "slug"), req.Email, req.Phone, "", req.Answers)
 	if err != nil {
 		memberErr(w, err)
 		return
