@@ -945,6 +945,9 @@ type Querier interface {
 	// CAS: only a live/failed row finishes — a retry after a marked failure
 	// CAN complete (the blob is valid; 'failed' just records the last error).
 	MarkTenantExportDone(ctx context.Context, arg MarkTenantExportDoneParams) (int64, error)
+	// passphrase_enc stays: asynq retries need to decrypt it again — a
+	// transient failure must not turn into a permanent one. Only
+	// MarkTenantExportDone scrubs the sealed secret.
 	MarkTenantExportFailed(ctx context.Context, arg MarkTenantExportFailedParams) error
 	// Idempotent worker completion — a redrive sees processed_at set and skips.
 	MarkWebhookProcessed(ctx context.Context, id pgtype.UUID) (int64, error)

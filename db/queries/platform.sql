@@ -304,7 +304,10 @@ UPDATE tenant_exports SET status='done', storage_key=$2, bundle_version=$3, erro
 WHERE id=$1 AND status IN ('processing','failed');
 
 -- name: MarkTenantExportFailed :exec
-UPDATE tenant_exports SET status='failed', error=$2, completed_at=now(), options=options-'passphrase_enc'
+-- passphrase_enc stays: asynq retries need to decrypt it again — a
+-- transient failure must not turn into a permanent one. Only
+-- MarkTenantExportDone scrubs the sealed secret.
+UPDATE tenant_exports SET status='failed', error=$2, completed_at=now()
 WHERE id=$1 AND status='processing';
 
 -- name: GetTenantExportByID :one

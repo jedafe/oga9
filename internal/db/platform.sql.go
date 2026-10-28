@@ -1065,7 +1065,7 @@ func (q *Queries) MarkTenantExportDone(ctx context.Context, arg MarkTenantExport
 }
 
 const markTenantExportFailed = `-- name: MarkTenantExportFailed :exec
-UPDATE tenant_exports SET status='failed', error=$2, completed_at=now(), options=options-'passphrase_enc'
+UPDATE tenant_exports SET status='failed', error=$2, completed_at=now()
 WHERE id=$1 AND status='processing'
 `
 
@@ -1074,6 +1074,9 @@ type MarkTenantExportFailedParams struct {
 	Error pgtype.Text `json:"error"`
 }
 
+// passphrase_enc stays: asynq retries need to decrypt it again — a
+// transient failure must not turn into a permanent one. Only
+// MarkTenantExportDone scrubs the sealed secret.
 func (q *Queries) MarkTenantExportFailed(ctx context.Context, arg MarkTenantExportFailedParams) error {
 	_, err := q.db.Exec(ctx, markTenantExportFailed, arg.ID, arg.Error)
 	return err
