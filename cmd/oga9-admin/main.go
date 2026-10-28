@@ -183,6 +183,12 @@ func runImport(args []string) error {
 		"UPDATE tenants SET edition='self_hosted' WHERE id = $1::uuid", m.TenantID); err != nil {
 		return err
 	}
+	// imported outbox rows keep their history but must never re-fire —
+	// a published_at IS NULL row would be claimed by the dispatcher.
+	if _, err := tx.Exec(ctx,
+		"UPDATE domain_events SET published_at = now() WHERE published_at IS NULL"); err != nil {
+		return err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return err
 	}

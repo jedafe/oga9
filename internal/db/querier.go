@@ -485,6 +485,10 @@ type Querier interface {
 	// scope column ('organization_id', 'tenant_id') — without these passes
 	// the Rule-28 export silently drops unscoped join/child tables.
 	ExportChildFKs(ctx context.Context, scopeCol string) ([]ExportChildFKsRow, error)
+	// ADR-026: edges where one of our orgs is the relationship TARGET but the
+	// source org lives outside this tenant — unimportable (source absent);
+	// recorded as dropped_external in the bundle manifest.
+	ExportInboundExternalEdges(ctx context.Context, orgIds []pgtype.UUID) (string, error)
 	// preferences are user-keyed (no scope column) — join through the org's
 	// memberships so member prefs land in the export too.
 	ExportOrgNotificationPrefs(ctx context.Context, orgIds []pgtype.UUID) (string, error)

@@ -328,5 +328,14 @@ FROM users u WHERE u.id IN (
 -- the eventual hard delete (Rule 11 — the only hard-delete path).
 UPDATE organizations SET deleted_at=now() WHERE tenant_id=$1 AND deleted_at IS NULL;
 
+-- name: ExportInboundExternalEdges :one
+-- ADR-026: edges where one of our orgs is the relationship TARGET but the
+-- source org lives outside this tenant — unimportable (source absent);
+-- recorded as dropped_external in the bundle manifest.
+SELECT COALESCE(jsonb_agg(to_jsonb(t)),'[]'::jsonb)::text
+FROM organization_relationships t
+WHERE t.related_org_id = ANY(sqlc.arg(org_ids)::uuid[])
+  AND NOT (t.organization_id = ANY(sqlc.arg(org_ids)::uuid[]));
+
 -- name: GetFeatureFlag :one
 SELECT enabled FROM feature_flags WHERE key = $1;

@@ -342,6 +342,23 @@ func (q *Queries) ExportChildFKs(ctx context.Context, scopeCol string) ([]Export
 	return items, nil
 }
 
+const exportInboundExternalEdges = `-- name: ExportInboundExternalEdges :one
+SELECT COALESCE(jsonb_agg(to_jsonb(t)),'[]'::jsonb)::text
+FROM organization_relationships t
+WHERE t.related_org_id = ANY($1::uuid[])
+  AND NOT (t.organization_id = ANY($1::uuid[]))
+`
+
+// ADR-026: edges where one of our orgs is the relationship TARGET but the
+// source org lives outside this tenant — unimportable (source absent);
+// recorded as dropped_external in the bundle manifest.
+func (q *Queries) ExportInboundExternalEdges(ctx context.Context, orgIds []pgtype.UUID) (string, error) {
+	row := q.db.QueryRow(ctx, exportInboundExternalEdges, orgIds)
+	var column_1 string
+	err := row.Scan(&column_1)
+	return column_1, err
+}
+
 const exportOrgNotificationPrefs = `-- name: ExportOrgNotificationPrefs :one
 SELECT COALESCE(jsonb_agg(t),'[]'::jsonb)::text FROM notification_preferences t
 WHERE t.user_id IN (

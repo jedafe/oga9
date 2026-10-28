@@ -6,7 +6,6 @@
 package platform
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -921,7 +920,7 @@ func (s *Service) RunTenantExport(ctx context.Context, exportID uuid.UUID, passp
 	var opts ExportOptions
 	_ = json.Unmarshal(e.Options, &opts)
 	tenantID := fromPg(e.TenantID)
-	data, err := s.buildBundle(ctx, tenantID, opts, passphrase)
+	rc, cleanup, err := s.buildBundle(ctx, tenantID, opts, passphrase)
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
 			_ = fail(err)
@@ -933,8 +932,9 @@ func (s *Service) RunTenantExport(ctx context.Context, exportID uuid.UUID, passp
 		}
 		return fail(err)
 	}
+	defer cleanup()
 	key := "tenant-export/" + exportID.String() + ".oga9exp"
-	if err := s.store.Put(ctx, key, bytes.NewReader(data)); err != nil {
+	if err := s.store.Put(ctx, key, rc); err != nil {
 		return fail(err)
 	}
 	actor := fromPg(e.RequestedBy)

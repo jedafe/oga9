@@ -16,12 +16,13 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
-	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"regexp"
 	"time"
 
@@ -185,25 +186,20 @@ type Archive struct {
 // Open reads a bundle (raw tar.gz or a tenant_export_v1_enc envelope).
 // passphrase is required when the envelope is encrypted.
 func Open(r io.Reader, passphrase string) (*Archive, error) {
-	head := make([]byte, 4096)
+	head := make([]byte, len(encMagic))
 	n, _ := io.ReadFull(r, head)
 	head = head[:n]
-	body := io.MultiReader(io.NopCloser(bytesReader(head)), r)
+	body := io.MultiReader(bytesReader(head), r)
 
-	// tenant_export_v1_enc is a JSON envelope — sniff '{' vs gzip magic.
-	if n > 0 && head[0] == '{' {
-		raw, err := io.ReadAll(body)
-		if err != nil {
-			return nil, err
-		}
-		plain, err := decryptEnvelope(raw, passphrase)
-		if err != nil {
-			return nil, err
-		}
-		body = bytesReader(plain)
+	var (
+		tmp string
+		err error
+	)
+	if n == len(encMagic) && string(head) == encMagic {
+		tmp, err = decryptToTemp(body, passphrase)
+	} else {
+		tmp, err = spoolTemp(body)
 	}
-
-	tmp, err := spoolTemp(body)
 	if err != nil {
 		return nil, err
 	}
@@ -353,72 +349,145 @@ func (a *Archive) walk(fn func(string, io.Reader, int64) error) error {
 
 // ---------- passphrase envelope ----------
 
-type envelope struct {
-	Format  string `json:"format"`
-	KDF     string `json:"kdf"`
-	Salt    string `json:"salt"`
-	Nonce   string `json:"nonce"`
-	Payload string `json:"payload"`
+// tenant_export_v1_enc is a STREAMING binary envelope — the whole tar is
+// never held in memory on either side:
+//
+//	[8B  magic "OGA9ENC1"][16B argon2id salt][12B base nonce]
+//	repeated: [4B BE ct_len][ct] — ct = AES-256-GCM seal of a ≤4MiB
+//	plaintext chunk; nonce = base nonce XOR chunk counter (BE last 4B)
+//
+// A single key derives per-chunk nonces from a counter, so nonce reuse
+// is impossible while chunking stays sequential.
+const (
+	encMagic     = "OGA9ENC1"
+	encSaltLen   = 16
+	encNonceLen  = 12
+	encChunkSize = 4 << 20 // 4 MiB plaintext per chunk
+)
+
+func chunkNonce(base [encNonceLen]byte, counter uint32) []byte {
+	n := make([]byte, encNonceLen)
+	copy(n, base[:])
+	v := binary.BigEndian.Uint32(n[encNonceLen-4:])
+	binary.BigEndian.PutUint32(n[encNonceLen-4:], v^counter)
+	return n
 }
 
-// Encrypt wraps a finished tar.gz bundle in the tenant_export_v1_enc
-// envelope — argon2id(passphrase) → AES-256-GCM.
-func Encrypt(plain []byte, passphrase string) ([]byte, error) {
+// Encrypt streams the plaintext tar.gz through chunked AEAD into w.
+func Encrypt(w io.Writer, r io.Reader, passphrase string) error {
 	if passphrase == "" {
-		return nil, errors.New("bundle: passphrase required for credentials export")
+		return errors.New("bundle: passphrase required for credentials export")
 	}
-	salt := make([]byte, 16)
-	nonce := make([]byte, 12)
-	if _, err := rand.Read(salt); err != nil {
-		return nil, err
+	var salt [encSaltLen]byte
+	var nonce [encNonceLen]byte
+	if _, err := rand.Read(salt[:]); err != nil {
+		return err
 	}
-	if _, err := rand.Read(nonce); err != nil {
-		return nil, err
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return err
 	}
+	key := argon2.IDKey([]byte(passphrase), salt[:], 1, 64*1024, 4, 32)
+	aead, err := newAEAD(key)
+	if err != nil {
+		return err
+	}
+	if _, err := w.Write([]byte(encMagic)); err != nil {
+		return err
+	}
+	if _, err := w.Write(salt[:]); err != nil {
+		return err
+	}
+	if _, err := w.Write(nonce[:]); err != nil {
+		return err
+	}
+	buf := make([]byte, encChunkSize)
+	var counter uint32
+	var lenBuf [4]byte
+	for {
+		n, rerr := io.ReadFull(r, buf)
+		if n > 0 {
+			ct := aead.Seal(nil, chunkNonce(nonce, counter), buf[:n], nil)
+			binary.BigEndian.PutUint32(lenBuf[:], uint32(len(ct)))
+			if _, err := w.Write(lenBuf[:]); err != nil {
+				return err
+			}
+			if _, err := w.Write(ct); err != nil {
+				return err
+			}
+			counter++
+		}
+		if rerr == io.EOF || rerr == io.ErrUnexpectedEOF {
+			return nil
+		}
+		if rerr != nil {
+			return rerr
+		}
+	}
+}
+
+// decryptToTemp streams the chunked ciphertext to a plaintext temp file
+// (same backing the raw path uses) and returns its path.
+func decryptToTemp(r io.Reader, passphrase string) (string, error) {
+	var magic [len(encMagic)]byte
+	if _, err := io.ReadFull(r, magic[:]); err != nil || string(magic[:]) != encMagic {
+		return "", fmt.Errorf("bundle: bad envelope magic")
+	}
+	var hdr [encSaltLen + encNonceLen]byte
+	if _, err := io.ReadFull(r, hdr[:]); err != nil {
+		return "", fmt.Errorf("bundle: truncated envelope: %w", err)
+	}
+	if passphrase == "" {
+		return "", errors.New("bundle is encrypted — passphrase required")
+	}
+	salt, nonce := hdr[:encSaltLen], [encNonceLen]byte{}
+	copy(nonce[:], hdr[encSaltLen:])
 	key := argon2.IDKey([]byte(passphrase), salt, 1, 64*1024, 4, 32)
 	aead, err := newAEAD(key)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
-	env := envelope{
-		Format:  FormatV1Enc,
-		KDF:     "argon2id",
-		Salt:    base64.StdEncoding.EncodeToString(salt),
-		Nonce:   base64.StdEncoding.EncodeToString(nonce),
-		Payload: base64.StdEncoding.EncodeToString(aead.Seal(nil, nonce, plain, nil)),
-	}
-	return json.Marshal(env)
-}
-
-func decryptEnvelope(raw []byte, passphrase string) ([]byte, error) {
-	var env envelope
-	if err := json.Unmarshal(raw, &env); err != nil {
-		return nil, fmt.Errorf("bundle: bad envelope: %w", err)
-	}
-	if env.Format != FormatV1Enc {
-		return nil, fmt.Errorf("bundle: unsupported envelope %q", env.Format)
-	}
-	salt, err := base64.StdEncoding.DecodeString(env.Salt)
+	f, err := os.CreateTemp("", "oga9exp-dec-*")
 	if err != nil {
-		return nil, err
+		return "", err
 	}
-	nonce, err := base64.StdEncoding.DecodeString(env.Nonce)
-	if err != nil {
-		return nil, err
+	fail := func(err error) (string, error) {
+		f.Close()
+		os.Remove(f.Name())
+		return "", err
 	}
-	ct, err := base64.StdEncoding.DecodeString(env.Payload)
-	if err != nil {
-		return nil, err
+	var counter uint32
+	var lenBuf [4]byte
+	for {
+		if _, err := io.ReadFull(r, lenBuf[:]); err == io.EOF {
+			break
+		} else if err != nil {
+			return fail(fmt.Errorf("bundle: truncated chunk header: %w", err))
+		}
+		n := binary.BigEndian.Uint32(lenBuf[:])
+		if n == 0 || n > encChunkSize+16 {
+			return fail(errors.New("bundle: corrupt chunk length"))
+		}
+		ct := make([]byte, n)
+		if _, err := io.ReadFull(r, ct); err != nil {
+			return fail(fmt.Errorf("bundle: truncated chunk: %w", err))
+		}
+		pt, err := aead.Open(nil, chunkNonce(nonce, counter), ct, nil)
+		if err != nil {
+			return fail(errors.New("bundle decryption failed — wrong passphrase or corrupt data"))
+		}
+		if _, err := f.Write(pt); err != nil {
+			return fail(err)
+		}
+		counter++
 	}
-	if passphrase == "" {
-		return nil, errors.New("bundle is encrypted — passphrase required")
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return fail(err)
 	}
-	key := argon2.IDKey([]byte(passphrase), salt, 1, 64*1024, 4, 32)
-	aead, err := newAEAD(key)
-	if err != nil {
-		return nil, err
-	}
-	return aead.Open(nil, nonce, ct, nil)
+	// the spool convention keeps one temp per archive — hand the open
+	// file's path over and let Close() remove it.
+	path := f.Name()
+	f.Close()
+	return path, nil
 }
 
 func newAEAD(key []byte) (cipher.AEAD, error) {

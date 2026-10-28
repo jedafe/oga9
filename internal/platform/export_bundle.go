@@ -5,11 +5,12 @@
 package platform
 
 import (
-	"bytes"
 	"context"
 	"crypto/ed25519"
 	"encoding/json"
 	"errors"
+	"io"
+	"os"
 
 	"github.com/google/uuid"
 
@@ -111,22 +112,32 @@ func (s *Service) RequestTenantExport(ctx context.Context, tenantID, actor uuid.
 // include_credentials is set the tar is passphrase-encrypted into the
 // tenant_export_v1_enc envelope (passphrase travels via the task
 // payload, never the DB).
-func (s *Service) buildBundle(ctx context.Context, tenantID uuid.UUID, opts ExportOptions, passphrase string) ([]byte, error) {
+func (s *Service) buildBundle(ctx context.Context, tenantID uuid.UUID, opts ExportOptions, passphrase string) (*os.File, func(), error) {
 	if opts.IncludeCredentials && passphrase == "" {
-		return nil, ErrPassphraseRequired
+		return nil, nil, ErrPassphraseRequired
 	}
 	d, err := s.collectExport(ctx, tenantID, opts.IncludeCredentials)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	orgSet := map[string]bool{}
 	for _, id := range d.orgIDs {
 		orgSet[id.String()] = true
 	}
-	var buf bytes.Buffer
-	w := tenantexport.NewWriter(&buf, tenantID.String(), opts.IncludeCredentials)
+	// build to a temp file, never a memory buffer — blob archives can be
+	// large; the caller streams the result to blob storage.
+	tmp, err := os.CreateTemp("", "oga9exp-build-*")
+	if err != nil {
+		return nil, nil, err
+	}
+	cleanup := func() { tmp.Close(); os.Remove(tmp.Name()) }
+	fail := func(err error) (*os.File, func(), error) {
+		cleanup()
+		return nil, nil, err
+	}
+	w := tenantexport.NewWriter(tmp, tenantID.String(), opts.IncludeCredentials)
 	if err := w.AddJSONL("tenants", json.RawMessage("["+string(d.tenant)+"]")); err != nil {
-		return nil, err
+		return fail(err)
 	}
 	// Tables scoped by BOTH columns (audit_events…) land in both dumps —
 	// merge so each table writes one data file. NULL-org notifications
@@ -171,8 +182,20 @@ func (s *Service) buildBundle(ctx context.Context, tenantID uuid.UUID, opts Expo
 			}
 		}
 		if err := w.AddJSONL(tbl, rows); err != nil {
-			return nil, err
+			return fail(err)
 		}
+	}
+	// inbound edges: rows where one of our orgs is the TARGET but the
+	// source org lives outside this tenant — they never entered the dump
+	// (the org-scoped pass keys on the source column), so they're recorded
+	// as dropped_external too.
+	inbound, err := s.q.ExportInboundExternalEdges(ctx, d.orgIDs)
+	if err != nil {
+		return fail(err)
+	}
+	var inb []json.RawMessage
+	if json.Unmarshal(json.RawMessage(inbound), &inb) == nil && len(inb) > 0 {
+		w.AddDroppedExternal("organization_relationships(inbound)", json.RawMessage(inbound))
 	}
 	// blob files referenced by storage_key/file_key columns.
 	if s.store != nil {
@@ -186,12 +209,32 @@ func (s *Service) buildBundle(ctx context.Context, tenantID uuid.UUID, opts Expo
 		}
 	}
 	if err := w.Close(s.signKey()); err != nil {
-		return nil, err
+		return fail(err)
 	}
-	if opts.IncludeCredentials {
-		return tenantexport.Encrypt(buf.Bytes(), passphrase)
+	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
+		return fail(err)
 	}
-	return buf.Bytes(), nil
+	if !opts.IncludeCredentials {
+		return tmp, cleanup, nil
+	}
+	// credentialed: stream-encrypt into a second temp file, drop the
+	// plaintext as soon as the ciphertext exists.
+	enc, err := os.CreateTemp("", "oga9exp-enc-*")
+	if err != nil {
+		return fail(err)
+	}
+	cleanupEnc := func() { enc.Close(); os.Remove(enc.Name()) }
+	if err := tenantexport.Encrypt(enc, tmp, passphrase); err != nil {
+		cleanup()
+		cleanupEnc()
+		return nil, nil, err
+	}
+	cleanup() // plaintext temp is done
+	if _, err := enc.Seek(0, io.SeekStart); err != nil {
+		cleanupEnc()
+		return nil, nil, err
+	}
+	return enc, cleanupEnc, nil
 }
 
 // splitExternalEdges partitions organization_relationships rows: edges

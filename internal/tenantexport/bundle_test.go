@@ -157,11 +157,11 @@ func TestEncryptedEnvelope(t *testing.T) {
 	pub, priv := testKey(t)
 	bundle := buildTestBundle(t, priv)
 
-	enc, err := Encrypt(bundle, "s3cret")
-	if err != nil {
+	var enc bytes.Buffer
+	if err := Encrypt(&enc, bytes.NewReader(bundle), "s3cret"); err != nil {
 		t.Fatal(err)
 	}
-	a, err := Open(bytes.NewReader(enc), "s3cret")
+	a, err := Open(bytes.NewReader(enc.Bytes()), "s3cret")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -170,10 +170,10 @@ func TestEncryptedEnvelope(t *testing.T) {
 		t.Fatalf("verify: %v", err)
 	}
 
-	if _, err := Open(bytes.NewReader(enc), "wrong"); err == nil {
+	if _, err := Open(bytes.NewReader(enc.Bytes()), "wrong"); err == nil {
 		t.Fatal("expected decryption failure with wrong passphrase")
 	}
-	if _, err := Open(bytes.NewReader(enc), ""); err == nil {
+	if _, err := Open(bytes.NewReader(enc.Bytes()), ""); err == nil {
 		t.Fatal("expected failure without passphrase")
 	}
 }
