@@ -187,10 +187,57 @@ func (h *IntegrationsHandler) ListKeys(w http.ResponseWriter, r *http.Request) {
 	httpx.WriteData(w, 200, rows)
 }
 
+// validScope — scope entries are permission-node-shaped strings or "*";
+// anything else is a typo'd grant that would never match a check.
+func validScope(s string) bool {
+	if s == "*" {
+		return true
+	}
+	for _, c := range s {
+		if !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '.' || c == '_' || c == '-') {
+			return false
+		}
+	}
+	return s != ""
+}
+
 func (h *IntegrationsHandler) IssueKey(w http.ResponseWriter, r *http.Request) {
+	uid := middleware.UserID(r.Context())
+	if uid == uuid.Nil {
+		// tenant-scoped keys are issued/revoked through the control-plane
+		// surface only — never through /me (they'd mint identity-less rows).
+		httpx.WriteErr(w, 403, "forbidden", "user session required")
+		return
+	}
 	var req keyReq
 	_ = httpx.Decode(w, r, &req)
-	id, raw, err := h.svc.IssueKey(r.Context(), middleware.UserID(r.Context()), req.Scopes)
+	for _, s := range req.Scopes {
+		if !validScope(s) {
+			httpx.WriteErr(w, 400, "validation_failed", "scopes must be permission nodes or \"*\"")
+			return
+		}
+	}
+	// A key can never mint a broader key — the caller's own scope list is
+	// the ceiling for any key it issues (empty caller scopes = full).
+	if caller := middleware.APIKeyScopes(r.Context()); len(caller) > 0 {
+		star := false
+		allow := map[string]bool{}
+		for _, s := range caller {
+			if s == "*" {
+				star = true
+			}
+			allow[s] = true
+		}
+		if !star {
+			for _, s := range req.Scopes {
+				if !allow[s] {
+					httpx.WriteErr(w, 403, "scope_exceeds_grants", "requested scopes exceed this key's grants")
+					return
+				}
+			}
+		}
+	}
+	id, raw, err := h.svc.IssueKey(r.Context(), uid, req.Scopes)
 	if err != nil {
 		intErr(w, err)
 		return

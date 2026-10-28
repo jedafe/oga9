@@ -305,7 +305,7 @@ func TestSponsorWorkflow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := svc.AcceptInvitation(ctx, sp2user, inv.Token); err != nil {
+	if _, err := svc.AcceptInvitation(ctx, sp2user, inv.Token, ""); err != nil {
 		t.Fatal(err)
 	}
 	sp2, err := db.New(pool).GetMembership(ctx, db.GetMembershipParams{OrganizationID: toPg(org.ID), UserID: toPg(sp2user)})
@@ -418,7 +418,7 @@ func TestIntakeDeadEnds(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := svc.AcceptInvitation(ctx, invUser, inv.Token); err != nil {
+	if _, err := svc.AcceptInvitation(ctx, invUser, inv.Token, ""); err != nil {
 		t.Fatalf("accept: %v", err)
 	}
 	moc, err := svc.ResolveOrgCtx(ctx, invUser, org.ID)

@@ -55,8 +55,32 @@ func ClientIPOf(r *http.Request, trusted []*net.IPNet) string {
 		return host
 	}
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		if first, _, _ := strings.Cut(xff, ","); strings.TrimSpace(first) != "" {
-			return strings.TrimSpace(first)
+		parts := strings.Split(xff, ",")
+		// The rightmost UNTRUSTED hop is the attributable client claim —
+		// the leftmost is attacker-controlled wherever a proxy appends
+		// XFF, and trusting it gives callers a fresh rate-limit bucket
+		// per request.
+		for i := len(parts) - 1; i >= 0; i-- {
+			cand := strings.TrimSpace(parts[i])
+			if cand == "" {
+				continue
+			}
+			ip := net.ParseIP(cand)
+			trustedHop := false
+			if ip != nil {
+				for _, n := range trusted {
+					if n.Contains(ip) {
+						trustedHop = true
+						break
+					}
+				}
+			}
+			if !trustedHop {
+				return cand
+			}
+		}
+		if first := strings.TrimSpace(parts[0]); first != "" {
+			return first // every listed hop is trusted — earliest claim is all we have
 		}
 	}
 	return host

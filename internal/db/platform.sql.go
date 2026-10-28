@@ -882,6 +882,57 @@ func (q *Queries) ListUsage(ctx context.Context, tenantID pgtype.UUID) ([]UsageM
 	return items, nil
 }
 
+const liveSupportSessionsForOrg = `-- name: LiveSupportSessionsForOrg :many
+SELECT DISTINCT ss.id, ss.tenant_id, ss.reason, ss.expires_at, ss.created_at,
+       op.display_name AS operator_name, tu.display_name AS target_name
+FROM support_sessions ss
+JOIN users op ON op.id = ss.operator_user_id
+JOIN users tu ON tu.id = ss.target_user_id
+JOIN organization_memberships m ON m.user_id = ss.target_user_id
+WHERE m.organization_id = $1::uuid
+  AND ss.expires_at > now() AND ss.ended_at IS NULL
+`
+
+type LiveSupportSessionsForOrgRow struct {
+	ID           pgtype.UUID        `json:"id"`
+	TenantID     pgtype.UUID        `json:"tenant_id"`
+	Reason       pgtype.Text        `json:"reason"`
+	ExpiresAt    pgtype.Timestamptz `json:"expires_at"`
+	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+	OperatorName string             `json:"operator_name"`
+	TargetName   string             `json:"target_name"`
+}
+
+// §15: org admins see live support sessions impersonating ANY member of
+// their org — the banner isn't only visible to the impersonated user.
+func (q *Queries) LiveSupportSessionsForOrg(ctx context.Context, orgID pgtype.UUID) ([]LiveSupportSessionsForOrgRow, error) {
+	rows, err := q.db.Query(ctx, liveSupportSessionsForOrg, orgID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []LiveSupportSessionsForOrgRow
+	for rows.Next() {
+		var i LiveSupportSessionsForOrgRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.TenantID,
+			&i.Reason,
+			&i.ExpiresAt,
+			&i.CreatedAt,
+			&i.OperatorName,
+			&i.TargetName,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const liveSupportSessionsForUser = `-- name: LiveSupportSessionsForUser :many
 SELECT ss.id, ss.tenant_id, ss.reason, ss.expires_at, ss.created_at,
        op.display_name AS operator_name

@@ -383,6 +383,15 @@ func (s *Service) RecordPayment(ctx context.Context, oc *tenant.OrgCtx, in Payme
 		if d.Kind == "fixed_amount" && d.FixedAmountMinor.Valid && in.AmountMinor != d.FixedAmountMinor.Int64 {
 			return uuid.Nil, false, ErrDriveKind // fixed drives take exactly their amount
 		}
+		// a drive collects in one currency — mixed currencies corrupt the
+		// collected total and the eventual disbursement amount.
+		if pays, err := s.q.DrivePayments(ctx, toPg(in.DriveID)); err == nil {
+			for _, p := range pays {
+				if p.Currency != in.Currency {
+					return uuid.Nil, false, ErrBadValue
+				}
+			}
+		}
 	}
 	payer := in.MembershipID
 	if payer == uuid.Nil {
@@ -614,6 +623,13 @@ func (s *Service) postConfirmation(ctx context.Context, q *db.Queries, oc *tenan
 // ReversePayment posts a reversing ledger entry — the original row stays
 // untouched (Rule 19: corrections are reversal_of entries, never edits).
 func (s *Service) ReversePayment(ctx context.Context, oc *tenant.OrgCtx, pid uuid.UUID, memo string) error {
+	// SoD parity with ConfirmPayment: the recorder can't reverse their own
+	// payment — a different officer posts the correction.
+	if cur, err := s.q.GetPayment(ctx, db.GetPaymentParams{ID: toPg(pid), OrganizationID: toPg(oc.OrgID)}); err != nil {
+		return ErrNotFound
+	} else if cur.RecordedBy.Valid && fromPg(cur.RecordedBy) == oc.MembershipID {
+		return ErrSeparation
+	}
 	return s.withTx(ctx, func(q *db.Queries) error {
 		// §25: payments backing a disbursed expense are system spend —
 		// reversing one would orphan the budget spent_minor projection.
@@ -712,6 +728,14 @@ func (s *Service) SubmitClaim(ctx context.Context, oc *tenant.OrgCtx, in Payment
 		}
 		if d.Kind == "fixed_amount" && d.FixedAmountMinor.Valid && in.AmountMinor != d.FixedAmountMinor.Int64 {
 			return nil, false, ErrDriveKind
+		}
+		// one currency per collection — same guard as RecordPayment.
+		if pays, err := s.q.DrivePayments(ctx, toPg(in.DriveID)); err == nil {
+			for _, p := range pays {
+				if p.Currency != in.Currency {
+					return nil, false, ErrBadValue
+				}
+			}
 		}
 	}
 	// require_receipt for non-cash (org.finance.claims.require_receipt, default true)
@@ -1016,9 +1040,20 @@ func (s *Service) CloseDrive(ctx context.Context, oc *tenant.OrgCtx, did uuid.UU
 }
 
 // DisburseDrive releases collected funds — an expense (debit) ledger entry,
-// never a deletion or a hidden transfer.
+// never a deletion or a hidden transfer. SoD: the officer who opened the
+// drive can't disburse it; a memo naming the destination is required.
 func (s *Service) DisburseDrive(ctx context.Context, oc *tenant.OrgCtx, did uuid.UUID, memo string) error {
 	return s.withTx(ctx, func(q *db.Queries) error {
+		if memo == "" {
+			return ErrBadValue // disbursement must record its destination/purpose
+		}
+		d, err := q.GetDrive(ctx, db.GetDriveParams{ID: toPg(did), OrganizationID: toPg(oc.OrgID)})
+		if err != nil {
+			return ErrNotFound
+		}
+		if d.CreatedBy.Valid && fromPg(d.CreatedBy) == oc.MembershipID {
+			return ErrSeparation // opener can't disburse — same guard as payments
+		}
 		n, err := q.SetDriveState(ctx, db.SetDriveStateParams{
 			ID: toPg(did), OrganizationID: toPg(oc.OrgID), State: "disbursed", Column4: "closed"})
 		if err != nil {
@@ -1028,9 +1063,25 @@ func (s *Service) DisburseDrive(ctx context.Context, oc *tenant.OrgCtx, did uuid
 			return ErrInvalidTransition
 		}
 		tot, _ := q.DriveCollected(ctx, toPg(did))
-		cur := "NGN"
-		if pays, err := q.DrivePayments(ctx, toPg(did)); err == nil && len(pays) > 0 {
-			cur = pays[0].Currency
+		// every contribution must share one currency — a mixed-currency
+		// collection can't disburse as a single ledger amount.
+		cur := ""
+		pays, err := q.DrivePayments(ctx, toPg(did))
+		if err != nil {
+			return err
+		}
+		for _, p := range pays {
+			if cur == "" {
+				cur = p.Currency
+			} else if p.Currency != cur {
+				return ErrBadValue
+			}
+		}
+		if cur == "" {
+			cur = "NGN"
+			if raw, err := s.ru.Value(ctx, oc.OrgID, "org.dues.currency"); err == nil {
+				_ = json.Unmarshal(raw, &cur)
+			}
 		}
 		var le db.LedgerEntries
 		if tot.CollectedMinor > 0 {

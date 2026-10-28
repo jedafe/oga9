@@ -50,7 +50,7 @@ func RequireAnyOrgPermission(svc *tenant.Service, nodes ...string) func(http.Han
 				return
 			}
 			for _, n := range nodes {
-				if svc.HasPermission(r.Context(), oc.UserID, oc.OrgID, n) {
+				if svc.HasPermission(r.Context(), oc.UserID, oc.OrgID, n) && ScopeAllows(r.Context(), n) {
 					next.ServeHTTP(w, r)
 					return
 				}

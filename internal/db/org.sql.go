@@ -459,7 +459,7 @@ func (q *Queries) GetFieldByKey(ctx context.Context, arg GetFieldByKeyParams) (C
 }
 
 const getInvitationByToken = `-- name: GetInvitationByToken :one
-SELECT id, organization_id, invited_by, email, category, member_no_hint, status, expires_at
+SELECT id, organization_id, invited_by, email, phone, category, member_no_hint, status, expires_at
 FROM org_invitations WHERE token = $1
 `
 
@@ -468,6 +468,7 @@ type GetInvitationByTokenRow struct {
 	OrganizationID pgtype.UUID        `json:"organization_id"`
 	InvitedBy      pgtype.UUID        `json:"invited_by"`
 	Email          pgtype.Text        `json:"email"`
+	Phone          pgtype.Text        `json:"phone"`
 	Category       string             `json:"category"`
 	MemberNoHint   pgtype.Text        `json:"member_no_hint"`
 	Status         string             `json:"status"`
@@ -482,6 +483,7 @@ func (q *Queries) GetInvitationByToken(ctx context.Context, token pgtype.UUID) (
 		&i.OrganizationID,
 		&i.InvitedBy,
 		&i.Email,
+		&i.Phone,
 		&i.Category,
 		&i.MemberNoHint,
 		&i.Status,
@@ -893,7 +895,7 @@ func (q *Queries) ListOrgSettings(ctx context.Context, organizationID pgtype.UUI
 }
 
 const listPendingInvitations = `-- name: ListPendingInvitations :many
-SELECT id, email, phone, category, member_no_hint, expires_at, created_at
+SELECT id, email, phone, category, member_no_hint, token, expires_at, created_at
 FROM org_invitations WHERE organization_id = $1 AND status = 'pending' AND expires_at > now()
 ORDER BY created_at DESC
 `
@@ -904,6 +906,7 @@ type ListPendingInvitationsRow struct {
 	Phone        pgtype.Text        `json:"phone"`
 	Category     string             `json:"category"`
 	MemberNoHint pgtype.Text        `json:"member_no_hint"`
+	Token        pgtype.UUID        `json:"token"`
 	ExpiresAt    pgtype.Timestamptz `json:"expires_at"`
 	CreatedAt    pgtype.Timestamptz `json:"created_at"`
 }
@@ -923,6 +926,7 @@ func (q *Queries) ListPendingInvitations(ctx context.Context, organizationID pgt
 			&i.Phone,
 			&i.Category,
 			&i.MemberNoHint,
+			&i.Token,
 			&i.ExpiresAt,
 			&i.CreatedAt,
 		); err != nil {
@@ -1112,6 +1116,48 @@ func (q *Queries) OrgByCustomDomain(ctx context.Context, lower string) (string, 
 	var slug string
 	err := row.Scan(&slug)
 	return slug, err
+}
+
+const pendingInvitesByTokenPrefix = `-- name: PendingInvitesByTokenPrefix :many
+SELECT id, organization_id, phone, status, expires_at
+FROM org_invitations
+WHERE status = 'pending' AND expires_at > now() AND token::text LIKE $1 || '%'
+`
+
+type PendingInvitesByTokenPrefixRow struct {
+	ID             pgtype.UUID        `json:"id"`
+	OrganizationID pgtype.UUID        `json:"organization_id"`
+	Phone          pgtype.Text        `json:"phone"`
+	Status         string             `json:"status"`
+	ExpiresAt      pgtype.Timestamptz `json:"expires_at"`
+}
+
+// WhatsApp inbound join-code lookup: the member texts "JOIN <code>" where
+// code is a token prefix — prefix match then phone-verify in the service.
+func (q *Queries) PendingInvitesByTokenPrefix(ctx context.Context, dollar_1 pgtype.Text) ([]PendingInvitesByTokenPrefixRow, error) {
+	rows, err := q.db.Query(ctx, pendingInvitesByTokenPrefix, dollar_1)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []PendingInvitesByTokenPrefixRow
+	for rows.Next() {
+		var i PendingInvitesByTokenPrefixRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.OrganizationID,
+			&i.Phone,
+			&i.Status,
+			&i.ExpiresAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const retireField = `-- name: RetireField :execrows

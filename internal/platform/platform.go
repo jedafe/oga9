@@ -662,6 +662,13 @@ func (s *Service) LiveSupportSessions(ctx context.Context, userID uuid.UUID) ([]
 	return s.q.LiveSupportSessionsForUser(ctx, toPg(userID))
 }
 
+// LiveSupportSessionsForOrg — the org-admin side of the banner: live
+// impersonation sessions targeting ANY member of the org, not just the
+// caller (org.admin.settings surface).
+func (s *Service) LiveSupportSessionsForOrg(ctx context.Context, orgID uuid.UUID) ([]db.LiveSupportSessionsForOrgRow, error) {
+	return s.q.LiveSupportSessionsForOrg(ctx, toPg(orgID))
+}
+
 // WelcomeMail sends the provisioned owner's credential link — wired in
 // main (auth mints the action token, mailer sends). Fire-and-forget: mail
 // failure never fails the provision (Rule 8 fan-out semantics).

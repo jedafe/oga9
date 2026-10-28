@@ -421,3 +421,16 @@ func (h *PlatformHandler) MySupportSessions(w http.ResponseWriter, r *http.Reque
 	}
 	httpx.WriteData(w, 200, map[string]any{"impersonated": len(rows) > 0, "sessions": rows})
 }
+
+// OrgSupportSessions — GET /orgs/{id}/support-sessions (org.admin.settings):
+// the org-admin side of the §15 banner — live support sessions targeting
+// any member of the org, not just the caller.
+func (h *PlatformHandler) OrgSupportSessions(w http.ResponseWriter, r *http.Request) {
+	oc := middleware.OrgCtx(r.Context())
+	rows, err := h.svc.LiveSupportSessionsForOrg(r.Context(), oc.OrgID)
+	if err != nil {
+		platErr(w, err)
+		return
+	}
+	httpx.WriteData(w, 200, map[string]any{"impersonated": len(rows) > 0, "sessions": rows})
+}

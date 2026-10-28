@@ -32,7 +32,7 @@ func TestScopedAppointmentResolution(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := svc.AcceptInvitation(ctx, member, inv.Token); err != nil {
+	if _, err := svc.AcceptInvitation(ctx, member, inv.Token, ""); err != nil {
 		t.Fatal(err)
 	}
 	m, err := db.New(pool).GetMembership(ctx, db.GetMembershipParams{OrganizationID: toPg(org.ID), UserID: toPg(member)})

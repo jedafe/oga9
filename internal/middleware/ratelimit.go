@@ -6,12 +6,20 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	valkey "github.com/valkey-io/valkey-go"
 
 	"github.com/jedafe/oga9/internal/httpx"
 )
+
+// strict toggles fail-closed limiting — when Valkey is unreachable a
+// strict deployment returns 503 rather than admitting unbounded traffic.
+// Off by default (fail-open degrade); wired from OGA9_RATE_LIMIT_STRICT.
+var strict atomic.Bool
+
+func SetRateLimitStrict(v bool) { strict.Store(v) }
 
 // RateLimit returns a limiter allowing `limit` requests per `window` per
 // client IP per bucket. Exceed → 429 standard envelope.
@@ -30,6 +38,10 @@ func RateLimit(vk valkey.Client, bucket string, limit int64, window time.Duratio
 			ctx := r.Context()
 			n, err := vk.Do(ctx, vk.B().Incr().Key(key).Build()).AsInt64()
 			if err != nil {
+				if strict.Load() {
+					httpx.WriteErr(w, 503, "rate_limit_unavailable", "rate limiting is temporarily unavailable")
+					return
+				}
 				// fail-open: a Valkey blip must not take down auth entirely
 				next.ServeHTTP(w, r)
 				return

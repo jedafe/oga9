@@ -59,7 +59,7 @@ func activeMember(t *testing.T, svc *tenant.Service, pool *pgxpool.Pool, oc *ten
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := svc.AcceptInvitation(ctx, u, inv.Token); err != nil {
+	if _, err := svc.AcceptInvitation(ctx, u, inv.Token, ""); err != nil {
 		t.Fatal(err)
 	}
 	moc, err := svc.ResolveOrgCtx(ctx, u, oc.OrgID)

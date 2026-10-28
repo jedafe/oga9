@@ -169,6 +169,18 @@ FROM support_sessions ss
 JOIN users op ON op.id = ss.operator_user_id
 WHERE ss.target_user_id = $1 AND ss.expires_at > now() AND ss.ended_at IS NULL;
 
+-- name: LiveSupportSessionsForOrg :many
+-- §15: org admins see live support sessions impersonating ANY member of
+-- their org — the banner isn't only visible to the impersonated user.
+SELECT DISTINCT ss.id, ss.tenant_id, ss.reason, ss.expires_at, ss.created_at,
+       op.display_name AS operator_name, tu.display_name AS target_name
+FROM support_sessions ss
+JOIN users op ON op.id = ss.operator_user_id
+JOIN users tu ON tu.id = ss.target_user_id
+JOIN organization_memberships m ON m.user_id = ss.target_user_id
+WHERE m.organization_id = sqlc.arg(org_id)::uuid
+  AND ss.expires_at > now() AND ss.ended_at IS NULL;
+
 -- name: ClaimProvision :one
 -- atomic retry claim — 'failed' rows reclaim; 'processing' rows whose
 -- lease is older than 30min reclaim too. processing_started_at re-stamps

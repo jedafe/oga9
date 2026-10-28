@@ -344,11 +344,17 @@ func (s *Service) Review(ctx context.Context, oc *tenant.OrgCtx, gid uuid.UUID, 
 	if err != nil {
 		return ErrNotFound
 	}
+	// an 'approved' generation that never reached 'applied' (the domain
+	// apply failed after the decision committed) is re-drivable — the
+	// decision stands, only the apply retries.
+	alreadyApproved := g.State == "approved" && approve
 	state := "rejected"
 	if approve {
 		state = "approved"
 	}
-	if err := s.withTx(ctx, func(q *db.Queries) error {
+	if alreadyApproved {
+		// fall through to the apply block below — no state change needed.
+	} else if err := s.withTx(ctx, func(q *db.Queries) error {
 		n, err := q.SetGenerationState(ctx, db.SetGenerationStateParams{
 			ID: g.ID, OrganizationID: g.OrganizationID, State: state, ReviewedBy: toPg(oc.MembershipID)})
 		if err != nil {

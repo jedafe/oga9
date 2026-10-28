@@ -19,7 +19,8 @@ type Querier interface {
 	// (terminal) subscription — the guard keeps cancelled sticky. 0 rows =
 	// already cancelled, nothing to emit.
 	ActivateSubscription(ctx context.Context, arg ActivateSubscriptionParams) (int64, error)
-	// webhook settlement: pending → active (CAS; replay is a no-op).
+	// webhook settlement: pending → active (CAS; replay is a no-op). Annual
+	// grants re-anchor their expiry at settlement; monthly runs until cancelled.
 	ActivateTenantAddon(ctx context.Context, arg ActivateTenantAddonParams) (int64, error)
 	// 'registration'-type schedules are excluded: their obligations mint on
 	// MemberApproved via the consumer, one per new member — periodic fan-out
@@ -885,6 +886,9 @@ type Querier interface {
 	ListVisits(ctx context.Context, caseID pgtype.UUID) ([]WelfareVisits, error)
 	ListVolunteerRoles(ctx context.Context, arg ListVolunteerRolesParams) ([]VolunteerRoles, error)
 	ListWelfareCases(ctx context.Context, arg ListWelfareCasesParams) ([]WelfareCases, error)
+	// §15: org admins see live support sessions impersonating ANY member of
+	// their org — the banner isn't only visible to the impersonated user.
+	LiveSupportSessionsForOrg(ctx context.Context, orgID pgtype.UUID) ([]LiveSupportSessionsForOrgRow, error)
 	// §15 banner: the impersonated user's client surfaces the active support
 	// session AND the operator identity — user-scoped read, live rows only.
 	LiveSupportSessionsForUser(ctx context.Context, targetUserID pgtype.UUID) ([]LiveSupportSessionsForUserRow, error)
@@ -1046,6 +1050,9 @@ type Querier interface {
 	PendingBenefitForCase(ctx context.Context, caseID pgtype.UUID) (WelfareBenefits, error)
 	// §16 handover section: claims still awaiting officer review.
 	PendingClaimsForOrg(ctx context.Context, organizationID pgtype.UUID) ([]PaymentClaims, error)
+	// WhatsApp inbound join-code lookup: the member texts "JOIN <code>" where
+	// code is a token prefix — prefix match then phone-verify in the service.
+	PendingInvitesByTokenPrefix(ctx context.Context, dollar_1 pgtype.Text) ([]PendingInvitesByTokenPrefixRow, error)
 	PollOptionBelongs(ctx context.Context, arg PollOptionBelongsParams) (bool, error)
 	PollTally(ctx context.Context, pollID pgtype.UUID) ([]PollTallyRow, error)
 	PollTurnout(ctx context.Context, pollID pgtype.UUID) (int32, error)
@@ -1057,12 +1064,17 @@ type Querier interface {
 	// org.welfare.once_per.{kind}_days — a repeat request inside the window is
 	// flagged (not auto-rejected; the flag rides on the case for reviewers).
 	PriorCaseInWindow(ctx context.Context, arg PriorCaseInWindowParams) (pgtype.UUID, error)
+	// Currency consistency guard — a project's spend books in one currency.
+	ProjectExpenseCurrencies(ctx context.Context, arg ProjectExpenseCurrenciesParams) ([]string, error)
 	ProjectExpenseTotal(ctx context.Context, arg ProjectExpenseTotalParams) (int64, error)
 	// edges in both directions around the project node.
 	ProjectGraph(ctx context.Context, sourceID pgtype.UUID) ([]ProjectGraphRow, error)
 	// Owner user created by the provision pipeline — no password (welcome
 	// action-token flow); verified=false until they set credentials.
 	ProvisionUser(ctx context.Context, arg ProvisionUserParams) (Users, error)
+	// §23 retention: webhook receipts are raw delivery payloads — keep 30 days
+	// for debugging/replay, then drop. Processed rows only; unprocessed stays.
+	PruneProcessedReceipts(ctx context.Context) error
 	// directory surface honors the same opt-in as /apply: an org that never
 	// listed itself exposes no public docs listing (§03 opt-in). Slim
 	// projection — storage_key is internal, never shipped to anonymous clients.

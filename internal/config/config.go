@@ -53,18 +53,47 @@ type Config struct {
 	SMTPPort                int
 	SMTPUser                string
 	SMTPPass                string
-	GlitchTipDSN            string
-	MeilisearchURL          string
-	MeilisearchKey          string
-	S3Endpoint              string
-	S3Bucket                string
-	S3AccessKey             string
-	S3SecretKey             string
-	ImgproxyURL             string
-	BaseURL                 string
-	AppURL                  string // user-facing app origin for emailed links (app.oga9.com)
-	MailFrom                string
-	TrustedProxies          []*net.IPNet
+	// invite OTP delivery — generic HTTPS POST gateway (empty = phone
+	// invites stay unverifiable; the accept path fails closed then).
+	SMSGatewayURL string
+	SMSGatewayKey string
+	// WhatsApp Cloud API OTP channel — preferred over the generic SMS
+	// gateway when set. Needs a WABA + sender number + an approved
+	// authentication template (code rides as a template parameter).
+	WhatsAppToken         string // permanent access token
+	WhatsAppPhoneNumberID string // sender phone_number_id
+	WhatsAppTemplate      string // approved authentication template name
+	WhatsAppLang          string // template language code, e.g. en_US
+	WhatsAppOTPButton     string // "copy_code"|"url" if the template has an OTP button, else empty
+	// WhatsApp INBOUND channel — free verification path: the member texts
+	// "JOIN <code>" to the WABA number; the webhook verifies the sender.
+	WhatsAppVerifyToken string // GET webhook challenge token
+	WhatsAppAppSecret   string // X-Hub-Signature-256 HMAC key
+	// The WABA's own number (E.164 digits) — used to compose wa.me join
+	// links returned on phone invitations.
+	WhatsAppDisplayNumber string
+	// strict rate limiting — fail closed (503) when Valkey is unreachable
+	// instead of the default fail-open degrade.
+	RateLimitStrict bool
+	GlitchTipDSN    string
+	// Connector file: credential_refs resolve only inside this directory
+	// (empty → file: refs rejected; env: refs never read OGA9_* names).
+	SecretsDir string
+	// Self-hosted escape hatch: connector locator_url pushes may target
+	// http/private/loopback hosts (in-house japa). Default false — cloud
+	// deployments must never set it (SSRF guard + secret-exfil channel).
+	ConnectorAllowPrivateTargets bool
+	MeilisearchURL               string
+	MeilisearchKey               string
+	S3Endpoint                   string
+	S3Bucket                     string
+	S3AccessKey                  string
+	S3SecretKey                  string
+	ImgproxyURL                  string
+	BaseURL                      string
+	AppURL                       string // user-facing app origin for emailed links (app.oga9.com)
+	MailFrom                     string
+	TrustedProxies               []*net.IPNet
 }
 
 // OAuthProviderEnv is a raw provider env bundle; cmd/api maps it onto
@@ -108,16 +137,30 @@ func Load() (*Config, error) {
 		SMTPPort:                envInt(&errs, "OGA9_SMTP_PORT", 1025),
 		SMTPUser:                env("OGA9_SMTP_USERNAME", ""),
 		SMTPPass:                env("OGA9_SMTP_PASSWORD", ""),
+		SMSGatewayURL:           env("OGA9_SMS_GATEWAY_URL", ""),
+		SMSGatewayKey:           env("OGA9_SMS_GATEWAY_KEY", ""),
+		WhatsAppToken:           env("OGA9_WHATSAPP_TOKEN", ""),
+		WhatsAppPhoneNumberID:   env("OGA9_WHATSAPP_PHONE_NUMBER_ID", ""),
+		WhatsAppTemplate:        env("OGA9_WHATSAPP_TEMPLATE", ""),
+		WhatsAppLang:            env("OGA9_WHATSAPP_TEMPLATE_LANG", "en_US"),
+		WhatsAppOTPButton:       env("OGA9_WHATSAPP_OTP_BUTTON", ""),
+		WhatsAppVerifyToken:     env("OGA9_WHATSAPP_VERIFY_TOKEN", ""),
+		WhatsAppAppSecret:       env("OGA9_WHATSAPP_APP_SECRET", ""),
+		WhatsAppDisplayNumber:   env("OGA9_WHATSAPP_DISPLAY_NUMBER", ""),
+		RateLimitStrict:         env("OGA9_RATE_LIMIT_STRICT", "") == "true" || env("OGA9_RATE_LIMIT_STRICT", "") == "1",
 		GlitchTipDSN:            env("OGA9_GLITCHTIP_DSN", ""),
-		MeilisearchURL:          env("OGA9_MEILISEARCH_URL", ""),
-		MeilisearchKey:          env("OGA9_MEILISEARCH_KEY", ""),
-		S3Endpoint:              env("OGA9_S3_ENDPOINT", ""),
-		S3Bucket:                env("OGA9_S3_BUCKET", ""),
-		S3AccessKey:             env("OGA9_S3_ACCESS_KEY", ""),
-		S3SecretKey:             env("OGA9_S3_SECRET_KEY", ""),
-		ImgproxyURL:             env("OGA9_IMGPROXY_URL", ""),
-		MailFrom:                env("OGA9_MAIL_FROM", "noreply@oga9.com"),
-		BaseURL:                 env("OGA9_BASE_URL", "http://localhost:8080"),
+		SecretsDir:              env("OGA9_SECRETS_DIR", ""),
+		ConnectorAllowPrivateTargets: env("OGA9_CONNECTOR_ALLOW_PRIVATE_TARGETS", "") == "true" ||
+			env("OGA9_CONNECTOR_ALLOW_PRIVATE_TARGETS", "") == "1",
+		MeilisearchURL: env("OGA9_MEILISEARCH_URL", ""),
+		MeilisearchKey: env("OGA9_MEILISEARCH_KEY", ""),
+		S3Endpoint:     env("OGA9_S3_ENDPOINT", ""),
+		S3Bucket:       env("OGA9_S3_BUCKET", ""),
+		S3AccessKey:    env("OGA9_S3_ACCESS_KEY", ""),
+		S3SecretKey:    env("OGA9_S3_SECRET_KEY", ""),
+		ImgproxyURL:    env("OGA9_IMGPROXY_URL", ""),
+		MailFrom:       env("OGA9_MAIL_FROM", "noreply@oga9.com"),
+		BaseURL:        env("OGA9_BASE_URL", "http://localhost:8080"),
 	}
 	cfg.AppURL = env("OGA9_APP_URL", cfg.BaseURL)
 	for _, c := range strings.Split(env("OGA9_TRUSTED_PROXIES", ""), ",") {
@@ -143,8 +186,12 @@ func Load() (*Config, error) {
 	if cfg.Edition != "cloud" && cfg.Edition != "self_hosted" {
 		errs = append(errs, fmt.Errorf("OGA9_EDITION must be cloud or self_hosted, got %q", cfg.Edition))
 	}
-	if cfg.JWTSecret == "change-me" && cfg.Env == "production" {
-		errs = append(errs, errors.New("OGA9_JWT_SECRET must be set in production"))
+	// The JWT secret signs every session token and action token — a
+	// production deployment running on a guessable secret is forgeable.
+	// It also derives dataKey/licenseSeed when their dedicated vars are
+	// unset, so the entropy bar applies even on self-hosted.
+	if cfg.Env == "production" && len(cfg.JWTSecret) < 32 {
+		errs = append(errs, errors.New("OGA9_JWT_SECRET must be at least 32 characters in production"))
 	}
 	// The signing key is control-plane material (§09): only the cloud
 	// edition signs licenses. A self-hosted deployment must NEVER hold it —

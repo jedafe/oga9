@@ -172,13 +172,20 @@ VALUES (sqlc.arg(organization_id), sqlc.arg(email), sqlc.arg(phone), sqlc.arg(me
 RETURNING id, token, expires_at;
 
 -- name: ListPendingInvitations :many
-SELECT id, email, phone, category, member_no_hint, expires_at, created_at
+SELECT id, email, phone, category, member_no_hint, token, expires_at, created_at
 FROM org_invitations WHERE organization_id = $1 AND status = 'pending' AND expires_at > now()
 ORDER BY created_at DESC;
 
 -- name: GetInvitationByToken :one
-SELECT id, organization_id, invited_by, email, category, member_no_hint, status, expires_at
+SELECT id, organization_id, invited_by, email, phone, category, member_no_hint, status, expires_at
 FROM org_invitations WHERE token = $1;
+
+-- name: PendingInvitesByTokenPrefix :many
+-- WhatsApp inbound join-code lookup: the member texts "JOIN <code>" where
+-- code is a token prefix — prefix match then phone-verify in the service.
+SELECT id, organization_id, phone, status, expires_at
+FROM org_invitations
+WHERE status = 'pending' AND expires_at > now() AND token::text LIKE $1 || '%';
 
 -- name: SetInvitationStatus :one
 -- Org-scoped: an invitation id alone must not grant cross-org mutation.

@@ -22,6 +22,7 @@ import (
 	"github.com/jedafe/oga9/internal/db"
 	"github.com/jedafe/oga9/internal/entitlements"
 	"github.com/jedafe/oga9/internal/events"
+	"github.com/jedafe/oga9/internal/otp"
 	"github.com/jedafe/oga9/internal/rules"
 )
 
@@ -58,6 +59,9 @@ type Service struct {
 	vk         valkey.Client
 	ent        *entitlements.Service // Rule 25 — SetEntitlements wires it
 	regGate    func(ctx context.Context, orgID, memberID uuid.UUID) (bool, error)
+	otp        *otp.Service // phone-invite verification — SetInviteOTP wires it
+	waInbound  bool         // WhatsApp inbound channel wired — SetWhatsAppInbound
+	waNumber   string       // WABA display number for wa.me join links
 }
 
 func NewService(pool *pgxpool.Pool, vk valkey.Client) *Service {
@@ -68,6 +72,20 @@ func NewService(pool *pgxpool.Pool, vk valkey.Client) *Service {
 // rejects domains equal to or nested under it (an org claiming
 // `oga9.com`/`*.oga9.com` would hijack the platform's own portal).
 func (s *Service) SetBaseDomain(d string) { s.baseDomain = strings.ToLower(d) }
+
+// SetInviteOTP wires the one-time-code service for phone-targeted
+// invitations — nil leaves phone invites unverifiable and the accept path
+// fails closed (a bearer link never mints a membership).
+func (s *Service) SetInviteOTP(o *otp.Service) { s.otp = o }
+
+// SetWhatsAppInbound marks the WhatsApp inbound channel as wired — the
+// /webhooks/whatsapp receiver marks invites phone-verified via JOIN codes.
+// It's the zero-cost verification path (service conversations are free).
+// displayNumber is the WABA's digits used to compose wa.me join links on
+// invitation responses (empty → no links emitted).
+func (s *Service) SetWhatsAppInbound(v bool, displayNumber string) {
+	s.waInbound, s.waNumber = v, normPhone(displayNumber)
+}
 
 func toPg(u uuid.UUID) pgtype.UUID { return pgtype.UUID{Bytes: u, Valid: true} }
 func fromPg(p pgtype.UUID) uuid.UUID {

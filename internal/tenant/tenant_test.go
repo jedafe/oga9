@@ -125,10 +125,10 @@ func TestOrgLifecycleFlow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("invite: %v", err)
 	}
-	if _, err := svc.AcceptInvitation(ctx, stranger, inv.Token); err != ErrForbidden {
+	if _, err := svc.AcceptInvitation(ctx, stranger, inv.Token, ""); err != ErrForbidden {
 		t.Fatalf("wrong-email accept should be forbidden, got %v", err)
 	}
-	if _, err := svc.AcceptInvitation(ctx, member, inv.Token); err != nil {
+	if _, err := svc.AcceptInvitation(ctx, member, inv.Token, ""); err != nil {
 		t.Fatalf("accept: %v", err)
 	}
 	moc, err := svc.ResolveOrgCtx(ctx, member, org.ID)

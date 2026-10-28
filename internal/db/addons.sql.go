@@ -12,7 +12,8 @@ import (
 )
 
 const activateTenantAddon = `-- name: ActivateTenantAddon :execrows
-UPDATE tenant_addons SET state = 'active'
+UPDATE tenant_addons SET state = 'active',
+  expires_at = CASE WHEN billing_term = 'annual' THEN now() + interval '365 days' ELSE NULL END
 WHERE tenant_id = $1 AND addon_slug = $2 AND state = 'pending'
 `
 
@@ -21,7 +22,8 @@ type ActivateTenantAddonParams struct {
 	AddonSlug string      `json:"addon_slug"`
 }
 
-// webhook settlement: pending → active (CAS; replay is a no-op).
+// webhook settlement: pending → active (CAS; replay is a no-op). Annual
+// grants re-anchor their expiry at settlement; monthly runs until cancelled.
 func (q *Queries) ActivateTenantAddon(ctx context.Context, arg ActivateTenantAddonParams) (int64, error) {
 	result, err := q.db.Exec(ctx, activateTenantAddon, arg.TenantID, arg.AddonSlug)
 	if err != nil {

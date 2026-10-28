@@ -68,6 +68,8 @@ WHERE ta.tenant_id = $1
   AND ac.active;
 
 -- name: ActivateTenantAddon :execrows
--- webhook settlement: pending → active (CAS; replay is a no-op).
-UPDATE tenant_addons SET state = 'active'
+-- webhook settlement: pending → active (CAS; replay is a no-op). Annual
+-- grants re-anchor their expiry at settlement; monthly runs until cancelled.
+UPDATE tenant_addons SET state = 'active',
+  expires_at = CASE WHEN billing_term = 'annual' THEN now() + interval '365 days' ELSE NULL END
 WHERE tenant_id = $1 AND addon_slug = $2 AND state = 'pending';

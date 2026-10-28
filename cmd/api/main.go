@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -48,6 +49,7 @@ import (
 	"github.com/jedafe/oga9/internal/mailer"
 	"github.com/jedafe/oga9/internal/middleware"
 	"github.com/jedafe/oga9/internal/obs"
+	"github.com/jedafe/oga9/internal/otp"
 	"github.com/jedafe/oga9/internal/platform"
 	"github.com/jedafe/oga9/internal/projects"
 	"github.com/jedafe/oga9/internal/realtime"
@@ -58,6 +60,39 @@ import (
 	"github.com/jedafe/oga9/internal/tenant"
 	"github.com/jedafe/oga9/internal/welfare"
 )
+
+// egressClient serves admin-configured outbound targets (connector
+// locator_url pushes): a hard timeout plus a per-dial public-IP check so
+// DNS resolving to loopback/private/link-local space can't reach it.
+var egressClient = &http.Client{
+	Timeout: 15 * time.Second,
+	Transport: &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			host, port, err := net.SplitHostPort(addr)
+			if err != nil {
+				return nil, err
+			}
+			ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+			if err != nil {
+				return nil, err
+			}
+			d := net.Dialer{Timeout: 10 * time.Second}
+			for _, a := range ips {
+				ip := a.IP
+				if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
+					ip.IsLinkLocalMulticast() || ip.IsMulticast() || !ip.IsGlobalUnicast() {
+					continue
+				}
+				return d.DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
+			}
+			return nil, fmt.Errorf("egress: no public address for %s", host)
+		},
+	},
+}
+
+// smsClient — the operator-configured SMS gateway gets a timeout but no
+// IP restriction: self-hosted gateways legitimately live on private nets.
+var smsClient = &http.Client{Timeout: 15 * time.Second}
 
 func main() {
 	cfg, err := config.Load()
@@ -153,6 +188,43 @@ func main() {
 	finSvc := finance.NewService(pool, vk)
 	// §07: limit.members.active gate at membership activation (Rule 25).
 	orgSvc.SetEntitlements(entSvc)
+	// §10 phone-targeted invites: OTP proof of the invited number before a
+	// bearer link mints a membership. Delivery is a generic HTTPS POST
+	// gateway — unconfigured leaves phone invites unverifiable and the
+	// accept path fails closed (never silently degrades to bearer).
+	otpSvc := otp.NewService(vk)
+	switch {
+	case cfg.WhatsAppPhoneNumberID != "" && cfg.WhatsAppToken != "" && cfg.WhatsAppTemplate != "":
+		// Meta Cloud API preferred — authentication template carries the code.
+		otpSvc.SetSender(otp.WhatsAppSender(cfg.WhatsAppPhoneNumberID, cfg.WhatsAppToken,
+			cfg.WhatsAppTemplate, cfg.WhatsAppLang, cfg.WhatsAppOTPButton))
+	case cfg.SMSGatewayURL != "":
+		otpSvc.SetSender(func(ctx context.Context, destination, code string) error {
+			payload, _ := json.Marshal(map[string]string{
+				"to":   destination,
+				"text": "Your OGA9 verification code is " + code,
+			})
+			req, err := http.NewRequestWithContext(ctx, http.MethodPost, cfg.SMSGatewayURL, bytes.NewReader(payload))
+			if err != nil {
+				return err
+			}
+			req.Header.Set("Content-Type", "application/json")
+			if cfg.SMSGatewayKey != "" {
+				req.Header.Set("Authorization", "Bearer "+cfg.SMSGatewayKey)
+			}
+			resp, err := smsClient.Do(req)
+			if err != nil {
+				return err
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode >= 300 {
+				return fmt.Errorf("sms gateway: %d", resp.StatusCode)
+			}
+			return nil
+		})
+	}
+	orgSvc.SetInviteOTP(otpSvc)
+	middleware.SetRateLimitStrict(cfg.RateLimitStrict)
 	// ADR-014: approved→registered requires settled registration dues —
 	// the gate lives in finance so members never reads finance tables.
 	orgSvc.SetRegistrationGate(finSvc.RegistrationPending)
@@ -243,17 +315,18 @@ func main() {
 	anaSvc.SetSection("activities", func(ctx context.Context, oc *tenant.OrgCtx, role string) (any, error) {
 		return actSvc.List(ctx, oc, "", "", uuid.Nil)
 	})
-	anaSvc.SetSection("finance", func(ctx context.Context, oc *tenant.OrgCtx, role string) (any, error) {
-		if role != "treasurer" && role != "president" {
-			return nil, nil // org.finance.reports.read-scoped data
+	anaSvc.SetSection("finance", func(ctx context.Context, oc *tenant.OrgCtx, _ string) (any, error) {
+		// §19: content filtered by the viewer's permission NODES (Rule 20),
+		// not position names — any holder of reports.read sees the section.
+		if !orgSvc.HasPermission(ctx, oc.UserID, oc.OrgID, "org.finance.reports.read") {
+			return nil, nil
 		}
 		return finSvc.Statement(ctx, oc)
 	})
-	anaSvc.SetSection("welfare", func(ctx context.Context, oc *tenant.OrgCtx, role string) (any, error) {
-		// welfare cases are org.welfare.view_any data — officer seats
-		// only; a plain member's snapshot must not embed them (§19:
-		// content filtered by the viewer's permission nodes).
-		if role == "member" {
+	anaSvc.SetSection("welfare", func(ctx context.Context, oc *tenant.OrgCtx, _ string) (any, error) {
+		// welfare cases are org.welfare.view_any data — a member without
+		// the node's snapshot must not embed them (§19: permission nodes).
+		if !orgSvc.HasPermission(ctx, oc.UserID, oc.OrgID, "org.welfare.view_any") {
 			return nil, nil
 		}
 		return welSvc.ListCases(ctx, oc, "")
@@ -392,7 +465,9 @@ func main() {
 			return vk.Do(ctx, vk.B().Set().Key("oga9:ics:"+orgID.String()).Value(feed).Ex(time.Hour).Build()).Error()
 		})
 	// credential_ref resolves through the secrets seam — env: and file:
-	// schemes only; raw secrets are never stored (§23 rule).
+	// schemes only; raw secrets are never stored (§23 rule). file: refs
+	// are confined to OGA9_SECRETS_DIR; env: refs never read OGA9_* names.
+	secrets.SetFileRoot(cfg.SecretsDir)
 	intSvc.SetSecret(secrets.Resolve)
 	intSvc.SetApply(orgSvc.PublicApply)
 	// §23 ICS feed — renders the org's activities as VCALENDAR.
@@ -417,6 +492,13 @@ func main() {
 	})
 	// outbound sync transport — POST job payload to the connector's
 	// locator_url (ADR-021); credential_ref supplies the bearer token.
+	// The private-target opt-in swaps in a plain client (self-hosted,
+	// in-house connectors); default keeps the public-IP egress guard.
+	pushClient := egressClient
+	if cfg.ConnectorAllowPrivateTargets {
+		pushClient = smsClient
+	}
+	intSvc.SetAllowPrivateTargets(cfg.ConnectorAllowPrivateTargets)
 	intSvc.SetPost(func(ctx context.Context, url, auth string, payload []byte) error {
 		req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(payload))
 		if err != nil {
@@ -426,7 +508,7 @@ func main() {
 		if auth != "" {
 			req.Header.Set("Authorization", auth)
 		}
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := pushClient.Do(req)
 		if err != nil {
 			return err
 		}
@@ -661,6 +743,11 @@ func main() {
 	}
 	oauthH := handler.NewOAuthHandler(authSvc, vk, providers, cfg.BaseURL, cfg.AppURL, queue, cfg.JWTSecret, orgSvc)
 	orgH := handler.NewOrgHandler(orgSvc, entSvc)
+	// WhatsApp inbound — free phone-verification channel (service
+	// conversation): member texts "JOIN <code>" to the WABA number.
+	orgH.SetWhatsAppWebhook(cfg.WhatsAppVerifyToken, cfg.WhatsAppAppSecret)
+	orgSvc.SetWhatsAppInbound(cfg.WhatsAppVerifyToken != "" && cfg.WhatsAppAppSecret != "",
+		cfg.WhatsAppDisplayNumber)
 	fieldsH := handler.NewFieldsHandler(orgSvc)
 	blogH := handler.NewBlogHandler(blog.NewService(pool), "https://"+cfg.BaseDomain) // platform blog lives on the marketing surface
 	finH := handler.NewFinanceHandler(finSvc, orgSvc)
@@ -845,6 +932,10 @@ func main() {
 		r.With(middleware.RateLimit(vk, "directory", 30, time.Minute)).Get("/blog/rss.xml", blogH.RSS)
 		r.With(middleware.RateLimit(vk, "directory_apply", 10, time.Minute)).Post("/directory/orgs/{slug}/join", intH.LocatorJoin)
 		r.With(middleware.RateLimit(vk, "webhook", 60, time.Minute)).Post("/webhooks/{provider}", intH.Webhook)
+		// WhatsApp inbound — free phone verification: member texts "JOIN <code>"
+		// to the WABA number; Meta's webhook verifies the sender's number.
+		r.Get("/webhooks/whatsapp", orgH.WhatsAppVerify)
+		r.With(middleware.RateLimit(vk, "whatsapp", 120, time.Minute)).Post("/webhooks/whatsapp", orgH.WhatsAppWebhook)
 
 		// §07 self-hosted callback + provider webhook — no session auth;
 		// the signed material / HMAC signature is the credential (Rules 9/29).
@@ -962,6 +1053,7 @@ func main() {
 			r.Get("/org-templates", orgH.Templates)
 			r.Post("/orgs", orgH.Create)
 			r.With(middleware.RateLimit(vk, "invite_accept", 10, time.Minute)).Post("/invitations/{token}/accept", orgH.Accept)
+			r.With(middleware.RateLimit(vk, "invite_otp", 5, time.Minute)).Post("/invitations/{token}/otp", orgH.RequestInviteOTP)
 			// applicant self-service — no OrgCtx (a pre-decision applicant
 			// has no membership); the handler verifies ownership.
 			r.Post("/orgs/{org_id}/applications/{application_id}/withdraw", memberH.Withdraw)
@@ -989,6 +1081,7 @@ func main() {
 				r.With(middleware.RequireOrgPermission(orgSvc, "org.structure.manage")).Patch("/orgs/{org_id}/units/{unit_id}", orgH.UpdateUnit)
 				r.With(middleware.RequireOrgPermission(orgSvc, "org.structure.manage")).Delete("/orgs/{org_id}/units/{unit_id}", orgH.ArchiveUnit)
 				r.With(middleware.RequireOrgPermission(orgSvc, "org.admin.settings")).Get("/orgs/{org_id}/settings", orgH.Settings)
+				r.With(middleware.RequireOrgPermission(orgSvc, "org.admin.settings")).Get("/orgs/{org_id}/support-sessions", platH.OrgSupportSessions)
 				r.With(middleware.RequireOrgPermission(orgSvc, "org.admin.settings")).Patch("/orgs/{org_id}/settings", orgH.SetSetting)
 				r.With(middleware.RequireOrgPermission(orgSvc, "org.members.invite")).Get("/orgs/{org_id}/invitations", orgH.Invitations)
 				r.With(middleware.RequireOrgPermission(orgSvc, "org.members.invite")).Post("/orgs/{org_id}/invitations", orgH.Invite)
@@ -1111,7 +1204,7 @@ func main() {
 					r.With(middleware.RequireOrgPermission(orgSvc, "org.vendors.manage")).Get("/orgs/{org_id}/vendors", prjH.ListVendors)
 					r.With(middleware.RequireOrgPermission(orgSvc, "org.vendors.manage")).Post("/orgs/{org_id}/vendors", prjH.AddVendor)
 					r.With(middleware.RequireOrgPermission(orgSvc, "org.projects.manage")).Post("/orgs/{org_id}/projects/{project_id}/donors", prjH.RecordDonor)
-					r.With(middleware.RequireOrgPermission(orgSvc, "org.projects.manage")).Post("/orgs/{org_id}/projects/{project_id}/spend", prjH.RecordSpend)
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.projects.manage"), middleware.RequireOrgPermission(orgSvc, "org.finance.expenses.disburse")).Post("/orgs/{org_id}/projects/{project_id}/spend", prjH.RecordSpend)
 					r.With(middleware.RequireOrgPermission(orgSvc, "org.projects.manage")).Post("/orgs/{org_id}/projects/{project_id}/budget", prjH.SetBudget)
 					r.With(middleware.RequireOrgPermission(orgSvc, "org.projects.view")).Get("/orgs/{org_id}/projects/{project_id}/budget", prjH.GetBudget)
 					r.With(middleware.RequireOrgPermission(orgSvc, "org.projects.view")).Get("/orgs/{org_id}/projects/{project_id}/graph", prjH.Graph)

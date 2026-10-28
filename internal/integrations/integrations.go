@@ -13,6 +13,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"net"
+	"net/url"
 	"strings"
 	"time"
 
@@ -53,6 +55,9 @@ type Service struct {
 	// oga9:ics:{org_id} feed cache (Rule 4 — catalog entry in §23).
 	feedGet func(ctx context.Context, orgID uuid.UUID) (string, error)
 	feedSet func(ctx context.Context, orgID uuid.UUID, feed string) error
+	// self-hosted opt-in (OGA9_CONNECTOR_ALLOW_PRIVATE_TARGETS): locator_url
+	// may be http/private/loopback for in-house connectors.
+	allowPrivate bool
 }
 
 func NewService(pool *pgxpool.Pool) *Service {
@@ -67,6 +72,7 @@ func (s *Service) SetApply(fn func(context.Context, string, string, string, stri
 func (s *Service) SetCalendar(fn func(context.Context, *tenant.OrgCtx) (string, error)) {
 	s.calFn = fn
 }
+func (s *Service) SetAllowPrivateTargets(v bool) { s.allowPrivate = v }
 
 func (s *Service) withTx(ctx context.Context, fn func(*db.Queries) error) error {
 	tx, err := s.pool.Begin(ctx)
@@ -84,9 +90,49 @@ func (s *Service) withTx(ctx context.Context, fn func(*db.Queries) error) error 
 
 // Configure — non-secret config lands in config JSONB; the secret stays
 // behind credential_ref (Rule: secrets never in DB).
+// validateOutboundURL — delivery targets are admin-supplied; require https
+// and a public host so the push path can't be turned into an internal
+// probe or a secret-exfil sink (credential_ref rides as the bearer).
+// allowPrivate (operator opt-in, self-hosted) relaxes to http/https with
+// a non-empty host — in-house connectors live on private nets there.
+func validateOutboundURL(raw string, allowPrivate bool) error {
+	u, err := url.Parse(raw)
+	if err != nil || u.Hostname() == "" {
+		return ErrBadValue
+	}
+	if allowPrivate {
+		if u.Scheme != "https" && u.Scheme != "http" {
+			return ErrBadValue
+		}
+		return nil
+	}
+	if u.Scheme != "https" {
+		return ErrBadValue
+	}
+	h := strings.ToLower(u.Hostname())
+	if ip := net.ParseIP(h); ip != nil {
+		if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
+			ip.IsLinkLocalMulticast() || ip.IsMulticast() || !ip.IsGlobalUnicast() {
+			return ErrBadValue
+		}
+		return nil
+	}
+	if !strings.Contains(h, ".") {
+		return ErrBadValue // bare/local hostnames can't be delivery targets
+	}
+	return nil
+}
+
 func (s *Service) Configure(ctx context.Context, oc *tenant.OrgCtx, kind string,
 	config json.RawMessage, credentialRef string) (uuid.UUID, error) {
 	if !connectorKinds[kind] {
+		return uuid.Nil, ErrBadValue
+	}
+	var probe struct {
+		LocatorURL string `json:"locator_url"`
+	}
+	_ = json.Unmarshal(config, &probe)
+	if probe.LocatorURL != "" && validateOutboundURL(probe.LocatorURL, s.allowPrivate) != nil {
 		return uuid.Nil, ErrBadValue
 	}
 	var id uuid.UUID
@@ -255,6 +301,11 @@ func (s *Service) JapaPushConsumer(ctx context.Context, q *db.Queries, e events.
 // Reconcile — integrations:japa_sync_reconcile (daily): listed orgs
 // missing a locator mapping get a synthetic push via the consumer path.
 func (s *Service) Reconcile(ctx context.Context) (int, error) {
+	// Retention: raw delivery payloads don't outlive their debugging
+	// window — unsigned/unbounded intake rows can't grow the table forever.
+	if err := s.q.PruneProcessedReceipts(ctx); err != nil {
+		return 0, err
+	}
 	orgs, err := s.q.PublicOrgNeedsSync(ctx)
 	if err != nil {
 		return 0, err
@@ -512,6 +563,10 @@ func (s *Service) deliverJob(ctx context.Context, j db.SyncJobs) error {
 	switch {
 	case cfg.LocatorURL == "":
 		note = "no locator_url configured — inbound pull fallback covers delivery (ADR-021)"
+	case validateOutboundURL(cfg.LocatorURL, s.allowPrivate) != nil:
+		// re-validate at delivery — rows pre-dating the configure-time
+		// check must never reach the transport either.
+		state, note = "failed", "locator_url rejected: not a public https endpoint"
 	case s.postFn == nil:
 		note = "no transport configured — job recorded"
 	case j.Direction == "push":

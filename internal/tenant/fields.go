@@ -292,6 +292,9 @@ func (s *Service) SetFieldValues(ctx context.Context, oc *OrgCtx, entityType str
 			return ErrNotFound
 		}
 	}
+	if entityType == "organization" && entityID != oc.OrgID {
+		return ErrBadValue // org-entity values pin to this org's own row
+	}
 	keys := make([]string, 0, len(values))
 	for k := range values {
 		keys = append(keys, k)

@@ -34,6 +34,8 @@ func welfareErr(w http.ResponseWriter, err error) {
 		httpx.WriteErr(w, 422, "welfare_ineligible", "member does not meet eligibility rules")
 	case errors.Is(err, welfare.ErrDuplicate):
 		httpx.WriteErr(w, 409, "already_decided", "approver has already recorded a decision")
+	case errors.Is(err, welfare.ErrSelfAction):
+		httpx.WriteErr(w, 403, "forbidden", "the claimant cannot decide or disburse their own case")
 	default:
 		log.Printf("welfare: %v", err)
 		httpx.WriteErr(w, 500, "internal_error", "request failed")

@@ -25,6 +25,7 @@ var (
 	ErrBadState   = errors.New("bad_case_state")
 	ErrIneligible = errors.New("welfare_ineligible")
 	ErrDuplicate  = errors.New("already_decided")
+	ErrSelfAction = errors.New("welfare_self_action")
 )
 
 var welfareKinds = map[string]bool{"medical": true, "bereavement": true, "marriage": true,
@@ -221,6 +222,11 @@ func (s *Service) Decide(ctx context.Context, oc *tenant.OrgCtx, cid uuid.UUID,
 	if c.State != "requested" && c.State != "reviewing" {
 		return false, ErrBadState
 	}
+	// §12 separation-of-duties parity with payments/expenses: the claimant
+	// may never decide their own case, however many nodes they hold.
+	if fromPg(c.MembershipID) == oc.MembershipID {
+		return false, ErrSelfAction
+	}
 	seen, err := s.q.ApproverAlreadyDecided(ctx, db.ApproverAlreadyDecidedParams{
 		CaseID: c.ID, ApproverID: toPg(oc.MembershipID)})
 	if err != nil {
@@ -319,9 +325,21 @@ func (s *Service) Disburse(ctx context.Context, oc *tenant.OrgCtx, cid uuid.UUID
 	if c.State != "approved" {
 		return uuid.Nil, ErrBadState
 	}
+	// claimant can't disburse their own grant — same SoD as decide.
+	if fromPg(c.MembershipID) == oc.MembershipID {
+		return uuid.Nil, ErrSelfAction
+	}
 	var bid uuid.UUID
 	err = s.withTx(ctx, func(q *db.Queries) error {
 		if pend, err := q.PendingBenefitForCase(ctx, c.ID); err == nil {
+			// the disbursement can't exceed (or re-currency) the approved
+			// grant — the pending row is what approvers signed off on.
+			if kind == "cash" && pend.AmountMinor.Valid && amountMinor > pend.AmountMinor.Int64 {
+				return ErrBadValue
+			}
+			if kind == "cash" && pend.Currency.Valid && pend.Currency.String != currency {
+				return ErrBadValue
+			}
 			// fulfill the approve-time expense request
 			n, err := q.MarkBenefitDisbursed(ctx, db.MarkBenefitDisbursedParams{
 				ID: pend.ID, Kind: kind, AmountMinor: nInt(amountMinor), Currency: pgText(currency)})

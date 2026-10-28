@@ -17,10 +17,11 @@ import (
 type ctxKey string
 
 const (
-	CtxUserID     ctxKey = "user_id"
-	CtxSessionJTI ctxKey = "session_jti"
-	CtxMFAGate    ctxKey = "mfa_gate"
-	CtxTenantID   ctxKey = "tenant_id"
+	CtxUserID       ctxKey = "user_id"
+	CtxSessionJTI   ctxKey = "session_jti"
+	CtxMFAGate      ctxKey = "mfa_gate"
+	CtxTenantID     ctxKey = "tenant_id"
+	CtxAPIKeyScopes ctxKey = "api_key_scopes"
 )
 
 func bearerToken(r *http.Request) (string, bool) {
@@ -125,6 +126,30 @@ func SessionJTI(ctx context.Context) uuid.UUID {
 	return uuid.Nil
 }
 
+// APIKeyScopes returns the resolved api key's scope list — nil for
+// session-JWT auth (no narrowing), possibly-empty slice for key auth
+// (empty = unrestricted, the stored default).
+func APIKeyScopes(ctx context.Context) []string {
+	v, _ := ctx.Value(CtxAPIKeyScopes).([]string)
+	return v
+}
+
+// ScopeAllows gates a permission node on the api key's scope grant.
+// Session auth and unrestricted keys pass; scoped keys need an exact
+// node match or "*".
+func ScopeAllows(ctx context.Context, node string) bool {
+	sc := APIKeyScopes(ctx)
+	if sc == nil || len(sc) == 0 {
+		return true
+	}
+	for _, s := range sc {
+		if s == "*" || s == node {
+			return true
+		}
+	}
+	return false
+}
+
 // MFAGateNonce returns the gate nonce when the request authenticated via an
 // mfa_token rather than a full session (empty otherwise).
 func MFAGateNonce(ctx context.Context) string {
@@ -162,6 +187,7 @@ func APIKeyAuth(svc APIKeyResolver) func(http.Handler) http.Handler {
 			if k.UserID.Valid {
 				ctx = context.WithValue(ctx, CtxUserID, uuid.UUID(k.UserID.Bytes))
 			}
+			ctx = context.WithValue(ctx, CtxAPIKeyScopes, k.Scopes)
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}

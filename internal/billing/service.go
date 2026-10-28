@@ -849,10 +849,6 @@ func (s *Service) SubscribeAddon(ctx context.Context, tenantID uuid.UUID, slug, 
 	if !eligible {
 		return "", ErrAddonNotEligible
 	}
-	var exp pgtype.Timestamptz
-	if expiresAt != nil {
-		exp = pgtype.Timestamptz{Time: *expiresAt, Valid: true}
-	}
 	price := a.PriceMonthlyMinor.Int64
 	if term == "annual" {
 		price = a.PriceAnnualMinor.Int64
@@ -865,13 +861,20 @@ func (s *Service) SubscribeAddon(ctx context.Context, tenantID uuid.UUID, slug, 
 	if price <= 0 {
 		state = "active"
 	}
-	if state == "pending" && !exp.Valid {
-		// an abandoned checkout must lapse, not sit pending forever — the
-		// expiry sweep already consumes 'pending' rows past expires_at.
+	// expires_at is server-computed — client input is ignored so a caller
+	// can't stretch a grant past its billing term. Pending checkouts lapse
+	// at +grace (the sweep consumes 'pending' rows past expires_at); annual
+	// grants run a year; monthly is perpetual until cancelled.
+	var exp pgtype.Timestamptz
+	switch {
+	case state == "pending":
 		exp = pgtype.Timestamptz{
 			Time:  time.Now().Add(time.Duration(s.settingInt(ctx, "billing.grace_period_days", 14)) * 24 * time.Hour),
 			Valid: true}
+	case term == "annual":
+		exp = pgtype.Timestamptz{Time: time.Now().Add(365 * 24 * time.Hour), Valid: true}
 	}
+	_ = expiresAt // client-supplied expiry intentionally ignored
 	err = s.withTx(ctx, func(q *db.Queries) error {
 		if _, err := q.SubscribeTenantAddon(ctx, db.SubscribeTenantAddonParams{
 			TenantID: toPg(tenantID), AddonSlug: slug, State: state,

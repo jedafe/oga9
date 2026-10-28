@@ -507,6 +507,16 @@ func (s *Service) RecordSpend(ctx context.Context, oc *tenant.OrgCtx, pid uuid.U
 				}
 			}
 		}
+		// one currency per project — mixed-currency spend corrupts the
+		// budget and mandate totals.
+		curs, err := q.ProjectExpenseCurrencies(ctx, db.ProjectExpenseCurrenciesParams{
+			OrgID: toPg(oc.OrgID), ProjectID: p.ID})
+		if err != nil {
+			return err
+		}
+		if len(curs) > 1 || (len(curs) == 1 && curs[0] != currency) {
+			return ErrBadValue
+		}
 		if p.UnitID.Valid && s.mandateFn != nil {
 			limit, _, ok := s.mandateFn(ctx, fromPg(p.UnitID))
 			if ok {

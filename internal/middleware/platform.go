@@ -26,7 +26,7 @@ func RequirePlatformNode(pool *pgxpool.Pool, node string) func(http.Handler) htt
 				httpx.WriteErr(w, 500, "internal_error", "platform permission check failed")
 				return
 			}
-			if !ok {
+			if !ok || !ScopeAllows(r.Context(), node) {
 				httpx.WriteErr(w, 403, "permission_denied", "missing platform permission")
 				return
 			}

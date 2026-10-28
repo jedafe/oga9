@@ -414,11 +414,19 @@ func (h *MemberHandler) Import(w http.ResponseWriter, r *http.Request) {
 
 // Export — GET /orgs/{id}/members/export (export node): synchronous CSV —
 // the async membership:export file-delivery path lands with blob storage.
+// maxSyncExportRows bounds the synchronous export — large orgs must use
+// the async path (POST /exports → download) instead of a request-scoped dump.
+const maxSyncExportRows = 10000
+
 func (h *MemberHandler) Export(w http.ResponseWriter, r *http.Request) {
 	rows, err := h.svc.Members(r.Context(), middleware.OrgCtx(r.Context()), "", "", uuid.Nil)
 	if err != nil {
 		memberErr(w, err)
 		return
+	}
+	if len(rows) > maxSyncExportRows {
+		rows = rows[:maxSyncExportRows]
+		w.Header().Set("X-Export-Truncated", "true")
 	}
 	w.Header().Set("Content-Type", "text/csv")
 	w.Header().Set("Content-Disposition", `attachment; filename="members.csv"`)

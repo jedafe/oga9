@@ -2,9 +2,15 @@
 package handler
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
+	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -12,16 +18,25 @@ import (
 	"github.com/jedafe/oga9/internal/entitlements"
 	"github.com/jedafe/oga9/internal/httpx"
 	"github.com/jedafe/oga9/internal/middleware"
+	"github.com/jedafe/oga9/internal/otp"
 	"github.com/jedafe/oga9/internal/tenant"
 )
 
 type OrgHandler struct {
-	svc *tenant.Service
-	ent *entitlements.Service
+	svc           *tenant.Service
+	ent           *entitlements.Service
+	waVerifyToken string // Meta webhook GET challenge token
+	waAppSecret   string // X-Hub-Signature-256 HMAC key
 }
 
 func NewOrgHandler(svc *tenant.Service, ent *entitlements.Service) *OrgHandler {
 	return &OrgHandler{svc: svc, ent: ent}
+}
+
+// SetWhatsAppWebhook wires the Meta webhook credentials — the GET
+// subscription challenge token and the POST signature secret.
+func (h *OrgHandler) SetWhatsAppWebhook(verifyToken, appSecret string) {
+	h.waVerifyToken, h.waAppSecret = verifyToken, appSecret
 }
 
 func orgErr(w http.ResponseWriter, err error) {
@@ -56,6 +71,14 @@ func orgErr(w http.ResponseWriter, err error) {
 		httpx.WriteErr(w, 400, "unknown_setting_key", "key not in the settings catalog")
 	case errors.Is(err, tenant.ErrBadValue):
 		httpx.WriteErr(w, 400, "validation_failed", "invalid request value")
+	case errors.Is(err, tenant.ErrOTPRequired):
+		httpx.WriteErr(w, 400, "otp_required", "enter the code sent to the invited phone")
+	case errors.Is(err, tenant.ErrOTPUnconfigured):
+		httpx.WriteErr(w, 503, "otp_unavailable", "phone verification is not configured on this deployment")
+	case errors.Is(err, otp.ErrCooldown):
+		httpx.WriteErr(w, 429, "otp_cooldown", "wait before requesting another code")
+	case errors.Is(err, otp.ErrUnconfigured):
+		httpx.WriteErr(w, 503, "otp_unavailable", "phone verification is not configured on this deployment")
 	case errors.Is(err, tenant.ErrBadSlug):
 		httpx.WriteErr(w, 400, "invalid_slug", "slug must be lowercase alphanumeric with interior hyphens")
 	case errors.Is(err, tenant.ErrBadCategory):
@@ -311,19 +334,108 @@ func (h *OrgHandler) RevokeInvitation(w http.ResponseWriter, r *http.Request) {
 }
 
 // Accept is a sessioned public route — the caller logs in (or registers)
-// then redeems the invite token.
+// then redeems the invite token. Phone-targeted invites carry the OTP
+// delivered by RequestInviteOTP in the body.
 func (h *OrgHandler) Accept(w http.ResponseWriter, r *http.Request) {
 	tok, err := uuid.Parse(chi.URLParam(r, "token"))
 	if err != nil {
 		httpx.WriteErr(w, 400, "validation_failed", "bad token")
 		return
 	}
-	orgID, err := h.svc.AcceptInvitation(r.Context(), middleware.UserID(r.Context()), tok)
+	var req struct {
+		OTP string `json:"otp"`
+	}
+	_ = httpx.Decode(w, r, &req) // body optional — only phone invites need it
+	orgID, err := h.svc.AcceptInvitation(r.Context(), middleware.UserID(r.Context()), tok, req.OTP)
 	if err != nil {
 		orgErr(w, err)
 		return
 	}
 	httpx.WriteData(w, 200, map[string]any{"organization_id": orgID})
+}
+
+// WhatsAppVerify — GET /webhooks/whatsapp: Meta's subscription handshake.
+// Echoes hub.challenge when the verify token matches.
+func (h *OrgHandler) WhatsAppVerify(w http.ResponseWriter, r *http.Request) {
+	if h.waVerifyToken == "" ||
+		r.URL.Query().Get("hub.mode") != "subscribe" ||
+		r.URL.Query().Get("hub.verify_token") != h.waVerifyToken {
+		httpx.WriteErr(w, 403, "forbidden", "bad verify token")
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain")
+	w.WriteHeader(200)
+	_, _ = w.Write([]byte(r.URL.Query().Get("hub.challenge")))
+}
+
+// WhatsAppWebhook — POST /webhooks/whatsapp: Meta pushes inbound messages.
+// X-Hub-Signature-256 = sha256=HMAC_SHA256(app_secret, raw body) gates the
+// payload. A "JOIN <code>" text flags the matching pending phone invite
+// as verified — the free (service-conversation) verification channel.
+func (h *OrgHandler) WhatsAppWebhook(w http.ResponseWriter, r *http.Request) {
+	if h.waAppSecret == "" {
+		httpx.WriteErr(w, 503, "webhook_unconfigured", "whatsapp inbound is not configured")
+		return
+	}
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<20))
+	if err != nil {
+		httpx.WriteErr(w, 400, "validation_failed", "bad body")
+		return
+	}
+	mac := hmac.New(sha256.New, []byte(h.waAppSecret))
+	mac.Write(body)
+	if !hmac.Equal([]byte("sha256="+hex.EncodeToString(mac.Sum(nil))),
+		[]byte(r.Header.Get("X-Hub-Signature-256"))) {
+		httpx.WriteErr(w, 401, "invalid_signature", "signature mismatch")
+		return
+	}
+	var ev struct {
+		Entry []struct {
+			Changes []struct {
+				Value struct {
+					Messages []struct {
+						From string `json:"from"`
+						Text struct {
+							Body string `json:"body"`
+						} `json:"text"`
+					} `json:"messages"`
+				} `json:"value"`
+			} `json:"changes"`
+		} `json:"entry"`
+	}
+	if err := json.Unmarshal(body, &ev); err != nil {
+		httpx.WriteErr(w, 400, "validation_failed", "bad payload")
+		return
+	}
+	for _, e := range ev.Entry {
+		for _, ch := range e.Changes {
+			for _, m := range ch.Value.Messages {
+				f := strings.Fields(m.Text.Body)
+				if len(f) == 2 && strings.EqualFold(f[0], "JOIN") {
+					if _, err := h.svc.MarkInvitePhoneVerified(r.Context(), m.From, f[1]); err != nil {
+						log.Printf("whatsapp join: %v", err)
+					}
+				}
+			}
+		}
+	}
+	w.WriteHeader(200) // Meta retries non-200s — always ack after parse
+}
+
+// RequestInviteOTP — POST /invitations/{token}/otp: sends a one-time code
+// to the invited phone number. Phone-targeted invites must verify it at
+// accept; email-bound and open-link invites are a no-op here.
+func (h *OrgHandler) RequestInviteOTP(w http.ResponseWriter, r *http.Request) {
+	tok, err := uuid.Parse(chi.URLParam(r, "token"))
+	if err != nil {
+		httpx.WriteErr(w, 400, "validation_failed", "bad token")
+		return
+	}
+	if err := h.svc.RequestInviteOTP(r.Context(), tok); err != nil {
+		orgErr(w, err)
+		return
+	}
+	httpx.WriteData(w, 202, map[string]any{"sent": true})
 }
 
 func (h *OrgHandler) Branding(w http.ResponseWriter, r *http.Request) {

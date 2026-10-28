@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/mail"
 	"strings"
 	"time"
 
@@ -120,6 +121,16 @@ func (s *Service) memberNo(ctx context.Context, q *db.Queries, orgID uuid.UUID) 
 func (s *Service) Apply(ctx context.Context, orgID, userID uuid.UUID, email, phone string, answers json.RawMessage, sponsorIDs []uuid.UUID) (uuid.UUID, error) {
 	if email == "" && phone == "" {
 		return uuid.Nil, ErrInviteNoContact
+	}
+	if email != "" {
+		// normalize + reject unparseable addresses — the value lands in
+		// notification To: headers, so a malformed string is an SMTP
+		// header-injection vector, not just bad data.
+		addr, err := mail.ParseAddress(email)
+		if err != nil || addr.Address == "" {
+			return uuid.Nil, ErrBadValue
+		}
+		email = addr.Address
 	}
 	if len(answers) == 0 {
 		answers = json.RawMessage("{}")
@@ -486,7 +497,14 @@ func (s *Service) ResignSelf(ctx context.Context, userID, orgID uuid.UUID) error
 		return err
 	}
 	oc := &OrgCtx{OrgID: orgID, TenantID: fromPg(org.TenantID), UserID: userID, MembershipID: fromPg(m.ID)}
-	return s.TransitionMember(ctx, oc, fromPg(m.ID), "resign")
+	// 'resign' is the single self-exit verb — a pre-active member
+	// (applied/invited/screened) maps to their only legal edge, withdraw.
+	to := "resign"
+	switch m.LifecycleState {
+	case "applied", "invited", "screened":
+		to = "withdraw"
+	}
+	return s.TransitionMember(ctx, oc, fromPg(m.ID), to)
 }
 
 // TransitionMember drives the ADR-014 lifecycle machine on the membership
@@ -656,19 +674,28 @@ func (s *Service) PatchMember(ctx context.Context, oc *OrgCtx, memberID uuid.UUI
 	if category != "" && !memberCategories[category] {
 		return ErrBadCategory
 	}
+	m, err := s.q.GetMembershipByID(ctx, toPg(memberID))
+	if err != nil || fromPg(m.OrganizationID) != oc.OrgID {
+		return ErrNotMember
+	}
 	if unitID != uuid.Nil {
 		u, err := s.q.GetUnit(ctx, toPg(unitID))
 		if err != nil || fromPg(u.OrganizationID) != oc.OrgID {
 			return ErrBadScopeUnit // scope must be a unit of this org
+		}
+		if u.Type == "committee" {
+			return ErrBadScopeUnit // committee seats live in committee_memberships, not the home-unit column
 		}
 	}
 	if _, err := s.q.PatchMembership(ctx, db.PatchMembershipParams{
 		ID: toPg(memberID), OrgID: toPg(oc.OrgID), Category: pgText(category), OrgUnitID: pgUUIDPtr(unitID),
 	}); errors.Is(err, pgx.ErrNoRows) {
 		return ErrNotMember
-	} else {
+	} else if err != nil {
 		return err
 	}
+	s.InvalidateOrgCtx(ctx, fromPg(m.UserID), oc.OrgID) // category/unit changed — cached ctx is stale
+	return nil
 }
 
 // WithdrawApplication is the applicant's self-service path (catalogued
@@ -882,6 +909,14 @@ func (s *Service) ProcessImport(ctx context.Context, importID uuid.UUID) error {
 			errs = append(errs, map[string]any{"row": i, "error": "email_or_phone_required"})
 			continue
 		}
+		if email != "" {
+			if addr, e := mail.ParseAddress(email); e != nil || addr.Address == "" {
+				errs = append(errs, map[string]any{"row": i, "error": "invalid_email"})
+				continue
+			} else {
+				email = addr.Address
+			}
+		}
 		// Rule 27 idempotency: a retried worker skips rows that already
 		// produced an open application for this applicant (email or phone).
 		if exists, err := s.q.ExistsOpenApplicationByEmail(ctx, db.ExistsOpenApplicationByEmailParams{
@@ -974,7 +1009,7 @@ func (s *Service) ProcessExport(ctx context.Context, exportID uuid.UUID) error {
 }
 
 func csvCell(s string) string {
-	if strings.ContainsAny(s, ",\"\n") {
+	if strings.ContainsAny(s, ",\"\n\r") {
 		return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
 	}
 	return s

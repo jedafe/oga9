@@ -50,7 +50,7 @@ func (h *BillingHandler) tenantFor(w http.ResponseWriter, r *http.Request) (uuid
 	}
 	userID := middleware.UserID(r.Context())
 	admins, err := h.orgSvc.TenantsWithNode(r.Context(), userID, "org.admin.billing")
-	if err != nil || len(admins) == 0 {
+	if err != nil || len(admins) == 0 || !middleware.ScopeAllows(r.Context(), "org.admin.billing") {
 		httpx.WriteErr(w, 403, "billing_forbidden", "no administered tenant")
 		return uuid.Nil, false
 	}
@@ -107,7 +107,22 @@ type subscriptionReq struct {
 	BillingTerm string `json:"billing_term"`
 }
 
+// requireUserSession blocks tenant-scoped API keys from mutating billing —
+// an oga9_* key (UserID NULL) may read subscription/invoices/entitlements
+// but must never change plans or cancel: there'd be no user actor and an
+// integration credential shouldn't wield billing power.
+func (h *BillingHandler) requireUserSession(w http.ResponseWriter, r *http.Request) bool {
+	if middleware.UserID(r.Context()) == uuid.Nil {
+		httpx.WriteErr(w, 403, "billing_forbidden", "billing changes require a user session")
+		return false
+	}
+	return true
+}
+
 func (h *BillingHandler) CreateSubscription(w http.ResponseWriter, r *http.Request) {
+	if !h.requireUserSession(w, r) {
+		return
+	}
 	tenantID, ok := h.tenantFor(w, r)
 	if !ok {
 		return
@@ -142,6 +157,9 @@ func (h *BillingHandler) CreateSubscription(w http.ResponseWriter, r *http.Reque
 }
 
 func (h *BillingHandler) ChangePlan(w http.ResponseWriter, r *http.Request) {
+	if !h.requireUserSession(w, r) {
+		return
+	}
 	tenantID, ok := h.tenantFor(w, r)
 	if !ok {
 		return
@@ -169,6 +187,9 @@ func (h *BillingHandler) ChangePlan(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *BillingHandler) Cancel(w http.ResponseWriter, r *http.Request) {
+	if !h.requireUserSession(w, r) {
+		return
+	}
 	tenantID, ok := h.tenantFor(w, r)
 	if !ok {
 		return
@@ -395,6 +416,9 @@ func (h *BillingHandler) Addons(w http.ResponseWriter, r *http.Request) {
 
 // SubscribeAddon — POST /billing/addons/{slug}/subscribe (org.admin.billing).
 func (h *BillingHandler) SubscribeAddon(w http.ResponseWriter, r *http.Request) {
+	if !h.requireUserSession(w, r) {
+		return
+	}
 	tenantID, ok := h.tenantFor(w, r)
 	if !ok {
 		return
@@ -414,6 +438,9 @@ func (h *BillingHandler) SubscribeAddon(w http.ResponseWriter, r *http.Request) 
 
 // CancelAddon — POST /billing/addons/{slug}/cancel (org.admin.billing).
 func (h *BillingHandler) CancelAddon(w http.ResponseWriter, r *http.Request) {
+	if !h.requireUserSession(w, r) {
+		return
+	}
 	tenantID, ok := h.tenantFor(w, r)
 	if !ok {
 		return

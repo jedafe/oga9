@@ -188,13 +188,17 @@ func (g *Gateway) Ticket(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":{"code":"unauthorized","message":"session required","status":401}}`, 401)
 		return
 	}
+	if g.vk == nil {
+		// no store → the nonce couldn't verify at upgrade; fail honestly
+		// instead of minting a dead ticket.
+		http.Error(w, `{"error":{"code":"unavailable","message":"realtime unavailable","status":503}}`, 503)
+		return
+	}
 	nonce := uuid.NewString()
-	if g.vk != nil {
-		if err := g.vk.Do(r.Context(), g.vk.B().Set().Key("oga9:ws_ticket:"+nonce).
-			Value(uid.String()).ExSeconds(60).Build()).Error(); err != nil {
-			http.Error(w, `{"error":{"code":"internal_error","message":"ticket mint failed","status":500}}`, 500)
-			return
-		}
+	if err := g.vk.Do(r.Context(), g.vk.B().Set().Key("oga9:ws_ticket:"+nonce).
+		Value(uid.String()).ExSeconds(60).Build()).Error(); err != nil {
+		http.Error(w, `{"error":{"code":"internal_error","message":"ticket mint failed","status":500}}`, 500)
+		return
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.Write([]byte(`{"data":{"ticket":"` + nonce + `","expires_in":60}}`))

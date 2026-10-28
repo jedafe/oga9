@@ -20,6 +20,8 @@ import (
 )
 
 var ErrBadValue = errors.New("invalid json value")
+var ErrOTPRequired = errors.New("otp_required")
+var ErrOTPUnconfigured = errors.New("otp_unavailable")
 var ErrBadSlug = errors.New("invalid_slug")
 var ErrBadCategory = errors.New("invalid_category")
 var ErrBadRole = errors.New("invalid_role")
@@ -364,13 +366,30 @@ func (s *Service) SetSetting(ctx context.Context, oc *OrgCtx, key string, value 
 }
 
 type Invitation struct {
-	ID        uuid.UUID `json:"id"`
-	Email     string    `json:"email"`
-	Phone     string    `json:"phone"`
-	Category  string    `json:"category"`
-	Token     uuid.UUID `json:"token,omitempty"`
-	ExpiresAt time.Time `json:"expires_at"`
-	CreatedAt time.Time `json:"created_at"`
+	ID       uuid.UUID `json:"id"`
+	Email    string    `json:"email"`
+	Phone    string    `json:"phone"`
+	Category string    `json:"category"`
+	Token    uuid.UUID `json:"token,omitempty"`
+	// Phone-targeted invites expose the ready-made WhatsApp join link —
+	// the member texts "JOIN <join_code>" to the WABA number and the
+	// inbound webhook marks the invite verified. Server-composed so
+	// clients only render the link (empty when WhatsApp isn't wired).
+	JoinCode        string    `json:"join_code,omitempty"`
+	WhatsAppJoinURL string    `json:"whatsapp_join_url,omitempty"`
+	ExpiresAt       time.Time `json:"expires_at"`
+	CreatedAt       time.Time `json:"created_at"`
+}
+
+// joinFields composes the join code + wa.me link for a phone-targeted
+// invite — no-op for email/open invites or when WhatsApp isn't wired.
+func (s *Service) joinFields(inv *Invitation) {
+	if inv.Phone == "" || s.waNumber == "" || inv.Token == uuid.Nil {
+		return
+	}
+	code := inv.Token.String()[:8]
+	inv.JoinCode = code
+	inv.WhatsAppJoinURL = "https://wa.me/" + s.waNumber + "?text=JOIN%20" + code
 }
 
 func (s *Service) CreateInvitation(ctx context.Context, oc *OrgCtx, email, phone, hint, category string) (*Invitation, error) {
@@ -402,6 +421,7 @@ func (s *Service) CreateInvitation(ctx context.Context, oc *OrgCtx, email, phone
 		}
 		out = Invitation{ID: fromPg(r.ID), Email: email, Phone: phone, Category: category,
 			Token: fromPg(r.Token), ExpiresAt: r.ExpiresAt.Time}
+		s.joinFields(&out)
 		// membership_id is the inviter's (no invitee membership exists yet);
 		// invitation_id identifies the invite itself.
 		return events.Emit(ctx, q, oc.TenantID, oc.OrgID, "MemberInvited", "invitation", fromPg(r.ID), oc.UserID, true,
@@ -419,7 +439,8 @@ func (s *Service) ListInvitations(ctx context.Context, orgID uuid.UUID) ([]Invit
 	out := make([]Invitation, len(rows))
 	for i, r := range rows {
 		out[i] = Invitation{ID: fromPg(r.ID), Email: r.Email.String, Phone: r.Phone.String,
-			Category: r.Category, ExpiresAt: r.ExpiresAt.Time, CreatedAt: r.CreatedAt.Time}
+			Category: r.Category, Token: fromPg(r.Token), ExpiresAt: r.ExpiresAt.Time, CreatedAt: r.CreatedAt.Time}
+		s.joinFields(&out[i])
 	}
 	return out, nil
 }
@@ -443,16 +464,99 @@ func (s *Service) RevokeInvitation(ctx context.Context, oc *OrgCtx, inviteID uui
 
 // AcceptInvitation — public token flow: creates the membership for the
 // authenticated user (invited→applied fast-path, §10).
-func (s *Service) AcceptInvitation(ctx context.Context, userID uuid.UUID, token uuid.UUID) (uuid.UUID, error) {
+// normPhone strips everything but digits — invite phones and Meta sender
+// ids compare on the bare number.
+func normPhone(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if r >= '0' && r <= '9' {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+// MarkInvitePhoneVerified — the WhatsApp inbound path: the member texts
+// "JOIN <code>" to the WABA number; Meta reports the sender's number, so
+// a match against the invite's phone IS the verification (no code to
+// relay). Flags the invite in Valkey for the accept path (24h — the
+// invite's own expiry still governs).
+func (s *Service) MarkInvitePhoneVerified(ctx context.Context, senderPhone, joinCode string) (bool, error) {
+	code := strings.ToLower(strings.TrimSpace(joinCode))
+	if len(code) < 8 {
+		return false, nil // too short to be a token prefix — ignore
+	}
+	for _, r := range code {
+		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f')) {
+			return false, nil // not a uuid prefix — also keeps LIKE honest
+		}
+	}
+	rows, err := s.q.PendingInvitesByTokenPrefix(ctx, pgText(code))
+	if err != nil {
+		return false, err
+	}
+	sender := normPhone(senderPhone)
+	for _, inv := range rows {
+		if !inv.Phone.Valid || normPhone(inv.Phone.String) != sender {
+			continue
+		}
+		if s.vk != nil {
+			_ = s.vk.Do(ctx, s.vk.B().Set().Key("oga9:phoneok:"+fromPg(inv.ID).String()).
+				Value("1").ExSeconds(86400).Build()).Error()
+		}
+		return true, nil
+	}
+	return false, nil
+}
+
+// RequestInviteOTP mints + sends a verification code to a phone-targeted
+// invitation's number. Email-bound and open-link invites are a no-op —
+// they need no phone proof. 60s resend cooldown lives inside otp.Send.
+func (s *Service) RequestInviteOTP(ctx context.Context, token uuid.UUID) error {
+	inv, err := s.q.GetInvitationByToken(ctx, toPg(token))
+	if err != nil || inv.Status != "pending" || inv.ExpiresAt.Time.Before(time.Now()) {
+		return ErrInviteDead
+	}
+	if !inv.Phone.Valid || inv.Phone.String == "" {
+		return nil // nothing to verify by phone
+	}
+	if s.otp == nil {
+		return ErrOTPUnconfigured
+	}
+	return s.otp.Send(ctx, "invite", fromPg(inv.ID).String(), inv.Phone.String)
+}
+
+func (s *Service) AcceptInvitation(ctx context.Context, userID uuid.UUID, token uuid.UUID, otpCode string) (uuid.UUID, error) {
 	inv, err := s.q.GetInvitationByToken(ctx, toPg(token))
 	if err != nil || inv.Status != "pending" || inv.ExpiresAt.Time.Before(time.Now()) {
 		return uuid.Nil, ErrInviteDead
 	}
 	// email-targeted invites bind to the acceptor's verified address
-	if inv.Email.Valid && inv.Email.String != "" {
+	emailBound := inv.Email.Valid && inv.Email.String != ""
+	if emailBound {
 		u, err := s.q.GetUserByID(ctx, toPg(userID))
 		if err != nil || !strings.EqualFold(u.Email, inv.Email.String) {
 			return uuid.Nil, ErrForbidden
+		}
+	}
+	// phone-targeted (email-less) invites require proof of the invited
+	// number — the bearer link alone must never mint a membership. Proof
+	// is either the delivered OTP or the WhatsApp-inbound flag set when
+	// Meta reported the sender == inv.phone. Neither channel wired → fail
+	// closed, never silently degrade to bearer.
+	if !emailBound && inv.Phone.Valid && inv.Phone.String != "" {
+		verified := s.otp != nil && s.otp.Verify(ctx, "invite", fromPg(inv.ID).String(), otpCode)
+		if !verified && s.vk != nil {
+			if _, err := s.vk.Do(ctx, s.vk.B().Get().Key(
+				"oga9:phoneok:"+fromPg(inv.ID).String()).Build()).AsBytes(); err == nil {
+				verified = true
+			}
+		}
+		if !verified {
+			if s.otp == nil && !s.waInbound {
+				return uuid.Nil, ErrOTPUnconfigured
+			}
+			return uuid.Nil, ErrOTPRequired
 		}
 	}
 	orgID := fromPg(inv.OrganizationID)
@@ -489,6 +593,13 @@ func (s *Service) AcceptInvitation(ctx context.Context, userID uuid.UUID, token 
 				OrganizationID: inv.OrganizationID, UserID: toPg(userID),
 				MemberNo: inv.MemberNoHint, Category: inv.Category, LifecycleState: "applied",
 			}); err != nil {
+				// a claimed member_no hint collides on UNIQUE — surface a
+				// 4xx, not an unmapped 500.
+				var pgErr *pgconn.PgError
+				if errors.As(err, &pgErr) && pgErr.Code == "23505" &&
+					strings.Contains(pgErr.ConstraintName, "member_no") {
+					return ErrBadValue
+				}
 				return err
 			}
 			// The member role lands at 'active' via TransitionMember — the

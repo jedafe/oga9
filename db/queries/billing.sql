@@ -186,7 +186,7 @@ SELECT DISTINCT o.tenant_id FROM officer_appointments oa
 JOIN position_permissions pp ON pp.position_id = oa.position_id
 JOIN organization_memberships m ON m.id = oa.member_id
 JOIN organizations o ON o.id = oa.organization_id
-JOIN terms t ON t.id = oa.term_id AND (t.ends_at IS NULL OR t.ends_at > now())
+JOIN terms t ON t.id = oa.term_id AND t.is_current
 WHERE m.user_id = sqlc.arg(user_id)::uuid
   AND m.lifecycle_state = 'active'
   AND (oa.ends_at IS NULL OR oa.ends_at >= now()::date)

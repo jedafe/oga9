@@ -630,6 +630,37 @@ func (q *Queries) MilestoneProgress(ctx context.Context, projectID pgtype.UUID) 
 	return i, err
 }
 
+const projectExpenseCurrencies = `-- name: ProjectExpenseCurrencies :many
+SELECT DISTINCT currency FROM project_expenses
+WHERE organization_id = $1::uuid AND project_id = $2::uuid
+`
+
+type ProjectExpenseCurrenciesParams struct {
+	OrgID     pgtype.UUID `json:"org_id"`
+	ProjectID pgtype.UUID `json:"project_id"`
+}
+
+// Currency consistency guard — a project's spend books in one currency.
+func (q *Queries) ProjectExpenseCurrencies(ctx context.Context, arg ProjectExpenseCurrenciesParams) ([]string, error) {
+	rows, err := q.db.Query(ctx, projectExpenseCurrencies, arg.OrgID, arg.ProjectID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []string
+	for rows.Next() {
+		var currency string
+		if err := rows.Scan(&currency); err != nil {
+			return nil, err
+		}
+		items = append(items, currency)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const projectExpenseTotal = `-- name: ProjectExpenseTotal :one
 SELECT COALESCE(SUM(amount_minor),0)::bigint AS total
 FROM project_expenses

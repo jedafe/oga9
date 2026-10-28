@@ -152,3 +152,8 @@ WHERE oa.organization_id = $1
   AND (oa.ends_at IS NULL OR oa.ends_at >= CURRENT_DATE)
   AND m.lifecycle_state = 'active'
 ORDER BY p.name;
+
+-- name: PruneProcessedReceipts :exec
+-- §23 retention: webhook receipts are raw delivery payloads — keep 30 days
+-- for debugging/replay, then drop. Processed rows only; unprocessed stays.
+DELETE FROM webhook_receipts WHERE processed_at IS NOT NULL AND created_at < now() - interval '30 days';

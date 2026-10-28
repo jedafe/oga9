@@ -64,7 +64,7 @@ func setup(t *testing.T, e *env) (*tenant.OrgCtx, uuid.UUID, *tenant.OrgCtx) {
 		t.Fatal(err)
 	}
 	u3 := mkUser(t, e.pool, email2)
-	if _, err := e.org.AcceptInvitation(ctx, u3, inv.Token); err != nil {
+	if _, err := e.org.AcceptInvitation(ctx, u3, inv.Token, ""); err != nil {
 		t.Fatal(err)
 	}
 	oc2, _ := e.org.ResolveOrgCtx(ctx, u3, org.ID)
@@ -267,7 +267,7 @@ func TestChatFlow(t *testing.T) {
 		 RETURNING id`, "dm3"+uuid.NewString()[:8]+"@t.co").Scan(&third)
 	inv3, _ := e.org.CreateInvitation(ctx, oc, "dm3x"+uuid.NewString()[:8]+"@t.co", "", "", "floor")
 	u3 := mkUser(t, e.pool, inv3.Email)
-	e.org.AcceptInvitation(ctx, u3, inv3.Token)
+	e.org.AcceptInvitation(ctx, u3, inv3.Token, "")
 	oc3, _ := e.org.ResolveOrgCtx(ctx, u3, oc.OrgID)
 	if err := e.chat.AddMember(ctx, oc, dmID, oc3.MembershipID, "member"); err != chat.ErrBadValue {
 		t.Fatalf("third dm member should be refused, got %v", err)

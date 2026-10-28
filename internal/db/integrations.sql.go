@@ -498,6 +498,17 @@ func (q *Queries) MarkReceiptProcessed(ctx context.Context, id pgtype.UUID) (int
 	return result.RowsAffected(), nil
 }
 
+const pruneProcessedReceipts = `-- name: PruneProcessedReceipts :exec
+DELETE FROM webhook_receipts WHERE processed_at IS NOT NULL AND created_at < now() - interval '30 days'
+`
+
+// §23 retention: webhook receipts are raw delivery payloads — keep 30 days
+// for debugging/replay, then drop. Processed rows only; unprocessed stays.
+func (q *Queries) PruneProcessedReceipts(ctx context.Context) error {
+	_, err := q.db.Exec(ctx, pruneProcessedReceipts)
+	return err
+}
+
 const publicOrgBySlug = `-- name: PublicOrgBySlug :many
 SELECT o.id, o.name, o.slug, o.city, o.country_code, o.maturity_level,
   (SELECT count(*) FROM organization_memberships m WHERE m.organization_id = o.id

@@ -142,3 +142,8 @@ WHERE organization_id = sqlc.arg(org_id)::uuid AND unit_id = sqlc.arg(unit_id)::
 -- serializes committee-capped spend across different projects sharing
 -- one mandate (pg advisory lock, released at tx end).
 SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0));
+
+-- name: ProjectExpenseCurrencies :many
+-- Currency consistency guard — a project's spend books in one currency.
+SELECT DISTINCT currency FROM project_expenses
+WHERE organization_id = sqlc.arg(org_id)::uuid AND project_id = sqlc.arg(project_id)::uuid;
