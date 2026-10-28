@@ -1027,19 +1027,20 @@ func (q *Queries) LiveSupportSessionsForUser(ctx context.Context, targetUserID p
 }
 
 const markTenantExportDone = `-- name: MarkTenantExportDone :execrows
-UPDATE tenant_exports SET status='done', storage_key=$2, error=NULL, completed_at=now()
+UPDATE tenant_exports SET status='done', storage_key=$2, bundle_version=$3, error=NULL, completed_at=now()
 WHERE id=$1 AND status IN ('processing','failed')
 `
 
 type MarkTenantExportDoneParams struct {
-	ID         pgtype.UUID `json:"id"`
-	StorageKey pgtype.Text `json:"storage_key"`
+	ID            pgtype.UUID `json:"id"`
+	StorageKey    pgtype.Text `json:"storage_key"`
+	BundleVersion pgtype.Int4 `json:"bundle_version"`
 }
 
 // CAS: only a live/failed row finishes — a retry after a marked failure
 // CAN complete (the blob is valid; 'failed' just records the last error).
 func (q *Queries) MarkTenantExportDone(ctx context.Context, arg MarkTenantExportDoneParams) (int64, error) {
-	result, err := q.db.Exec(ctx, markTenantExportDone, arg.ID, arg.StorageKey)
+	result, err := q.db.Exec(ctx, markTenantExportDone, arg.ID, arg.StorageKey, arg.BundleVersion)
 	if err != nil {
 		return 0, err
 	}

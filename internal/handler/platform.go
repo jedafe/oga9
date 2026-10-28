@@ -353,8 +353,8 @@ func (h *PlatformHandler) DownloadTenantExport(w http.ResponseWriter, r *http.Re
 		return
 	}
 	defer blob.Close()
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=oga9-tenant-%s.json", tid))
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=oga9-tenant-%s.oga9exp", tid))
 	_, _ = io.Copy(w, blob)
 }
 

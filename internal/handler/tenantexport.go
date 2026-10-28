@@ -128,6 +128,10 @@ func (h *TenantExportHandler) Get(w http.ResponseWriter, r *http.Request) {
 		tenantExportErr(w, err)
 		return
 	}
+	if status == "failed" {
+		httpx.WriteErr(w, 409, "export_failed", "export failed — request a new one")
+		return
+	}
 	if status != "done" {
 		httpx.WriteData(w, 202, map[string]any{"export_id": eid, "status": status})
 		return

@@ -300,7 +300,7 @@ SELECT * FROM tenant_exports WHERE id = $1 AND tenant_id = $2;
 -- name: MarkTenantExportDone :execrows
 -- CAS: only a live/failed row finishes — a retry after a marked failure
 -- CAN complete (the blob is valid; 'failed' just records the last error).
-UPDATE tenant_exports SET status='done', storage_key=$2, error=NULL, completed_at=now()
+UPDATE tenant_exports SET status='done', storage_key=$2, bundle_version=$3, error=NULL, completed_at=now()
 WHERE id=$1 AND status IN ('processing','failed');
 
 -- name: MarkTenantExportFailed :exec

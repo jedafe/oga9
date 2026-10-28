@@ -40,6 +40,7 @@ var (
 func toPg(u uuid.UUID) pgtype.UUID   { return pgtype.UUID{Bytes: u, Valid: u != uuid.Nil} }
 func fromPg(u pgtype.UUID) uuid.UUID { return uuid.UUID(u.Bytes) }
 func pgText(s string) pgtype.Text    { return pgtype.Text{String: s, Valid: s != ""} }
+func pgInt4(i int) pgtype.Int4       { return pgtype.Int4{Int32: int32(i), Valid: i != 0} }
 
 // provisionPayload serializes the request for the durable row — including
 // the server-set RequestedBy, so a sweep-redriven run keeps the original
@@ -939,7 +940,7 @@ func (s *Service) RunTenantExport(ctx context.Context, exportID uuid.UUID, passp
 	actor := fromPg(e.RequestedBy)
 	return s.withTx(ctx, func(q *db.Queries) error {
 		n, err := q.MarkTenantExportDone(ctx, db.MarkTenantExportDoneParams{
-			ID: e.ID, StorageKey: pgText(key)})
+			ID: e.ID, StorageKey: pgText(key), BundleVersion: pgInt4(tenantexport.BundleVersion)})
 		if err != nil {
 			return err
 		}

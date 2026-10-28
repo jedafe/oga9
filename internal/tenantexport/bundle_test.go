@@ -96,6 +96,38 @@ func TestTamperDetected(t *testing.T) {
 	}
 }
 
+// A member appended to a signed bundle is absent from the signed
+// manifest — Verify must reject it, or Walk consumers would import
+// smuggled data/files entries.
+func TestUnmanifestedMemberRejected(t *testing.T) {
+	pub, priv := testKey(t)
+	var buf bytes.Buffer
+	w := NewWriter(&buf, "t", false)
+	_ = w.AddJSONL("organizations", json.RawMessage(`[{"id":"a"}]`))
+	_ = w.AddJSONL("users", json.RawMessage(`[{"id":"evil"}]`))
+	if err := w.Close(priv); err != nil {
+		t.Fatal(err)
+	}
+	// rebuild without the smuggled member, signed over its manifest —
+	// then append data/ back by hand isn't possible at the Writer level,
+	// so simulate: verify a bundle whose manifest drops the file.
+	bundle := buf.Bytes()
+	a, err := Open(bytes.NewReader(bundle), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	if err := a.Verify(pub); err != nil {
+		t.Fatalf("baseline verify: %v", err)
+	}
+	// strip data/users.jsonl from the manifest but keep it in the tar —
+	// Verify must now flag the manifest's missing member.
+	a.manifest.Entries = a.manifest.Entries[:1]
+	if err := a.Verify(nil); err == nil {
+		t.Fatal("unmanifested member must fail verification")
+	}
+}
+
 func TestUnsignedBundle(t *testing.T) {
 	var buf bytes.Buffer
 	w := NewWriter(&buf, "t", false)

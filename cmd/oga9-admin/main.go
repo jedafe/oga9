@@ -131,6 +131,16 @@ func runImport(args []string) error {
 		return err
 	}
 	defer conn.Close(ctx)
+	// Self-hosted is single-tenant — a different tenant already on this
+	// install means this bundle does not belong here.
+	var existingID string
+	err = conn.QueryRow(ctx, "SELECT id::text FROM tenants LIMIT 1").Scan(&existingID)
+	if err != nil && err != pgx.ErrNoRows {
+		return err
+	}
+	if existingID != "" && existingID != m.TenantID {
+		return fmt.Errorf("this install already hosts tenant %s — self-hosted is single-tenant (refusing to import %s)", existingID, m.TenantID)
+	}
 	tx, err := conn.Begin(ctx)
 	if err != nil {
 		return err
@@ -144,7 +154,6 @@ func runImport(args []string) error {
 	if err != nil {
 		return err
 	}
-	files := map[string][]byte{}
 	inserted := map[string]int64{}
 	err = a.Walk(func(path string, r io.Reader, _ int64) error {
 		if !strings.HasPrefix(path, "data/") || !strings.HasSuffix(path, ".jsonl") {
@@ -169,23 +178,6 @@ func runImport(args []string) error {
 	if err != nil {
 		return err
 	}
-	// blobs — files/<key> collected during the data walk is impossible
-	// (single pass), so walk once more for files.
-	err = a.Walk(func(path string, r io.Reader, _ int64) error {
-		if !strings.HasPrefix(path, "files/") {
-			return nil
-		}
-		key := strings.TrimPrefix(path, "files/")
-		b, err := io.ReadAll(r)
-		if err != nil {
-			return err
-		}
-		files[key] = b
-		return nil
-	})
-	if err != nil {
-		return err
-	}
 	// the imported tenant now lives on a self-hosted install.
 	if _, err := tx.Exec(ctx,
 		"UPDATE tenants SET edition='self_hosted' WHERE id = $1::uuid", m.TenantID); err != nil {
@@ -194,16 +186,30 @@ func runImport(args []string) error {
 	if err := tx.Commit(ctx); err != nil {
 		return err
 	}
-	if len(files) > 0 {
-		if err := os.MkdirAll(*uploads, 0o755); err != nil {
+	// blobs land only after the data tx commits — a failed import must
+	// not half-populate the uploads dir.
+	var nFiles int
+	if err := os.MkdirAll(*uploads, 0o755); err != nil {
+		return err
+	}
+	err = a.Walk(func(path string, r io.Reader, _ int64) error {
+		if !strings.HasPrefix(path, "files/") {
+			return nil
+		}
+		key := filepath.Clean("/" + strings.ReplaceAll(strings.TrimPrefix(path, "files/"), "..", ""))
+		dst, err := os.Create(filepath.Join(*uploads, key))
+		if err != nil {
 			return err
 		}
-		for key, b := range files {
-			clean := filepath.Clean("/" + strings.ReplaceAll(key, "..", ""))
-			if err := os.WriteFile(filepath.Join(*uploads, clean), b, 0o644); err != nil {
-				return fmt.Errorf("blob %s: %w", key, err)
-			}
+		defer dst.Close()
+		if _, err := io.Copy(dst, r); err != nil {
+			return err
 		}
+		nFiles++
+		return nil
+	})
+	if err != nil {
+		return err
 	}
 	var total int64
 	for t, n := range inserted {
@@ -212,7 +218,7 @@ func runImport(args []string) error {
 		}
 		total += n
 	}
-	log.Printf("imported %d rows, %d blobs — attach the deployment's license file (OGA9_LICENSE_FILE) if not yet present", total, len(files))
+	log.Printf("imported %d rows, %d blobs — attach the deployment's license file (OGA9_LICENSE_FILE) if not yet present", total, nFiles)
 	return nil
 }
 

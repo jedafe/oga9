@@ -145,6 +145,22 @@ func (s *Service) buildBundle(ctx context.Context, tenantID uuid.UUID, opts Expo
 	} else {
 		tables["notifications"] = d.userNotifs
 	}
+	// extras carry no scope column today (users, notification_preferences)
+	// — merge anyway so a future scope column can't produce a duplicate
+	// data/<table>.jsonl member.
+	for _, extra := range []struct {
+		table string
+		rows  json.RawMessage
+	}{
+		{"users", d.users},
+		{"notification_preferences", d.prefs},
+	} {
+		if existing, ok := tables[extra.table]; ok {
+			tables[extra.table] = mergeRows(existing, extra.rows)
+		} else {
+			tables[extra.table] = extra.rows
+		}
+	}
 	for tbl, rows := range tables {
 		if tbl == "organization_relationships" {
 			var dropped []json.RawMessage
@@ -155,17 +171,6 @@ func (s *Service) buildBundle(ctx context.Context, tenantID uuid.UUID, opts Expo
 			}
 		}
 		if err := w.AddJSONL(tbl, rows); err != nil {
-			return nil, err
-		}
-	}
-	for _, extra := range []struct {
-		table string
-		rows  json.RawMessage
-	}{
-		{"users", d.users},
-		{"notification_preferences", d.prefs},
-	} {
-		if err := w.AddJSONL(extra.table, extra.rows); err != nil {
 			return nil, err
 		}
 	}

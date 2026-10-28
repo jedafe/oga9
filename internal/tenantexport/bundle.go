@@ -240,11 +240,19 @@ func (a *Archive) Verify(pub ed25519.PublicKey) error {
 	for _, e := range a.manifest.Entries {
 		want[e.Path] = e
 	}
-	return a.walk(func(path string, r io.Reader, _ int64) error {
+	seen := map[string]bool{}
+	err := a.walk(func(path string, r io.Reader, _ int64) error {
+		if path == "manifest.json" || path == "signature" {
+			return nil
+		}
 		e, ok := want[path]
 		if !ok {
-			return nil // manifest/signature themselves aren't entries
+			// the signature only covers manifest.json — a member absent
+			// from it could be appended to a signed bundle undetected,
+			// then smuggled into Walk consumers (import).
+			return fmt.Errorf("bundle: unmanifested member %s", path)
 		}
+		seen[path] = true
 		h := sha256.New()
 		if _, err := io.Copy(h, r); err != nil {
 			return err
@@ -254,6 +262,15 @@ func (a *Archive) Verify(pub ed25519.PublicKey) error {
 		}
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	for p := range want {
+		if !seen[p] {
+			return fmt.Errorf("bundle: missing member %s", p)
+		}
+	}
+	return nil
 }
 
 // Walk streams each member after verification — single pass, suitable
