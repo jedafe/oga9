@@ -20,7 +20,11 @@ func New(dir string) *Store { _ = os.MkdirAll(dir, 0o755); return &Store{dir: di
 // anyway so a stray ../ can never escape the root.
 func (s *Store) Put(ctx context.Context, key string, r io.Reader) error {
 	key = filepath.Clean("/" + strings.ReplaceAll(key, "..", ""))
-	f, err := os.Create(filepath.Join(s.dir, key))
+	dst := filepath.Join(s.dir, key)
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return err
+	}
+	f, err := os.Create(dst)
 	if err != nil {
 		return err
 	}

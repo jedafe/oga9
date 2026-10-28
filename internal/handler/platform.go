@@ -309,12 +309,12 @@ func (h *PlatformHandler) StartTenantExport(w http.ResponseWriter, r *http.Reque
 		httpx.WriteErr(w, 400, "invalid_id", "malformed identifier")
 		return
 	}
-	eid, err := h.svc.RequestTenantExport(r.Context(), tid, middleware.UserID(r.Context()))
+	eid, err := h.svc.RequestTenantExport(r.Context(), tid, middleware.UserID(r.Context()), platform.ExportOptions{})
 	if err != nil {
 		platErr(w, err)
 		return
 	}
-	t, err := tasks.NewTenantExportTask(eid)
+	t, err := tasks.NewTenantExportTask(eid, "")
 	if err != nil {
 		platErr(w, err)
 		return

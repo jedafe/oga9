@@ -25,6 +25,7 @@ import (
 	"github.com/jedafe/oga9/internal/db"
 	"github.com/jedafe/oga9/internal/events"
 	"github.com/jedafe/oga9/internal/storage"
+	"github.com/jedafe/oga9/internal/tenantexport"
 )
 
 var (
@@ -97,6 +98,7 @@ type Service struct {
 	sessionFn func(ctx context.Context, supportSessionID, targetUserID uuid.UUID, ttl time.Duration, ip, ua string) (token string, sessionID uuid.UUID, err error)
 	trial     int64             // default trial days — operator may override per request
 	store     storage.BlobStore // tenant_exports blob backend (§13.06 async export)
+	signSeed  []byte            // ed25519 seed signing tenant_export_v1 bundles (ADR-026)
 }
 
 // SetStore wires the export blob backend (same uploads dir as documents).
@@ -700,10 +702,43 @@ func (s *Service) auditExport(ctx context.Context, tenantID, actor uuid.UUID) er
 	})
 }
 
+// exportData is the collected Rule-28 dump — marshalled to the legacy
+// single-doc JSON by buildExport, or packed into the tenant_export_v1
+// bundle by buildBundle (ADR-026).
+type exportData struct {
+	orgIDs     []pgtype.UUID
+	tenant     json.RawMessage
+	orgTables  map[string]json.RawMessage
+	tnTables   map[string]json.RawMessage
+	users      json.RawMessage
+	prefs      json.RawMessage
+	userNotifs json.RawMessage
+}
+
 // buildExport produces the full Rule-28 data export: every org-scoped and
 // tenant-scoped table dumped to JSON, plus a credential-free user
 // projection (ADR-020 data minimization).
 func (s *Service) buildExport(ctx context.Context, tenantID uuid.UUID) ([]byte, error) {
+	d, err := s.collectExport(ctx, tenantID, false)
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(map[string]any{
+		"tenant_id":                tenantID,
+		"exported_at":              time.Now().UTC(),
+		"tenant":                   d.tenant,
+		"tenant_tables":            d.tnTables,
+		"org_tables":               d.orgTables,
+		"users":                    d.users,
+		"notification_preferences": d.prefs,
+		"user_notifications":       d.userNotifs,
+	})
+}
+
+// collectExport gathers every org-scoped and tenant-scoped table plus a
+// user projection. includeCreds swaps the credential-free projection for
+// the full row set (ADR-026 encrypted bundles only — never default).
+func (s *Service) collectExport(ctx context.Context, tenantID uuid.UUID, includeCreds bool) (*exportData, error) {
 	if _, err := s.q.GetTenantRow(ctx, toPg(tenantID)); err != nil {
 		return nil, ErrNotFound
 	}
@@ -759,20 +794,25 @@ func (s *Service) buildExport(ctx context.Context, tenantID uuid.UUID) ([]byte, 
 	}
 	// children keyed by FK to a scoped parent — they carry no scope column
 	// themselves, so they're joined through the parent's scope instead.
-	// Two passes: org-scoped parents ($1; chat_messages.channel_id,
+	// Two passes: org-scoped parents (chat_messages.channel_id,
 	// minutes.activity_id, document_versions.document_id, ...) and
-	// tenant-scoped parents ($2; user_role_assignments.role_id →
+	// tenant-scoped parents (user_role_assignments.role_id →
 	// user_roles.tenant_id, children of organizations.id, ...). FKs to
-	// different parents OR together (an edge kept by either side).
-	conds := map[string][]string{}
+	// different parents OR together (an edge kept by either side). Each
+	// condition carries which arg it needs — a table may only reference
+	// one side, so params are numbered per query, not fixed $1/$2.
+	type fkCond struct {
+		tmpl string // holds one %d — the positional arg index
+		org  bool
+	}
+	conds := map[string][]fkCond{}
 	orgChild := map[string]bool{}
 	for _, pass := range []struct {
-		col  string
-		cond string // %s = child col, parent col, parent table
-		org  bool
+		col string
+		org bool
 	}{
-		{"organization_id", "t.%s IN (SELECT %s FROM %s WHERE organization_id = ANY($1))", true},
-		{"tenant_id", "t.%s IN (SELECT %s FROM %s WHERE tenant_id = ANY($2))", false},
+		{"organization_id", true},
+		{"tenant_id", false},
 	} {
 		fks, err := s.q.ExportChildFKs(ctx, pass.col)
 		if err != nil {
@@ -783,8 +823,11 @@ func (s *Service) buildExport(ctx context.Context, tenantID uuid.UUID) ([]byte, 
 				!validIdent.MatchString(fk.ParentTable) || !validIdent.MatchString(fk.ParentCol) {
 				continue
 			}
-			conds[fk.ChildTable] = append(conds[fk.ChildTable], fmt.Sprintf(pass.cond,
-				fk.ChildCol, `"`+fk.ParentCol+`"`, `"`+fk.ParentTable+`"`))
+			conds[fk.ChildTable] = append(conds[fk.ChildTable], fkCond{
+				tmpl: fmt.Sprintf("t.%s IN (SELECT %s FROM %s WHERE %s = ANY($%%d))",
+					fk.ChildCol, `"`+fk.ParentCol+`"`, `"`+fk.ParentTable+`"`, pass.col),
+				org: pass.org,
+			})
 			if pass.org {
 				orgChild[fk.ChildTable] = true
 			}
@@ -796,10 +839,20 @@ func (s *Service) buildExport(ctx context.Context, tenantID uuid.UUID) ([]byte, 
 		if inOrg || inTn || len(cs) == 0 {
 			continue // directly scoped — already dumped
 		}
+		var parts []string
+		var args []any
+		for _, c := range cs {
+			if c.org {
+				args = append(args, orgArr)
+			} else {
+				args = append(args, tnArr)
+			}
+			parts = append(parts, fmt.Sprintf(c.tmpl, len(args)))
+		}
 		var b []byte
 		if err := s.pool.QueryRow(ctx, fmt.Sprintf(
 			`SELECT COALESCE(jsonb_agg(t),'[]'::jsonb) FROM %s t WHERE %s`,
-			`"`+tbl+`"`, strings.Join(cs, " OR ")), orgArr, tnArr).Scan(&b); err != nil {
+			`"`+tbl+`"`, strings.Join(parts, " OR ")), args...).Scan(&b); err != nil {
 			return nil, fmt.Errorf("export %s: %w", tbl, err)
 		}
 		if orgChild[tbl] {
@@ -808,7 +861,12 @@ func (s *Service) buildExport(ctx context.Context, tenantID uuid.UUID) ([]byte, 
 			tnTables[tbl] = b
 		}
 	}
-	users, err := s.q.ExportTenantUsers(ctx, toPg(tenantID))
+	var users string
+	if includeCreds {
+		users, err = s.q.ExportTenantUsersCredentialed(ctx, toPg(tenantID))
+	} else {
+		users, err = s.q.ExportTenantUsers(ctx, toPg(tenantID))
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -824,16 +882,12 @@ func (s *Service) buildExport(ctx context.Context, tenantID uuid.UUID) ([]byte, 
 	if err != nil {
 		return nil, err
 	}
-	return json.Marshal(map[string]any{
-		"tenant_id":                tenantID,
-		"exported_at":              time.Now().UTC(),
-		"tenant":                   json.RawMessage(tnRow),
-		"tenant_tables":            tnTables,
-		"org_tables":               orgTables,
-		"users":                    json.RawMessage(users),
-		"notification_preferences": json.RawMessage(prefs),
-		"user_notifications":       json.RawMessage(userNotifs),
-	})
+	return &exportData{
+		orgIDs: orgIDs, tenant: json.RawMessage(tnRow),
+		orgTables: orgTables, tnTables: tnTables,
+		users: json.RawMessage(users), prefs: json.RawMessage(prefs),
+		userNotifs: json.RawMessage(userNotifs),
+	}, nil
 }
 
 // ---------- async tenant export (tenant:export worker — §13.06) ----------
@@ -842,35 +896,12 @@ func (s *Service) buildExport(ctx context.Context, tenantID uuid.UUID) ([]byte, 
 // DownloadTenantExport marks the row failed instead of 202-ing forever.
 const exportStaleAfter = 15 * time.Minute
 
-// RequestTenantExport audits + creates the durable row; the handler
-// enqueues tenant:export {export_id} (Rule 8 — the request never blocks
-// on the dump).
-func (s *Service) RequestTenantExport(ctx context.Context, tenantID, actor uuid.UUID) (uuid.UUID, error) {
-	if _, err := s.q.GetTenantRow(ctx, toPg(tenantID)); err != nil {
-		return uuid.Nil, ErrNotFound
-	}
-	var id uuid.UUID
-	err := s.withTx(ctx, func(q *db.Queries) error {
-		// audit-first (Rule 10) — the row + audit commit together.
-		if err := s.audit(ctx, q, tenantID, actor, "tenant.export", "tenant", tenantID,
-			map[string]any{"mode": "async"}); err != nil {
-			return err
-		}
-		row, err := q.CreateTenantExport(ctx, db.CreateTenantExportParams{
-			TenantID: toPg(tenantID), RequestedBy: toPg(actor)})
-		if err != nil {
-			return err
-		}
-		id = fromPg(row.ID)
-		return nil
-	})
-	return id, err
-}
-
-// RunTenantExport is the tenant:export worker body: build → store blob →
-// mark done. Idempotent (Rule 27): a retry re-builds and the done CAS
-// no-ops; a failure marks the row failed with the error.
-func (s *Service) RunTenantExport(ctx context.Context, exportID uuid.UUID) error {
+// RunTenantExport is the tenant:export worker body: build the signed
+// tenant_export_v1 bundle → store blob → mark done + emit TenantExported.
+// Idempotent (Rule 27): a retry re-builds and the done CAS no-ops; a
+// failure marks the row failed with the error. passphrase travels in the
+// task payload — never persisted (ADR-026).
+func (s *Service) RunTenantExport(ctx context.Context, exportID uuid.UUID, passphrase string) error {
 	e, err := s.q.GetTenantExportByID(ctx, toPg(exportID))
 	if err != nil {
 		return nil // row gone
@@ -886,27 +917,42 @@ func (s *Service) RunTenantExport(ctx context.Context, exportID uuid.UUID) error
 			ID: e.ID, Error: pgText(err.Error())})
 		return err
 	}
-	data, err := s.buildExport(ctx, fromPg(e.TenantID))
+	var opts ExportOptions
+	_ = json.Unmarshal(e.Options, &opts)
+	tenantID := fromPg(e.TenantID)
+	data, err := s.buildBundle(ctx, tenantID, opts, passphrase)
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
 			_ = fail(err)
 			return nil // tenant gone — permanent, not worth retrying
 		}
+		if errors.Is(err, ErrPassphraseRequired) {
+			_ = fail(err)
+			return nil // permanent — no passphrase on the payload
+		}
 		return fail(err)
 	}
-	key := "tenant-export/" + exportID.String() + ".json"
+	key := "tenant-export/" + exportID.String() + ".oga9exp"
 	if err := s.store.Put(ctx, key, bytes.NewReader(data)); err != nil {
 		return fail(err)
 	}
-	n, err := s.q.MarkTenantExportDone(ctx, db.MarkTenantExportDoneParams{
-		ID: e.ID, StorageKey: pgText(key)})
-	if err != nil {
-		return err
-	}
-	if n == 0 && e.Status == "processing" {
-		return errors.New("export row lost processing claim") // raced — retry
-	}
-	return nil
+	actor := fromPg(e.RequestedBy)
+	return s.withTx(ctx, func(q *db.Queries) error {
+		n, err := q.MarkTenantExportDone(ctx, db.MarkTenantExportDoneParams{
+			ID: e.ID, StorageKey: pgText(key)})
+		if err != nil {
+			return err
+		}
+		if n == 0 && e.Status == "processing" {
+			return errors.New("export row lost processing claim") // raced — retry
+		}
+		return events.Emit(ctx, q, tenantID, uuid.Nil, "TenantExported", "tenant",
+			tenantID, actor, true, map[string]any{
+				"export_id":           exportID,
+				"include_credentials": opts.IncludeCredentials,
+				"bundle_version":      tenantexport.BundleVersion,
+			})
+	})
 }
 
 // DownloadTenantExport streams a finished export blob. Returns

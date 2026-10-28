@@ -658,7 +658,8 @@ func main() {
 	wsGw := realtime.NewGateway(chatSvc, vk, cfg.BaseDomain, cfg.Env != "production")
 	// §15 platform control plane — provision pipeline + operator routes.
 	platSvc := platform.NewService(pool)
-	platSvc.SetStore(storage.New(cfg.UploadsDir)) // §13.06 async tenant exports
+	platSvc.SetStore(storage.New(cfg.UploadsDir))   // §13.06 async tenant exports
+	platSvc.SetExportSigningKey(cfg.LicenseSignKey) // ADR-026 bundle signature
 	// §15 scaffold: the tenant module owns role/app rows — clone templates,
 	// install MVP apps, grant the owner org_admin inside the provision tx.
 	platSvc.SetTenantScaffolder(tenant.ScaffoldTenant)
@@ -670,6 +671,7 @@ func main() {
 		return org.ID, nil
 	})
 	platH := handler.NewPlatformHandler(platSvc, queue)
+	texH := handler.NewTenantExportHandler(platSvc, queue, orgSvc.HasPermission)
 	taskDeps.Activities = actSvc
 	taskDeps.Comms = commsSvc
 	taskDeps.Governance = govSvc
@@ -1052,6 +1054,10 @@ func main() {
 			r.Patch("/me/preferences", commsH.SetPrefs)
 			r.Get("/org-templates", orgH.Templates)
 			r.Post("/orgs", orgH.Create)
+			// ADR-026 tenant export/migration — owner-org admin only.
+			r.With(middleware.RateLimit(vk, "tenant_export", 5, time.Hour)).Post("/tenants/{tenant_id}/exports", texH.Create)
+			r.Get("/tenants/{tenant_id}/exports/{export_id}", texH.Get)
+			r.With(middleware.RateLimit(vk, "tenant_export_confirm", 10, time.Hour)).Post("/tenants/{tenant_id}/exports/{export_id}/confirm", texH.Confirm)
 			r.With(middleware.RateLimit(vk, "invite_accept", 10, time.Minute)).Post("/invitations/{token}/accept", orgH.Accept)
 			r.With(middleware.RateLimit(vk, "invite_otp", 5, time.Minute)).Post("/invitations/{token}/otp", orgH.RequestInviteOTP)
 			// applicant self-service — no OrgCtx (a pre-decision applicant

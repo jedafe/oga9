@@ -5,7 +5,8 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/oga9 ./cmd/api
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/oga9 ./cmd/api \
+ && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/oga9-admin ./cmd/oga9-admin
 
 FROM debian:bookworm-slim
 # No postgres client baked in — bookworm ships pg15, which can't pg_dump a
@@ -17,6 +18,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
  && groupadd -r oga9 && useradd -r -g oga9 -u 10001 oga9 \
  && mkdir -p /data/uploads && chown -R oga9:oga9 /data
 COPY --from=build /out/oga9 /usr/local/bin/oga9
+COPY --from=build /out/oga9-admin /usr/local/bin/oga9-admin
 COPY db/migrations /opt/oga9/migrations
 COPY scripts /opt/oga9/scripts
 ENV OGA9_UPLOADS_DIR=/data/uploads

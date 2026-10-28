@@ -1074,22 +1074,25 @@ func tenantProvision(svc *platform.Service) asynq.HandlerFunc {
 	}
 }
 
-// NewTenantExportTask — tenant:export {export_id}: durable-row-driven
-// (the row is the idempotency record; retries re-run build+store).
-func NewTenantExportTask(exportID uuid.UUID) (*asynq.Task, error) {
-	b, err := json.Marshal(map[string]string{"export_id": exportID.String()})
+// NewTenantExportTask — tenant:export {export_id, passphrase}:
+// durable-row-driven (the row is the idempotency record; retries re-run
+// build+store). passphrase rides the task payload only — ADR-026 keeps
+// it out of tenant_exports.options.
+func NewTenantExportTask(exportID uuid.UUID, passphrase string) (*asynq.Task, error) {
+	b, err := json.Marshal(map[string]string{"export_id": exportID.String(), "passphrase": passphrase})
 	if err != nil {
 		return nil, err
 	}
 	return asynq.NewTask(TypeTenantExport, b, asynq.Queue("default"), asynq.MaxRetry(3)), nil
 }
 
-// tenantExport — §13.06: builds the export JSON, stores the blob, marks
-// the tenant_exports row done.
+// tenantExport — §13.06/ADR-026: builds the signed tenant_export_v1
+// bundle, stores the blob, marks the tenant_exports row done.
 func tenantExport(svc *platform.Service) asynq.HandlerFunc {
 	return func(ctx context.Context, t *asynq.Task) error {
 		var p struct {
-			ExportID string `json:"export_id"`
+			ExportID   string `json:"export_id"`
+			Passphrase string `json:"passphrase"`
 		}
 		if err := json.Unmarshal(t.Payload(), &p); err != nil {
 			return fmt.Errorf("tenant:export payload: %w", err)
@@ -1101,7 +1104,7 @@ func tenantExport(svc *platform.Service) asynq.HandlerFunc {
 		if err != nil {
 			return nil // malformed id — retrying won't help
 		}
-		return svc.RunTenantExport(ctx, id)
+		return svc.RunTenantExport(ctx, id, p.Passphrase)
 	}
 }
 

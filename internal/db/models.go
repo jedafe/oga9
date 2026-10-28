@@ -1295,14 +1295,17 @@ type TenantAddons struct {
 }
 
 type TenantExports struct {
-	ID          pgtype.UUID        `json:"id"`
-	TenantID    pgtype.UUID        `json:"tenant_id"`
-	RequestedBy pgtype.UUID        `json:"requested_by"`
-	StorageKey  pgtype.Text        `json:"storage_key"`
-	Error       pgtype.Text        `json:"error"`
-	Status      string             `json:"status"`
-	CreatedAt   pgtype.Timestamptz `json:"created_at"`
-	CompletedAt pgtype.Timestamptz `json:"completed_at"`
+	ID            pgtype.UUID        `json:"id"`
+	TenantID      pgtype.UUID        `json:"tenant_id"`
+	RequestedBy   pgtype.UUID        `json:"requested_by"`
+	StorageKey    pgtype.Text        `json:"storage_key"`
+	Error         pgtype.Text        `json:"error"`
+	Status        string             `json:"status"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+	CompletedAt   pgtype.Timestamptz `json:"completed_at"`
+	Options       []byte             `json:"options"`
+	BundleVersion pgtype.Int4        `json:"bundle_version"`
+	ConfirmedAt   pgtype.Timestamptz `json:"confirmed_at"`
 }
 
 type TenantProvisions struct {

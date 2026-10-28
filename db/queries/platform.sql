@@ -229,10 +229,12 @@ SELECT id FROM organizations WHERE tenant_id = $1;
 
 -- name: ExportScopedTables :many
 -- every table carrying a scope column — the export stays complete as the
--- schema grows; no per-table code to forget.
-SELECT DISTINCT table_name::text FROM information_schema.columns
-WHERE table_schema = 'public' AND column_name = $1
-ORDER BY table_name;
+-- schema grows; no per-table code to forget. BASE TABLE only: views are
+-- derived projections, not exportable data (import skips them anyway).
+SELECT DISTINCT c.table_name::text FROM information_schema.columns c
+JOIN information_schema.tables t ON t.table_name = c.table_name AND t.table_schema = c.table_schema
+WHERE c.table_schema = 'public' AND c.column_name = $1 AND t.table_type = 'BASE TABLE'
+ORDER BY c.table_name::text;
 
 -- name: ExportTenantUsers :one
 -- minimal user projection for the export — never credentials or secrets
@@ -290,7 +292,7 @@ WHERE t.user_id IN (
   WHERE m.organization_id = ANY(sqlc.arg(org_ids)::uuid[]));
 
 -- name: CreateTenantExport :one
-INSERT INTO tenant_exports (tenant_id, requested_by) VALUES ($1,$2) RETURNING *;
+INSERT INTO tenant_exports (tenant_id, requested_by, options) VALUES ($1,$2,$3) RETURNING *;
 
 -- name: GetTenantExport :one
 SELECT * FROM tenant_exports WHERE id = $1 AND tenant_id = $2;
@@ -307,6 +309,24 @@ WHERE id=$1 AND status='processing';
 
 -- name: GetTenantExportByID :one
 SELECT * FROM tenant_exports WHERE id = $1;
+
+-- name: ConfirmTenantExport :execrows
+-- CAS: confirm lands once, only on a finished bundle.
+UPDATE tenant_exports SET confirmed_at=now()
+WHERE id=$1 AND tenant_id=$2 AND status='done' AND confirmed_at IS NULL;
+
+-- name: ExportTenantUsersCredentialed :one
+-- ADR-026 migration export ONLY: password_hash rides inside an encrypted,
+-- explicitly-requested bundle — never the default Rule-28 path.
+SELECT COALESCE(jsonb_agg(to_jsonb(u)), '[]'::jsonb)::text
+FROM users u WHERE u.id IN (
+  SELECT m.user_id FROM organization_memberships m
+  JOIN organizations o ON o.id = m.organization_id WHERE o.tenant_id = $1);
+
+-- name: SoftDeleteTenantOrgs :exec
+-- ADR-026 post_state=purge: orgs soft-delete; platform:data_erasure does
+-- the eventual hard delete (Rule 11 — the only hard-delete path).
+UPDATE organizations SET deleted_at=now() WHERE tenant_id=$1 AND deleted_at IS NULL;
 
 -- name: GetFeatureFlag :one
 SELECT enabled FROM feature_flags WHERE key = $1;

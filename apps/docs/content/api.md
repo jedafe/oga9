@@ -24,3 +24,10 @@ Base URL: `/api/v1` on the API service (dev: `http://localhost:8080`).
 `GET /auth/oauth/{provider}/start` · `POST /auth/mfa/setup|confirm|disable` ·
 `GET /me` · `GET /me/sessions` · `DELETE /me/sessions/{id}` ·
 `POST /auth/logout`
+
+## Tenancy
+
+`GET /me/organizations` · `POST /orgs` · `GET|PATCH /orgs/{id}` ·
+`GET /org-templates` ·
+`POST /tenants/{tid}/exports` (owner-org admin — cloud→self-hosted export) ·
+`GET /tenants/{tid}/exports/{eid}` · `POST /tenants/{tid}/exports/{eid}/confirm`

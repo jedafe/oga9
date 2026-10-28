@@ -82,6 +82,25 @@ func (q *Queries) ClaimProvision(ctx context.Context, requestID string) (TenantP
 	return i, err
 }
 
+const confirmTenantExport = `-- name: ConfirmTenantExport :execrows
+UPDATE tenant_exports SET confirmed_at=now()
+WHERE id=$1 AND tenant_id=$2 AND status='done' AND confirmed_at IS NULL
+`
+
+type ConfirmTenantExportParams struct {
+	ID       pgtype.UUID `json:"id"`
+	TenantID pgtype.UUID `json:"tenant_id"`
+}
+
+// CAS: confirm lands once, only on a finished bundle.
+func (q *Queries) ConfirmTenantExport(ctx context.Context, arg ConfirmTenantExportParams) (int64, error) {
+	result, err := q.db.Exec(ctx, confirmTenantExport, arg.ID, arg.TenantID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const createDeployment = `-- name: CreateDeployment :one
 INSERT INTO deployments (tenant_id, kind, edition, deployment_key)
 VALUES ($1, $2, $3,
@@ -192,16 +211,17 @@ func (q *Queries) CreateSupportSession(ctx context.Context, arg CreateSupportSes
 }
 
 const createTenantExport = `-- name: CreateTenantExport :one
-INSERT INTO tenant_exports (tenant_id, requested_by) VALUES ($1,$2) RETURNING id, tenant_id, requested_by, storage_key, error, status, created_at, completed_at
+INSERT INTO tenant_exports (tenant_id, requested_by, options) VALUES ($1,$2,$3) RETURNING id, tenant_id, requested_by, storage_key, error, status, created_at, completed_at, options, bundle_version, confirmed_at
 `
 
 type CreateTenantExportParams struct {
 	TenantID    pgtype.UUID `json:"tenant_id"`
 	RequestedBy pgtype.UUID `json:"requested_by"`
+	Options     []byte      `json:"options"`
 }
 
 func (q *Queries) CreateTenantExport(ctx context.Context, arg CreateTenantExportParams) (TenantExports, error) {
-	row := q.db.QueryRow(ctx, createTenantExport, arg.TenantID, arg.RequestedBy)
+	row := q.db.QueryRow(ctx, createTenantExport, arg.TenantID, arg.RequestedBy, arg.Options)
 	var i TenantExports
 	err := row.Scan(
 		&i.ID,
@@ -212,6 +232,9 @@ func (q *Queries) CreateTenantExport(ctx context.Context, arg CreateTenantExport
 		&i.Status,
 		&i.CreatedAt,
 		&i.CompletedAt,
+		&i.Options,
+		&i.BundleVersion,
+		&i.ConfirmedAt,
 	)
 	return i, err
 }
@@ -336,13 +359,15 @@ func (q *Queries) ExportOrgNotificationPrefs(ctx context.Context, orgIds []pgtyp
 }
 
 const exportScopedTables = `-- name: ExportScopedTables :many
-SELECT DISTINCT table_name::text FROM information_schema.columns
-WHERE table_schema = 'public' AND column_name = $1
-ORDER BY table_name
+SELECT DISTINCT c.table_name::text FROM information_schema.columns c
+JOIN information_schema.tables t ON t.table_name = c.table_name AND t.table_schema = c.table_schema
+WHERE c.table_schema = 'public' AND c.column_name = $1 AND t.table_type = 'BASE TABLE'
+ORDER BY c.table_name::text
 `
 
 // every table carrying a scope column — the export stays complete as the
-// schema grows; no per-table code to forget.
+// schema grows; no per-table code to forget. BASE TABLE only: views are
+// derived projections, not exportable data (import skips them anyway).
 func (q *Queries) ExportScopedTables(ctx context.Context, columnName interface{}) ([]string, error) {
 	rows, err := q.db.Query(ctx, exportScopedTables, columnName)
 	if err != nil {
@@ -351,11 +376,11 @@ func (q *Queries) ExportScopedTables(ctx context.Context, columnName interface{}
 	defer rows.Close()
 	var items []string
 	for rows.Next() {
-		var table_name string
-		if err := rows.Scan(&table_name); err != nil {
+		var c_table_name string
+		if err := rows.Scan(&c_table_name); err != nil {
 			return nil, err
 		}
-		items = append(items, table_name)
+		items = append(items, c_table_name)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
@@ -433,6 +458,22 @@ SELECT COALESCE(jsonb_agg(j), '[]'::jsonb)::text FROM (
 // (ADR-020 data minimization).
 func (q *Queries) ExportTenantUsers(ctx context.Context, tenantID pgtype.UUID) (string, error) {
 	row := q.db.QueryRow(ctx, exportTenantUsers, tenantID)
+	var column_1 string
+	err := row.Scan(&column_1)
+	return column_1, err
+}
+
+const exportTenantUsersCredentialed = `-- name: ExportTenantUsersCredentialed :one
+SELECT COALESCE(jsonb_agg(to_jsonb(u)), '[]'::jsonb)::text
+FROM users u WHERE u.id IN (
+  SELECT m.user_id FROM organization_memberships m
+  JOIN organizations o ON o.id = m.organization_id WHERE o.tenant_id = $1)
+`
+
+// ADR-026 migration export ONLY: password_hash rides inside an encrypted,
+// explicitly-requested bundle — never the default Rule-28 path.
+func (q *Queries) ExportTenantUsersCredentialed(ctx context.Context, tenantID pgtype.UUID) (string, error) {
+	row := q.db.QueryRow(ctx, exportTenantUsersCredentialed, tenantID)
 	var column_1 string
 	err := row.Scan(&column_1)
 	return column_1, err
@@ -543,7 +584,7 @@ func (q *Queries) GetSupportSession(ctx context.Context, id pgtype.UUID) (Suppor
 }
 
 const getTenantExport = `-- name: GetTenantExport :one
-SELECT id, tenant_id, requested_by, storage_key, error, status, created_at, completed_at FROM tenant_exports WHERE id = $1 AND tenant_id = $2
+SELECT id, tenant_id, requested_by, storage_key, error, status, created_at, completed_at, options, bundle_version, confirmed_at FROM tenant_exports WHERE id = $1 AND tenant_id = $2
 `
 
 type GetTenantExportParams struct {
@@ -563,12 +604,15 @@ func (q *Queries) GetTenantExport(ctx context.Context, arg GetTenantExportParams
 		&i.Status,
 		&i.CreatedAt,
 		&i.CompletedAt,
+		&i.Options,
+		&i.BundleVersion,
+		&i.ConfirmedAt,
 	)
 	return i, err
 }
 
 const getTenantExportByID = `-- name: GetTenantExportByID :one
-SELECT id, tenant_id, requested_by, storage_key, error, status, created_at, completed_at FROM tenant_exports WHERE id = $1
+SELECT id, tenant_id, requested_by, storage_key, error, status, created_at, completed_at, options, bundle_version, confirmed_at FROM tenant_exports WHERE id = $1
 `
 
 func (q *Queries) GetTenantExportByID(ctx context.Context, id pgtype.UUID) (TenantExports, error) {
@@ -583,6 +627,9 @@ func (q *Queries) GetTenantExportByID(ctx context.Context, id pgtype.UUID) (Tena
 		&i.Status,
 		&i.CreatedAt,
 		&i.CompletedAt,
+		&i.Options,
+		&i.BundleVersion,
+		&i.ConfirmedAt,
 	)
 	return i, err
 }
@@ -1107,6 +1154,17 @@ func (q *Queries) SetTenantStatus(ctx context.Context, arg SetTenantStatusParams
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const softDeleteTenantOrgs = `-- name: SoftDeleteTenantOrgs :exec
+UPDATE organizations SET deleted_at=now() WHERE tenant_id=$1 AND deleted_at IS NULL
+`
+
+// ADR-026 post_state=purge: orgs soft-delete; platform:data_erasure does
+// the eventual hard delete (Rule 11 — the only hard-delete path).
+func (q *Queries) SoftDeleteTenantOrgs(ctx context.Context, tenantID pgtype.UUID) error {
+	_, err := q.db.Exec(ctx, softDeleteTenantOrgs, tenantID)
+	return err
 }
 
 const staleProvisions = `-- name: StaleProvisions :many

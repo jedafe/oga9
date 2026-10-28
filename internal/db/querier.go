@@ -198,6 +198,8 @@ type Querier interface {
 	// confirm without the recorder!=approver CAS — separation of duties for
 	// these lives on the expense/invoice workflow, not the payment row.
 	ConfirmSystemPayment(ctx context.Context, arg ConfirmSystemPaymentParams) (Payments, error)
+	// CAS: confirm lands once, only on a finished bundle.
+	ConfirmTenantExport(ctx context.Context, arg ConfirmTenantExportParams) (int64, error)
 	// capacity check inside the confirm tx (role row must be locked first).
 	ConfirmedCount(ctx context.Context, roleID pgtype.UUID) (int32, error)
 	// Status derives from confirmed ledger money, not payment row state alone.
@@ -487,7 +489,8 @@ type Querier interface {
 	// memberships so member prefs land in the export too.
 	ExportOrgNotificationPrefs(ctx context.Context, orgIds []pgtype.UUID) (string, error)
 	// every table carrying a scope column — the export stays complete as the
-	// schema grows; no per-table code to forget.
+	// schema grows; no per-table code to forget. BASE TABLE only: views are
+	// derived projections, not exportable data (import skips them anyway).
 	ExportScopedTables(ctx context.Context, columnName interface{}) ([]string, error)
 	// ---------- tenant export (Rule 28 — §13.06) ----------
 	ExportTenantOrgIDs(ctx context.Context, tenantID pgtype.UUID) ([]pgtype.UUID, error)
@@ -501,6 +504,9 @@ type Querier interface {
 	// minimal user projection for the export — never credentials or secrets
 	// (ADR-020 data minimization).
 	ExportTenantUsers(ctx context.Context, tenantID pgtype.UUID) (string, error)
+	// ADR-026 migration export ONLY: password_hash rides inside an encrypted,
+	// explicitly-requested bundle — never the default Rule-28 path.
+	ExportTenantUsersCredentialed(ctx context.Context, tenantID pgtype.UUID) (string, error)
 	// idempotent sync (Rule 27): an already-mapped external record is a
 	// dedupe hit, not a re-push.
 	ExternalIDExists(ctx context.Context, arg ExternalIDExistsParams) (bool, error)
@@ -1229,6 +1235,9 @@ type Querier interface {
 	SignupVolunteer(ctx context.Context, arg SignupVolunteerParams) (VolunteerSignups, error)
 	SoftDeleteDocument(ctx context.Context, arg SoftDeleteDocumentParams) (int64, error)
 	SoftDeleteMessage(ctx context.Context, arg SoftDeleteMessageParams) (int64, error)
+	// ADR-026 post_state=purge: orgs soft-delete; platform:data_erasure does
+	// the eventual hard delete (Rule 11 — the only hard-delete path).
+	SoftDeleteTenantOrgs(ctx context.Context, tenantID pgtype.UUID) error
 	// email-channel rows that never got delivered past the grace window —
 	// enqueue-loss redrive for the notifications:email fan-out (the row is
 	// durable, the task wasn't). Announcement refs only: body/subject
