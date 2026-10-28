@@ -1074,12 +1074,12 @@ func tenantProvision(svc *platform.Service) asynq.HandlerFunc {
 	}
 }
 
-// NewTenantExportTask — tenant:export {export_id, passphrase}:
+// NewTenantExportTask — tenant:export {export_id}:
 // durable-row-driven (the row is the idempotency record; retries re-run
-// build+store). passphrase rides the task payload only — ADR-026 keeps
-// it out of tenant_exports.options.
-func NewTenantExportTask(exportID uuid.UUID, passphrase string) (*asynq.Task, error) {
-	b, err := json.Marshal(map[string]string{"export_id": exportID.String(), "passphrase": passphrase})
+// build+store). The export passphrase is AEAD-sealed in the row's options
+// and scrubbed on completion — never in the payload (ADR-026).
+func NewTenantExportTask(exportID uuid.UUID) (*asynq.Task, error) {
+	b, err := json.Marshal(map[string]string{"export_id": exportID.String()})
 	if err != nil {
 		return nil, err
 	}
@@ -1091,8 +1091,7 @@ func NewTenantExportTask(exportID uuid.UUID, passphrase string) (*asynq.Task, er
 func tenantExport(svc *platform.Service) asynq.HandlerFunc {
 	return func(ctx context.Context, t *asynq.Task) error {
 		var p struct {
-			ExportID   string `json:"export_id"`
-			Passphrase string `json:"passphrase"`
+			ExportID string `json:"export_id"`
 		}
 		if err := json.Unmarshal(t.Payload(), &p); err != nil {
 			return fmt.Errorf("tenant:export payload: %w", err)
@@ -1104,7 +1103,7 @@ func tenantExport(svc *platform.Service) asynq.HandlerFunc {
 		if err != nil {
 			return nil // malformed id — retrying won't help
 		}
-		return svc.RunTenantExport(ctx, id, p.Passphrase)
+		return svc.RunTenantExport(ctx, id)
 	}
 }
 

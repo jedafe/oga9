@@ -658,7 +658,8 @@ func main() {
 	wsGw := realtime.NewGateway(chatSvc, vk, cfg.BaseDomain, cfg.Env != "production")
 	// §15 platform control plane — provision pipeline + operator routes.
 	platSvc := platform.NewService(pool)
-	platSvc.SetStore(storage.New(cfg.UploadsDir))   // §13.06 async tenant exports
+	platSvc.SetStore(storage.New(cfg.UploadsDir)) // §13.06 async tenant exports
+	platSvc.SetExportDataKey(cfg.DataKey)
 	platSvc.SetExportSigningKey(cfg.LicenseSignKey) // ADR-026 bundle signature
 	// §15 scaffold: the tenant module owns role/app rows — clone templates,
 	// install MVP apps, grant the owner org_admin inside the provision tx.

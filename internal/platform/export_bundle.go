@@ -6,7 +6,11 @@ package platform
 
 import (
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -20,11 +24,13 @@ import (
 )
 
 // ExportOptions rides tenant_exports.options — post_state applies on
-// confirm (ADR-026). The encryption passphrase is NEVER persisted: it
-// travels in the tenant:export task payload only.
+// confirm (ADR-026). passphrase_enc is the export passphrase AEAD-sealed
+// under OGA9_DATA_ENCRYPTION_KEY — never plaintext at rest, never in the
+// asynq payload; scrubbed when the export completes or fails.
 type ExportOptions struct {
 	IncludeCredentials bool   `json:"include_credentials"`
 	PostState          string `json:"post_state"` // readonly_grace|purge|keep_active
+	PassphraseEnc      string `json:"passphrase_enc,omitempty"`
 }
 
 var (
@@ -54,6 +60,56 @@ func (o ExportOptions) validate() error {
 // that signs self-hosted license files (one platform signing identity).
 func (s *Service) SetExportSigningKey(seed []byte) { s.signSeed = seed }
 
+// SetExportDataKey wires the 32-byte at-rest AES key (OGA9_DATA_ENCRYPTION_KEY)
+// used to seal the export passphrase inside tenant_exports.options.
+func (s *Service) SetExportDataKey(key []byte) { s.dataKey = key }
+
+// sealPass/openPass mirror auth's blob layout: nonce (12B) || ct+tag.
+func sealPass(key, plaintext []byte) (string, error) {
+	if len(key) != 32 {
+		return "", errors.New("export data key must be 32 bytes")
+	}
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return "", err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", err
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		return "", err
+	}
+	return base64.StdEncoding.EncodeToString(gcm.Seal(nonce, nonce, plaintext, nil)), nil
+}
+
+func (s *Service) openPass(enc string) (string, error) {
+	if enc == "" {
+		return "", nil
+	}
+	blob, err := base64.StdEncoding.DecodeString(enc)
+	if err != nil {
+		return "", err
+	}
+	block, err := aes.NewCipher(s.dataKey)
+	if err != nil {
+		return "", err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", err
+	}
+	if len(blob) < gcm.NonceSize()+gcm.Overhead() {
+		return "", errors.New("export passphrase blob corrupt")
+	}
+	plain, err := gcm.Open(nil, blob[:gcm.NonceSize()], blob[gcm.NonceSize():], nil)
+	if err != nil {
+		return "", errors.New("export passphrase decrypt failed")
+	}
+	return string(plain), nil
+}
+
 func (s *Service) signKey() ed25519.PrivateKey {
 	if len(s.signSeed) != ed25519.SeedSize {
 		return nil
@@ -75,10 +131,22 @@ func (s *Service) TenantOwnerOrg(ctx context.Context, tenantID uuid.UUID) (uuid.
 }
 
 // RequestTenantExport audits + creates the durable row; the handler
-// enqueues tenant:export {export_id, passphrase} (Rule 8).
-func (s *Service) RequestTenantExport(ctx context.Context, tenantID, actor uuid.UUID, opts ExportOptions) (uuid.UUID, error) {
+// enqueues tenant:export {export_id} (Rule 8). A credentialed request's
+// passphrase is sealed into options under the at-rest data key —
+// plaintext never reaches the DB or the queue.
+func (s *Service) RequestTenantExport(ctx context.Context, tenantID, actor uuid.UUID, opts ExportOptions, passphrase string) (uuid.UUID, error) {
 	if err := opts.validate(); err != nil {
 		return uuid.Nil, err
+	}
+	if opts.IncludeCredentials {
+		if passphrase == "" {
+			return uuid.Nil, ErrPassphraseRequired
+		}
+		enc, err := sealPass(s.dataKey, []byte(passphrase))
+		if err != nil {
+			return uuid.Nil, err
+		}
+		opts.PassphraseEnc = enc
 	}
 	if _, err := s.q.GetTenantRow(ctx, toPg(tenantID)); err != nil {
 		return uuid.Nil, ErrNotFound
@@ -172,6 +240,10 @@ func (s *Service) buildBundle(ctx context.Context, tenantID uuid.UUID, opts Expo
 			tables[extra.table] = extra.rows
 		}
 	}
+	// tenants is written explicitly above — the child-FK pass also
+	// discovers it (tenants.owner_org_id → organizations), and a second
+	// data/tenants.jsonl member would corrupt the manifest checksum.
+	delete(tables, "tenants")
 	for tbl, rows := range tables {
 		if tbl == "organization_relationships" {
 			var dropped []json.RawMessage

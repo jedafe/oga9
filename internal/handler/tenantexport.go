@@ -94,12 +94,12 @@ func (h *TenantExportHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	eid, err := h.svc.RequestTenantExport(r.Context(), tid, middleware.UserID(r.Context()),
-		platform.ExportOptions{IncludeCredentials: body.IncludeCredentials, PostState: body.PostState})
+		platform.ExportOptions{IncludeCredentials: body.IncludeCredentials, PostState: body.PostState}, body.ExportPassphrase)
 	if err != nil {
 		tenantExportErr(w, err)
 		return
 	}
-	t, err := tasks.NewTenantExportTask(eid, body.ExportPassphrase)
+	t, err := tasks.NewTenantExportTask(eid)
 	if err != nil {
 		tenantExportErr(w, err)
 		return

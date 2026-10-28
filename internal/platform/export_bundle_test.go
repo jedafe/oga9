@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -32,11 +33,11 @@ func TestTenantExportBundleAndConfirm(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	eid, err := svc.RequestTenantExport(ctx, tenantID, uid, ExportOptions{})
+	eid, err := svc.RequestTenantExport(ctx, tenantID, uid, ExportOptions{}, "")
 	if err != nil {
 		t.Fatalf("request: %v", err)
 	}
-	if err := svc.RunTenantExport(ctx, eid, ""); err != nil {
+	if err := svc.RunTenantExport(ctx, eid); err != nil {
 		t.Fatalf("worker: %v", err)
 	}
 
@@ -117,11 +118,11 @@ func TestTenantExportPurgeRequiresDoubleConfirm(t *testing.T) {
 	uid := mkUser(t, pool, uuid.NewString()[:8]+"@x.test")
 	mkOrgMember(t, pool, tenantID, uid, "active")
 
-	eid, err := svc.RequestTenantExport(ctx, tenantID, uid, ExportOptions{PostState: "purge"})
+	eid, err := svc.RequestTenantExport(ctx, tenantID, uid, ExportOptions{PostState: "purge"}, "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := svc.RunTenantExport(ctx, eid, ""); err != nil {
+	if err := svc.RunTenantExport(ctx, eid); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := svc.ConfirmTenantMigration(ctx, tenantID, eid, uid, false); !errors.Is(err, ErrPurgeNotConfirmed) {
@@ -147,23 +148,60 @@ func TestTenantExportPurgeRequiresDoubleConfirm(t *testing.T) {
 func TestTenantExportCredentialsNeedPassphrase(t *testing.T) {
 	svc, _, pool := testSvc(t)
 	svc.SetStore(storage.New(t.TempDir()))
+	seed := bytes.Repeat([]byte{7}, ed25519.SeedSize)
+	svc.SetExportSigningKey(seed)
 	ctx := context.Background()
 
 	tenantID := mkTenant(t, pool, "exp-"+uuid.NewString()[:8])
 	uid := mkUser(t, pool, uuid.NewString()[:8]+"@x.test")
 	mkOrgMember(t, pool, tenantID, uid, "active")
 
-	eid, err := svc.RequestTenantExport(ctx, tenantID, uid, ExportOptions{IncludeCredentials: true})
+	svc.SetExportDataKey(bytes.Repeat([]byte{3}, 32))
+	eid, err := svc.RequestTenantExport(ctx, tenantID, uid, ExportOptions{IncludeCredentials: true}, "test-pass")
 	if err != nil {
 		t.Fatal(err)
 	}
-	// no passphrase on the payload → permanent failure, row marked failed.
-	if err := svc.RunTenantExport(ctx, eid, ""); err != nil {
-		t.Fatalf("worker should mark failed, not retry: %v", err)
+	// the passphrase is AEAD-sealed in the row — sealed present, plaintext absent.
+	var opts string
+	_ = pool.QueryRow(ctx, "SELECT options::text FROM tenant_exports WHERE id=$1", eid).Scan(&opts)
+	if !strings.Contains(opts, "passphrase_enc") {
+		t.Fatalf("options missing sealed passphrase: %s", opts)
 	}
-	var status string
-	_ = pool.QueryRow(ctx, "SELECT status FROM tenant_exports WHERE id=$1", eid).Scan(&status)
-	if status != "failed" {
-		t.Fatalf("export status = %s, want failed", status)
+	if strings.Contains(opts, "test-pass") {
+		t.Fatalf("plaintext passphrase leaked into options: %s", opts)
+	}
+	if err := svc.RunTenantExport(ctx, eid); err != nil {
+		t.Fatal(err)
+	}
+	// done/failed writes scrub the sealed passphrase.
+	_ = pool.QueryRow(ctx, "SELECT options::text FROM tenant_exports WHERE id=$1", eid).Scan(&opts)
+	if strings.Contains(opts, "passphrase_enc") {
+		t.Fatalf("sealed passphrase not scrubbed after completion: %s", opts)
+	}
+	// the stored blob is an encrypted envelope — no passphrase fails, the
+	// right one opens and verifies.
+	blob, status, err := svc.DownloadTenantExport(ctx, tenantID, eid)
+	if err != nil || status != "done" {
+		t.Fatalf("download: %v %s", err, status)
+	}
+	defer blob.Close()
+	data, err := io.ReadAll(blob)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tenantexport.Open(bytes.NewReader(data), ""); err == nil {
+		t.Fatal("encrypted bundle must reject a missing passphrase")
+	}
+	a, err := tenantexport.Open(bytes.NewReader(data), "test-pass")
+	if err != nil {
+		t.Fatalf("open encrypted bundle: %v", err)
+	}
+	defer a.Close()
+	pub := ed25519.NewKeyFromSeed(seed).Public().(ed25519.PublicKey)
+	if err := a.Verify(pub); err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	if !a.Manifest().IncludeCredentials {
+		t.Fatal("manifest should flag credentials included")
 	}
 }

@@ -99,6 +99,7 @@ type Service struct {
 	trial     int64             // default trial days — operator may override per request
 	store     storage.BlobStore // tenant_exports blob backend (§13.06 async export)
 	signSeed  []byte            // ed25519 seed signing tenant_export_v1 bundles (ADR-026)
+	dataKey   []byte            // 32B at-rest key sealing the export passphrase (ADR-026)
 }
 
 // SetStore wires the export blob backend (same uploads dir as documents).
@@ -899,9 +900,9 @@ const exportStaleAfter = 15 * time.Minute
 // RunTenantExport is the tenant:export worker body: build the signed
 // tenant_export_v1 bundle → store blob → mark done + emit TenantExported.
 // Idempotent (Rule 27): a retry re-builds and the done CAS no-ops; a
-// failure marks the row failed with the error. passphrase travels in the
-// task payload — never persisted (ADR-026).
-func (s *Service) RunTenantExport(ctx context.Context, exportID uuid.UUID, passphrase string) error {
+// failure marks the row failed with the error. The passphrase is AEAD-
+// sealed in the row and scrubbed by the done/failed writes (ADR-026).
+func (s *Service) RunTenantExport(ctx context.Context, exportID uuid.UUID) error {
 	e, err := s.q.GetTenantExportByID(ctx, toPg(exportID))
 	if err != nil {
 		return nil // row gone
@@ -919,6 +920,11 @@ func (s *Service) RunTenantExport(ctx context.Context, exportID uuid.UUID, passp
 	}
 	var opts ExportOptions
 	_ = json.Unmarshal(e.Options, &opts)
+	passphrase, err := s.openPass(opts.PassphraseEnc)
+	if err != nil {
+		_ = fail(err)
+		return nil // corrupt sealed blob — permanent
+	}
 	tenantID := fromPg(e.TenantID)
 	rc, cleanup, err := s.buildBundle(ctx, tenantID, opts, passphrase)
 	if err != nil {

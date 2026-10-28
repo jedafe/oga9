@@ -1044,7 +1044,7 @@ func (q *Queries) LiveSupportSessionsForUser(ctx context.Context, targetUserID p
 }
 
 const markTenantExportDone = `-- name: MarkTenantExportDone :execrows
-UPDATE tenant_exports SET status='done', storage_key=$2, bundle_version=$3, error=NULL, completed_at=now()
+UPDATE tenant_exports SET status='done', storage_key=$2, bundle_version=$3, error=NULL, completed_at=now(), options=options-'passphrase_enc'
 WHERE id=$1 AND status IN ('processing','failed')
 `
 
@@ -1065,7 +1065,7 @@ func (q *Queries) MarkTenantExportDone(ctx context.Context, arg MarkTenantExport
 }
 
 const markTenantExportFailed = `-- name: MarkTenantExportFailed :exec
-UPDATE tenant_exports SET status='failed', error=$2, completed_at=now()
+UPDATE tenant_exports SET status='failed', error=$2, completed_at=now(), options=options-'passphrase_enc'
 WHERE id=$1 AND status='processing'
 `
 
