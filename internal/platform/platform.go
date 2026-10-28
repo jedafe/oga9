@@ -883,6 +883,11 @@ func (s *Service) collectExport(ctx context.Context, tenantID uuid.UUID, include
 	if err != nil {
 		return nil, err
 	}
+	// the tenant row travels separately (doc["tenant"] / data/tenants.jsonl)
+	// — the child-FK pass also discovers it via owner_org_id →
+	// organizations and would emit a second, possibly-empty copy.
+	delete(orgTables, "tenants")
+	delete(tnTables, "tenants")
 	return &exportData{
 		orgIDs: orgIDs, tenant: json.RawMessage(tnRow),
 		orgTables: orgTables, tnTables: tnTables,

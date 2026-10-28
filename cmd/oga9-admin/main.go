@@ -168,8 +168,11 @@ func runImport(args []string) error {
 			log.Printf("skip %s — table not present in this schema version", table)
 			return nil
 		}
-		n, err := insertJSONL(ctx, tx, table, r, colSets[table])
+		n, lines, err := insertJSONL(ctx, tx, table, r, colSets[table])
 		inserted[table] += n
+		if int64(lines) > n {
+			log.Printf("  note: %s — %d of %d rows conflicted with existing rows and were skipped", table, int64(lines)-n, lines)
+		}
 		return err
 	})
 	if err != nil {
@@ -266,9 +269,10 @@ func listTables(ctx context.Context, tx pgx.Tx) (map[string]bool, map[string]map
 // password_hash on purpose, and explicit NULLs would defeat NOT NULL
 // defaults (mfa_recovery_codes …) or violate constraints outright.
 // Rows stream line-by-line — a table file is never held whole in memory.
-func insertJSONL(ctx context.Context, tx pgx.Tx, table string, data io.Reader, cols map[string]bool) (int64, error) {
+func insertJSONL(ctx context.Context, tx pgx.Tx, table string, data io.Reader, cols map[string]bool) (int64, int, error) {
 	var batch []json.RawMessage
 	var total int64
+	var lines int
 	flush := func() error {
 		if len(batch) == 0 {
 			return nil
@@ -318,17 +322,18 @@ func insertJSONL(ctx context.Context, tx pgx.Tx, table string, data io.Reader, c
 		if line == "" {
 			continue
 		}
+		lines++
 		batch = append(batch, json.RawMessage(line))
 		if len(batch) >= 500 {
 			if err := flush(); err != nil {
-				return total, err
+				return total, lines, err
 			}
 		}
 	}
 	if err := sc.Err(); err != nil {
-		return total, err
+		return total, lines, err
 	}
-	return total, flush()
+	return total, lines, flush()
 }
 
 func envOr(key, fallback string) string {

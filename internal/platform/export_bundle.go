@@ -240,10 +240,11 @@ func (s *Service) buildBundle(ctx context.Context, tenantID uuid.UUID, opts Expo
 			tables[extra.table] = extra.rows
 		}
 	}
-	// tenants is written explicitly above — the child-FK pass also
-	// discovers it (tenants.owner_org_id → organizations), and a second
-	// data/tenants.jsonl member would corrupt the manifest checksum.
-	delete(tables, "tenants")
+	// the sealed passphrase must never ride inside the bundle it unlocks —
+	// this export's own row still carries it until completion.
+	if raw, ok := tables["tenant_exports"]; ok {
+		tables["tenant_exports"] = scrubExportSecrets(raw)
+	}
 	for tbl, rows := range tables {
 		if tbl == "organization_relationships" {
 			var dropped []json.RawMessage
@@ -312,6 +313,33 @@ func (s *Service) buildBundle(ctx context.Context, tenantID uuid.UUID, opts Expo
 		return nil, nil, err
 	}
 	return enc, cleanupEnc, nil
+}
+
+// scrubExportSecrets strips options.passphrase_enc from exported
+// tenant_exports rows — AEAD ciphertext of the very passphrase that
+// unlocks this bundle has no business inside it.
+func scrubExportSecrets(rows json.RawMessage) json.RawMessage {
+	var objs []map[string]json.RawMessage
+	if json.Unmarshal(rows, &objs) != nil {
+		return rows
+	}
+	changed := false
+	for _, o := range objs {
+		var opts map[string]json.RawMessage
+		if raw, ok := o["options"]; ok && json.Unmarshal(raw, &opts) == nil {
+			if _, has := opts["passphrase_enc"]; has {
+				delete(opts, "passphrase_enc")
+				b, _ := json.Marshal(opts)
+				o["options"] = b
+				changed = true
+			}
+		}
+	}
+	if !changed {
+		return rows
+	}
+	out, _ := json.Marshal(objs)
+	return out
 }
 
 // splitExternalEdges partitions organization_relationships rows: edges
