@@ -11,7 +11,7 @@ Go modular monolith + SvelteKit clients + Flutter mobile (post-MVP).
 cmd/api/    backend entry point
 internal/   bounded-context packages
 apps/main/  SvelteKit webapp + PWA (all user interfaces)
-apps/control/ SvelteKit ecosystem ops (cloud-only)
+apps/control/ → private jedafe/oga9-cloud repo (ecosystem ops, cloud-only — ADR-025)
 apps/mobile/  Flutter (post-MVP)
 db/         migrations + sqlc queries
 ```
@@ -29,3 +29,9 @@ git submodule update --init        # first clone
 git submodule update --remote      # pull latest spec
 # spec changes: cd .oos, edit/commit/push there, then bump pointer here
 ```
+
+## License
+
+AGPLv3 (community edition). Commercial terms apply to enterprise and
+licensed self-hosted tiers (ADR-010); cloud-only operator surfaces live in
+the private `jedafe/oga9-cloud` repo (ADR-025).
