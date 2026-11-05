@@ -218,6 +218,7 @@ type Querier interface {
 	// try every enabled connector's secret; the one that verifies IS the
 	// org attribution.
 	ConnectorsByKind(ctx context.Context, kind string) ([]Connectors, error)
+	ConsumeAuthorizationCode(ctx context.Context, code string) (OauthAuthorizationCodes, error)
 	// Atomic single-use burn: removes the hash and returns the row in one
 	// statement — concurrent logins can't both consume the same code.
 	ConsumeRecoveryCode(ctx context.Context, arg ConsumeRecoveryCodeParams) (pgtype.UUID, error)
@@ -276,6 +277,7 @@ type Querier interface {
 	// Ref: oga9-engineering/sections/18-assets.md
 	CreateAsset(ctx context.Context, arg CreateAssetParams) (pgtype.UUID, error)
 	CreateAudit(ctx context.Context, arg CreateAuditParams) (pgtype.UUID, error)
+	CreateAuthorizationCode(ctx context.Context, arg CreateAuthorizationCodeParams) error
 	// Ref: oga9-engineering/sections/28-platform-blog.md — platform blog queries.
 	CreateBlogPost(ctx context.Context, arg CreateBlogPostParams) (BlogPosts, error)
 	// Ref: oga9-engineering/sections/25-finance-full.md — budgets, expenses,
@@ -326,6 +328,11 @@ type Querier interface {
 	// Ref: oga9-engineering/sections/16-governance.md
 	CreateMotion(ctx context.Context, arg CreateMotionParams) (pgtype.UUID, error)
 	CreateNotification(ctx context.Context, arg CreateNotificationParams) (Notifications, error)
+	// Ref: oga9-engineering/sections/29-wordpress-connector.md + ADR-028 —
+	// sqlc queries for the OIDC/OAuth2 provider slice (oauth_clients,
+	// oauth_authorization_codes, oauth_grants).
+	CreateOAuthClient(ctx context.Context, arg CreateOAuthClientParams) (OauthClients, error)
+	CreateOAuthGrant(ctx context.Context, arg CreateOAuthGrantParams) (OauthGrants, error)
 	CreateOAuthUser(ctx context.Context, arg CreateOAuthUserParams) (pgtype.UUID, error)
 	// ---------- obligations ----------
 	// Idempotent generation: the (membership,type,period) unique makes replay
@@ -608,6 +615,11 @@ type Querier interface {
 	GetNotificationChannel(ctx context.Context, arg GetNotificationChannelParams) (GetNotificationChannelRow, error)
 	// tenant_id joins through organizations — notifications has no tenant col.
 	GetNotificationForDelivery(ctx context.Context, id pgtype.UUID) (GetNotificationForDeliveryRow, error)
+	GetOAuthClient(ctx context.Context, id pgtype.UUID) (OauthClients, error)
+	GetOAuthClientByClientID(ctx context.Context, clientID string) (OauthClients, error)
+	GetOAuthGrantByID(ctx context.Context, id pgtype.UUID) (OauthGrants, error)
+	GetOAuthGrantByRefreshHash(ctx context.Context, arg GetOAuthGrantByRefreshHashParams) (OauthGrants, error)
+	GetOAuthGrantBySession(ctx context.Context, sessionID pgtype.UUID) (OauthGrants, error)
 	GetObligation(ctx context.Context, arg GetObligationParams) (Obligations, error)
 	GetOrg(ctx context.Context, id pgtype.UUID) (GetOrgRow, error)
 	// Reclaim adoption: organizations.slug is UNIQUE(tenant_id, slug), so a
@@ -841,6 +853,7 @@ type Querier interface {
 	ListMilestones(ctx context.Context, projectID pgtype.UUID) ([]ProjectMilestones, error)
 	ListMinutes(ctx context.Context, arg ListMinutesParams) ([]Minutes, error)
 	ListMotions(ctx context.Context, arg ListMotionsParams) ([]Motions, error)
+	ListOAuthClients(ctx context.Context) ([]OauthClients, error)
 	ListObligations(ctx context.Context, arg ListObligationsParams) ([]Obligations, error)
 	// Tenants where the caller holds the org_admin role — the server-side
 	// "my tenant" resolution for POST /orgs (Rule 24).
@@ -1165,12 +1178,15 @@ type Querier interface {
 	// Terminal lifecycle events (expelled/deceased) pull the physical card —
 	// Rule: MemberDeceased → card revoke (§11 business rules).
 	RevokeCards(ctx context.Context, membershipID pgtype.UUID) error
+	RevokeClientGrants(ctx context.Context, clientID string) error
+	RevokeOAuthGrant(ctx context.Context, id pgtype.UUID) error
 	RevokeSessionByID(ctx context.Context, arg RevokeSessionByIDParams) (pgtype.UUID, error)
 	RevokeSessionByJTI(ctx context.Context, jti pgtype.UUID) (pgtype.UUID, error)
 	// end impersonation → the operator's minted session dies with the
 	// support_sessions row (explicit end must cut access, not just flag it).
 	RevokeSessionsForSupport(ctx context.Context, supportSessionID pgtype.UUID) (int64, error)
 	RoleRoster(ctx context.Context, roleID pgtype.UUID) ([]RoleRosterRow, error)
+	RotateOAuthGrant(ctx context.Context, arg RotateOAuthGrantParams) error
 	// partial-patch semantics: unset timestamps keep their previous value.
 	ScheduleElection(ctx context.Context, arg ScheduleElectionParams) (int64, error)
 	// §15: a self-serve downgrade schedules at period end instead of applying
@@ -1211,6 +1227,7 @@ type Querier interface {
 	// state machine is one-way: tabled → debated → voted | withdrawn.
 	// CAS on the read state so concurrent recorders can't double-vote.
 	SetMotionState(ctx context.Context, arg SetMotionStateParams) (int64, error)
+	SetOAuthClientStatus(ctx context.Context, arg SetOAuthClientStatusParams) error
 	// waived/cancelled are terminal; 'paid' MAY reopen to open/partially_paid —
 	// a reversed payment legitimately un-pays the obligation (recompute-driven).
 	SetObligationStatus(ctx context.Context, arg SetObligationStatusParams) (int64, error)
@@ -1310,6 +1327,7 @@ type Querier interface {
 	UpdateDuesSchedule(ctx context.Context, arg UpdateDuesScheduleParams) (int64, error)
 	UpdateField(ctx context.Context, arg UpdateFieldParams) (UpdateFieldRow, error)
 	UpdateFieldGroup(ctx context.Context, arg UpdateFieldGroupParams) (UpdateFieldGroupRow, error)
+	UpdateOAuthClient(ctx context.Context, arg UpdateOAuthClientParams) error
 	UpdateOrgProfile(ctx context.Context, arg UpdateOrgProfileParams) (pgtype.UUID, error)
 	UpdateUnit(ctx context.Context, arg UpdateUnitParams) (pgtype.UUID, error)
 	UpdateUserPassword(ctx context.Context, arg UpdateUserPasswordParams) error

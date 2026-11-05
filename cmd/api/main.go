@@ -790,6 +790,7 @@ func main() {
 		}
 	}
 	oauthH := handler.NewOAuthHandler(authSvc, vk, providers, cfg.BaseURL, cfg.AppURL, queue, cfg.JWTSecret, orgSvc)
+	idpH := handler.NewIDPHandler(authSvc, cfg.AppURL)
 	orgH := handler.NewOrgHandler(orgSvc, entSvc)
 	// WhatsApp inbound — free phone-verification channel (service
 	// conversation): member texts "JOIN <code>" to the WABA number.
@@ -964,6 +965,11 @@ func main() {
 		r.With(middleware.RateLimit(vk, "reset", 5, time.Minute)).Post("/auth/password/reset", authH.ResetPassword)
 		r.With(middleware.RateLimit(vk, "oauth", 20, time.Minute)).Get("/auth/oauth/{provider}/start", oauthH.Start)
 		r.With(middleware.RateLimit(vk, "oauth", 20, time.Minute)).Get("/auth/oauth/{provider}/callback", oauthH.Callback)
+		// §29/ADR-028 OIDC provider — authorize is browser-facing: resolves
+		// the session when present, 302s to app login when not.
+		r.With(middleware.OptionalAuth(authSvc, cfg.JWTSecret),
+			middleware.RateLimit(vk, "oauth_authorize", 30, time.Minute)).Get("/oauth/authorize", idpH.Authorize)
+		r.With(middleware.RateLimit(vk, "oauth_token", 30, time.Minute)).Post("/oauth/token", idpH.Token)
 		r.With(middleware.RateLimit(vk, "mfa", 10, time.Minute)).Post("/auth/mfa/complete", mfaH.Complete)
 		r.With(middleware.RateLimit(vk, "directory", 30, time.Minute)).Get("/directory/organizations", orgH.Directory)
 		r.With(middleware.RateLimit(vk, "directory_apply", 10, time.Minute)).Post("/directory/orgs/{slug}/apply", memberH.PublicApply)
@@ -1011,6 +1017,8 @@ func main() {
 			r.Use(middleware.APIKeyAuth(intSvc))
 			r.Use(middleware.RequireAuth(authSvc, cfg.JWTSecret))
 			r.Post("/auth/logout", authH.Logout)
+			r.Get("/oauth/userinfo", idpH.Userinfo)
+			r.Post("/oauth/revoke", idpH.Revoke)
 			r.Get("/me", authH.Me)
 			r.Get("/me/sessions", authH.Sessions)
 			r.Delete("/me/sessions/{session_id}", authH.RevokeSession)
@@ -1019,6 +1027,11 @@ func main() {
 			// §06/§07 platform surfaces — platform.* nodes resolve via
 			// NULL-tenant roles only (RequirePlatformNode).
 			r.With(middleware.RequirePlatformNode(pool, "platform.apps.view")).Get("/platform/apps", appsH.Registry)
+			// ADR-028 ecosystem relying parties (japa.to et al).
+			r.With(middleware.RequirePlatformNode(pool, "platform.clients.manage")).Get("/platform/oauth-clients", idpH.ListClients)
+			r.With(middleware.RequirePlatformNode(pool, "platform.clients.manage")).Post("/platform/oauth-clients", idpH.CreateClient)
+			r.With(middleware.RequirePlatformNode(pool, "platform.clients.manage")).Patch("/platform/oauth-clients/{cid}", idpH.UpdateClient)
+			r.With(middleware.RequirePlatformNode(pool, "platform.clients.manage")).Delete("/platform/oauth-clients/{cid}", idpH.DeleteClient)
 			r.With(middleware.RequirePlatformNode(pool, "platform.plans.view")).Get("/platform/plans", billH.Plans)
 			r.With(middleware.RequirePlatformNode(pool, "platform.licenses.issue")).Post("/platform/licenses", billH.IssueLicense)
 			r.With(middleware.RequirePlatformNode(pool, "platform.licenses.issue")).Get("/platform/licenses/{deployment_id}/file", billH.LicenseFile)

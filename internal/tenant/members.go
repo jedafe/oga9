@@ -220,7 +220,16 @@ func (s *Service) PublicApply(ctx context.Context, slug, email, phone, japaSubje
 	if err != nil {
 		return uuid.Nil, err
 	}
-	id, err := s.Apply(ctx, fromPg(org.ID), uuid.Nil, email, phone, answers, nil)
+	// ADR-028: the verified subject is an OGA9 sub — when it resolves to
+	// a real account the application links that user instead of staying
+	// an anonymous intake row.
+	var userID uuid.UUID
+	if uid, err := uuid.Parse(japaSubject); err == nil {
+		if _, err := s.q.GetUserByID(ctx, toPg(uid)); err == nil {
+			userID = uid
+		}
+	}
+	id, err := s.Apply(ctx, fromPg(org.ID), userID, email, phone, answers, nil)
 	if err != nil || japaSubject == "" {
 		return id, err
 	}

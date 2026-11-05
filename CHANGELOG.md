@@ -3,6 +3,28 @@
 All notable changes to the OGA9 platform. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 entries reference engineering phases in `.oos/roadmaps/ROADMAP-BACKEND.md`.
 
+## Ecosystem identity provider (ADR-028) — OGA9 as IdP
+
+### Added
+- **OIDC/OAuth2 provider slice (§29 generalized)** — `oauth_clients`
+  (`connector` org-scoped | `platform` ecosystem relying parties),
+  `oauth_authorization_codes` (PKCE S256, single-use, 120s),
+  `oauth_grants` (opaque 256-bit refresh, hashed, rotated on use)
+  (000195). Routes: `GET /oauth/authorize` (browser flow; unauthenticated
+  → 302 to app login), `POST /oauth/token` (form or JSON; code exchange +
+  refresh rotation — superseded session revoked+denylisted),
+  `GET /oauth/userinfo` (connector: `sub/email/name/oga9_org_id/
+  oga9_membership_id`; platform: `sub/email/name/email_verified`),
+  `POST /oauth/revoke`.
+- **Platform client management** — `GET|POST|PATCH|DELETE
+  /platform/oauth-clients` gated by new `platform.clients.manage` node
+  (seeded to platform_admin); secrets are bcrypt-at-rest, shown once.
+  Disabling a client revokes all its grants.
+- **Locator join links real accounts** — a verified referral
+  `japa_subject` that resolves to a `users.id` (the OGA9 sub japa
+  learned via OIDC login) now sets `membership_applications.user_id`
+  (ADR-028) instead of staying anonymous intake.
+
 ## Tenant portability E2E — oga9-admin import fixes (15.13 closeout)
 
 ### Fixed

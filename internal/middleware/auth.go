@@ -77,6 +77,22 @@ func RequireAuth(svc *auth.Service, jwtSecret string) func(http.Handler) http.Ha
 	}
 }
 
+// OptionalAuth resolves a Bearer session when present but never rejects —
+// used on the OAuth authorize endpoint, which redirects unauthenticated
+// browsers to login instead of 401ing.
+func OptionalAuth(svc *auth.Service, jwtSecret string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if token, ok := bearerToken(r); ok {
+				if ctx, ok := resolveSessionToken(r, svc, jwtSecret, token); ok {
+					r = r.WithContext(ctx)
+				}
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
 // RequireAuthOrMFAGate accepts a full session OR an mfa gate nonce as the
 // Bearer credential — used on mfa/setup + mfa/confirm so a privileged login
 // held at mfa_setup_required can still enroll (§02).

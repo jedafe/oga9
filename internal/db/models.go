@@ -821,6 +821,45 @@ type Notifications struct {
 	CreatedAt      pgtype.Timestamptz `json:"created_at"`
 }
 
+type OauthAuthorizationCodes struct {
+	Code                string             `json:"code"`
+	ClientID            string             `json:"client_id"`
+	UserID              pgtype.UUID        `json:"user_id"`
+	OrganizationID      pgtype.UUID        `json:"organization_id"`
+	RedirectUri         string             `json:"redirect_uri"`
+	CodeChallenge       string             `json:"code_challenge"`
+	CodeChallengeMethod string             `json:"code_challenge_method"`
+	ExpiresAt           pgtype.Timestamptz `json:"expires_at"`
+	ConsumedAt          pgtype.Timestamptz `json:"consumed_at"`
+}
+
+type OauthClients struct {
+	ID             pgtype.UUID        `json:"id"`
+	Kind           string             `json:"kind"`
+	ConnectorID    pgtype.UUID        `json:"connector_id"`
+	OrganizationID pgtype.UUID        `json:"organization_id"`
+	ClientID       string             `json:"client_id"`
+	HashedSecret   string             `json:"hashed_secret"`
+	RedirectUris   []string           `json:"redirect_uris"`
+	Name           string             `json:"name"`
+	Trusted        bool               `json:"trusted"`
+	Status         string             `json:"status"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+	RevokedAt      pgtype.Timestamptz `json:"revoked_at"`
+}
+
+type OauthGrants struct {
+	ID               pgtype.UUID        `json:"id"`
+	ClientID         string             `json:"client_id"`
+	UserID           pgtype.UUID        `json:"user_id"`
+	OrganizationID   pgtype.UUID        `json:"organization_id"`
+	SessionID        pgtype.UUID        `json:"session_id"`
+	RefreshTokenHash pgtype.Text        `json:"refresh_token_hash"`
+	RefreshExpiresAt pgtype.Timestamptz `json:"refresh_expires_at"`
+	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+	RevokedAt        pgtype.Timestamptz `json:"revoked_at"`
+}
+
 type OauthProviders struct {
 	ID              pgtype.UUID        `json:"id"`
 	UserID          pgtype.UUID        `json:"user_id"`
