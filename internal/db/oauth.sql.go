@@ -270,6 +270,27 @@ func (q *Queries) GetOAuthGrantByRefreshHash(ctx context.Context, arg GetOAuthGr
 	return i, err
 }
 
+const getOAuthGrantByRefreshHashAny = `-- name: GetOAuthGrantByRefreshHashAny :one
+SELECT id, client_id, user_id, organization_id, session_id, refresh_token_hash, refresh_expires_at, created_at, revoked_at FROM oauth_grants WHERE refresh_token_hash = $1 AND revoked_at IS NULL
+`
+
+func (q *Queries) GetOAuthGrantByRefreshHashAny(ctx context.Context, refreshTokenHash pgtype.Text) (OauthGrants, error) {
+	row := q.db.QueryRow(ctx, getOAuthGrantByRefreshHashAny, refreshTokenHash)
+	var i OauthGrants
+	err := row.Scan(
+		&i.ID,
+		&i.ClientID,
+		&i.UserID,
+		&i.OrganizationID,
+		&i.SessionID,
+		&i.RefreshTokenHash,
+		&i.RefreshExpiresAt,
+		&i.CreatedAt,
+		&i.RevokedAt,
+	)
+	return i, err
+}
+
 const getOAuthGrantBySession = `-- name: GetOAuthGrantBySession :one
 SELECT id, client_id, user_id, organization_id, session_id, refresh_token_hash, refresh_expires_at, created_at, revoked_at FROM oauth_grants WHERE session_id = $1 AND revoked_at IS NULL
 `
@@ -406,6 +427,20 @@ func (q *Queries) UpdateOAuthClient(ctx context.Context, arg UpdateOAuthClientPa
 		arg.RedirectUris,
 		arg.Trusted,
 	)
+	return err
+}
+
+const updateOAuthClientSecret = `-- name: UpdateOAuthClientSecret :exec
+UPDATE oauth_clients SET hashed_secret = $2 WHERE id = $1
+`
+
+type UpdateOAuthClientSecretParams struct {
+	ID           pgtype.UUID `json:"id"`
+	HashedSecret string      `json:"hashed_secret"`
+}
+
+func (q *Queries) UpdateOAuthClientSecret(ctx context.Context, arg UpdateOAuthClientSecretParams) error {
+	_, err := q.db.Exec(ctx, updateOAuthClientSecret, arg.ID, arg.HashedSecret)
 	return err
 }
 

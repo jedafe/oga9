@@ -1060,6 +1060,7 @@ func main() {
 			r.With(middleware.RequirePlatformNode(pool, "platform.clients.manage")).Post("/platform/oauth-clients", idpH.CreateClient)
 			r.With(middleware.RequirePlatformNode(pool, "platform.clients.manage")).Patch("/platform/oauth-clients/{cid}", idpH.UpdateClient)
 			r.With(middleware.RequirePlatformNode(pool, "platform.clients.manage")).Delete("/platform/oauth-clients/{cid}", idpH.DeleteClient)
+			r.With(middleware.RequirePlatformNode(pool, "platform.clients.manage")).Post("/platform/oauth-clients/{cid}/rotate-secret", idpH.RotateClientSecret)
 			r.With(middleware.RequirePlatformNode(pool, "platform.plans.view")).Get("/platform/plans", billH.Plans)
 			r.With(middleware.RequirePlatformNode(pool, "platform.licenses.issue")).Post("/platform/licenses", billH.IssueLicense)
 			r.With(middleware.RequirePlatformNode(pool, "platform.licenses.issue")).Get("/platform/licenses/{deployment_id}/file", billH.LicenseFile)

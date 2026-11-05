@@ -65,3 +65,9 @@ SELECT * FROM oauth_consents WHERE user_id = $1 AND client_id = $2;
 
 -- name: DeleteOAuthConsentsForClient :exec
 DELETE FROM oauth_consents WHERE client_id = $1;
+
+-- name: UpdateOAuthClientSecret :exec
+UPDATE oauth_clients SET hashed_secret = $2 WHERE id = $1;
+
+-- name: GetOAuthGrantByRefreshHashAny :one
+SELECT * FROM oauth_grants WHERE refresh_token_hash = $1 AND revoked_at IS NULL;

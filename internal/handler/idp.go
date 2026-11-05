@@ -156,14 +156,43 @@ func (h *IDPHandler) Userinfo(w http.ResponseWriter, r *http.Request) {
 	httpx.WriteData(w, 200, claims)
 }
 
-// Revoke — POST /oauth/revoke: revokes the grant bound to the caller's
-// session and denylists the token.
+// Revoke — POST /oauth/revoke: with a `token` body field, revokes the
+// caller's grant by refresh token (RFC 7009); otherwise revokes the
+// grant bound to the caller's session.
 func (h *IDPHandler) Revoke(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Token string `json:"token"`
+	}
+	_ = httpx.Decode(w, r, &body)
+	if body.Token != "" {
+		if err := h.svc.RevokeTokenGrant(r.Context(), middleware.UserID(r.Context()), body.Token); err != nil {
+			idpErr(w, err)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
 	if err := h.svc.RevokeSessionGrant(r.Context(), middleware.SessionJTI(r.Context())); err != nil {
 		idpErr(w, err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// RotateClientSecret — POST /platform/oauth-clients/{cid}/rotate-secret:
+// kills the old secret, returns the new one once.
+func (h *IDPHandler) RotateClientSecret(w http.ResponseWriter, r *http.Request) {
+	id, err := uuid.Parse(chi.URLParam(r, "cid"))
+	if err != nil {
+		httpx.WriteErr(w, 400, "invalid_id", "bad client id")
+		return
+	}
+	secret, err := h.svc.RotateOAuthClientSecret(r.Context(), id)
+	if err != nil {
+		idpErr(w, err)
+		return
+	}
+	httpx.WriteData(w, 200, map[string]any{"client_secret": secret})
 }
 
 // ---------- platform client management (platform.clients.manage) ----------

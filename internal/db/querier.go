@@ -621,6 +621,7 @@ type Querier interface {
 	GetOAuthConsent(ctx context.Context, arg GetOAuthConsentParams) (OauthConsents, error)
 	GetOAuthGrantByID(ctx context.Context, id pgtype.UUID) (OauthGrants, error)
 	GetOAuthGrantByRefreshHash(ctx context.Context, arg GetOAuthGrantByRefreshHashParams) (OauthGrants, error)
+	GetOAuthGrantByRefreshHashAny(ctx context.Context, refreshTokenHash pgtype.Text) (OauthGrants, error)
 	GetOAuthGrantBySession(ctx context.Context, sessionID pgtype.UUID) (OauthGrants, error)
 	GetObligation(ctx context.Context, arg GetObligationParams) (Obligations, error)
 	GetOrg(ctx context.Context, id pgtype.UUID) (GetOrgRow, error)
@@ -1330,6 +1331,7 @@ type Querier interface {
 	UpdateField(ctx context.Context, arg UpdateFieldParams) (UpdateFieldRow, error)
 	UpdateFieldGroup(ctx context.Context, arg UpdateFieldGroupParams) (UpdateFieldGroupRow, error)
 	UpdateOAuthClient(ctx context.Context, arg UpdateOAuthClientParams) error
+	UpdateOAuthClientSecret(ctx context.Context, arg UpdateOAuthClientSecretParams) error
 	UpdateOrgProfile(ctx context.Context, arg UpdateOrgProfileParams) (pgtype.UUID, error)
 	UpdateUnit(ctx context.Context, arg UpdateUnitParams) (pgtype.UUID, error)
 	UpdateUserPassword(ctx context.Context, arg UpdateUserPasswordParams) error

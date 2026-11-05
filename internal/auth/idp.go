@@ -177,8 +177,12 @@ func (s *Service) Authorize(ctx context.Context, userID uuid.UUID, clientID, red
 	// untrusted clients need recorded consent — a one-time
 	// consent=accept persists the decision; trusted clients skip.
 	if !c.Trusted {
-		if _, err := s.q.GetOAuthConsent(ctx, db.GetOAuthConsentParams{
-			UserID: toPg(userID), ClientID: c.ClientID}); err != nil {
+		_, err := s.q.GetOAuthConsent(ctx, db.GetOAuthConsentParams{
+			UserID: toPg(userID), ClientID: c.ClientID})
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return "", err // real DB error — don't mask as consent_missing
+		}
+		if errors.Is(err, pgx.ErrNoRows) {
 			if !consented {
 				return "", ErrConsentRequired
 			}
@@ -511,4 +515,54 @@ func (s *Service) DiscoveryDoc() map[string]any {
 		"subject_types_supported":               []string{"public"},
 		"id_token_signing_alg_values_supported": []string{"ES256"},
 	}
+}
+
+// ---------- RFC 7009 token revocation + secret rotation ----------
+
+// RevokeTokenGrant revokes a grant by its refresh token (RFC 7009
+// `token` param). The caller must own the grant — bearer sessions only
+// reach grants they minted.
+func (s *Service) RevokeTokenGrant(ctx context.Context, userID uuid.UUID, refreshToken string) error {
+	g, err := s.q.GetOAuthGrantByRefreshHashAny(ctx, pgText(hashToken(refreshToken)))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil // RFC 7009: unknown token → 200 anyway
+	}
+	if err != nil {
+		return err
+	}
+	if fromPg(g.UserID) != userID {
+		return ErrGrantInvalid // don't leak another user's grant existence
+	}
+	if err := s.q.RevokeOAuthGrant(ctx, g.ID); err != nil {
+		return err
+	}
+	if g.SessionID.Valid {
+		if jti, err := s.q.RevokeSessionByID(ctx, db.RevokeSessionByIDParams{
+			ID: g.SessionID, UserID: g.UserID}); err == nil {
+			s.denySession(ctx, fromPg(jti))
+		}
+	}
+	return nil
+}
+
+// RotateOAuthClientSecret mints a new secret for a client (old secret
+// dies immediately — rotated out of existence, not versioned).
+func (s *Service) RotateOAuthClientSecret(ctx context.Context, id uuid.UUID) (string, error) {
+	if _, err := s.q.GetOAuthClient(ctx, toPg(id)); err != nil {
+		return "", ErrClientNotFound
+	}
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	secret := hex.EncodeToString(b)
+	hash, err := HashPassword(secret)
+	if err != nil {
+		return "", err
+	}
+	if err := s.q.UpdateOAuthClientSecret(ctx, db.UpdateOAuthClientSecretParams{
+		ID: toPg(id), HashedSecret: hash}); err != nil {
+		return "", err
+	}
+	return secret, nil
 }
