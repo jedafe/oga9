@@ -974,6 +974,8 @@ func main() {
 		}
 	}
 
+	// RFC 8414: discovery lives at {issuer}/.well-known — root, not /api/v1.
+	r.Get("/.well-known/openid-configuration", idpH.Discovery)
 	r.Route("/api/v1", func(r chi.Router) {
 		r.Get("/", func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
@@ -994,7 +996,6 @@ func main() {
 		r.With(middleware.OptionalAuth(authSvc, cfg.JWTSecret),
 			middleware.RateLimit(vk, "oauth_authorize", 30, time.Minute)).Get("/oauth/authorize", idpH.Authorize)
 		r.With(middleware.RateLimit(vk, "oauth_token", 30, time.Minute)).Post("/oauth/token", idpH.Token)
-		r.Get("/.well-known/openid-configuration", idpH.Discovery)
 		r.Get("/oauth/jwks.json", idpH.JWKS)
 		r.With(middleware.RateLimit(vk, "mfa", 10, time.Minute)).Post("/auth/mfa/complete", mfaH.Complete)
 		r.With(middleware.RateLimit(vk, "directory", 30, time.Minute)).Get("/directory/organizations", orgH.Directory)
