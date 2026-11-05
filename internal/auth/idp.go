@@ -30,6 +30,7 @@ var (
 	ErrBadPKCE         = errors.New("PKCE verification failed")
 	ErrAccessDenied    = errors.New("access_denied")
 	ErrGrantInvalid    = errors.New("grant invalid or revoked")
+	ErrBadClientState  = errors.New("invalid client status")
 )
 
 const refreshGrantTTL = 30 * 24 * time.Hour
@@ -85,7 +86,7 @@ func (s *Service) UpdateOAuthClient(ctx context.Context, id uuid.UUID, in OAuthC
 // revokes its live grants (a disabled client must die everywhere).
 func (s *Service) SetOAuthClientStatus(ctx context.Context, id uuid.UUID, status string) error {
 	if status != "active" && status != "disabled" {
-		return ErrBadRedirectURI
+		return ErrBadClientState
 	}
 	c, err := s.q.GetOAuthClient(ctx, toPg(id))
 	if err != nil {
@@ -147,8 +148,9 @@ func (s *Service) Authorize(ctx context.Context, userID uuid.UUID, clientID, red
 		return "", ErrBadPKCE
 	}
 	if c.Kind == "connector" {
-		if _, err := s.q.GetMembership(ctx, db.GetMembershipParams{
-			OrganizationID: c.OrganizationID, UserID: toPg(userID)}); err != nil {
+		m, err := s.q.GetMembership(ctx, db.GetMembershipParams{
+			OrganizationID: c.OrganizationID, UserID: toPg(userID)})
+		if err != nil || (m.LifecycleState != "active" && m.LifecycleState != "life_member") {
 			return "", ErrAccessDenied
 		}
 	}
@@ -268,16 +270,24 @@ func (s *Service) RefreshGrant(ctx context.Context, clientID, secret, refreshTok
 		return nil, err
 	}
 	newRefresh := hex.EncodeToString(newRefreshBytes)
-	var oldSession pgtype.UUID
-	err = s.withTx(ctx, func(q *db.Queries) error {
-		oldSession = g.SessionID
-		return q.RotateOAuthGrant(ctx, db.RotateOAuthGrantParams{
-			ID: g.ID, SessionID: toPg(sessionID), RefreshTokenHash: pgText(hashToken(newRefresh)),
-			RefreshExpiresAt: pgtype.Timestamptz{Time: time.Now().Add(refreshGrantTTL), Valid: true}})
-	})
+	// CAS on the session we read: a concurrent refresh already rotated
+	// (session_id moved on) → 0 rows, and the session we just minted is
+	// an orphan — kill it before it can be used.
+	n, err := s.q.RotateOAuthGrant(ctx, db.RotateOAuthGrantParams{
+		ID: g.ID, SessionID: toPg(sessionID), RefreshTokenHash: pgText(hashToken(newRefresh)),
+		RefreshExpiresAt: pgtype.Timestamptz{Time: time.Now().Add(refreshGrantTTL), Valid: true},
+		SessionID_2:      g.SessionID})
 	if err != nil {
 		return nil, err
 	}
+	if n == 0 {
+		if jti, rerr := s.q.RevokeSessionByID(ctx, db.RevokeSessionByIDParams{
+			ID: toPg(sessionID), UserID: g.UserID}); rerr == nil {
+			s.denySession(ctx, fromPg(jti))
+		}
+		return nil, ErrGrantInvalid
+	}
+	oldSession := g.SessionID
 	if oldSession.Valid {
 		if jti, err := s.q.RevokeSessionByID(ctx, db.RevokeSessionByIDParams{
 			ID: oldSession, UserID: g.UserID}); err == nil {

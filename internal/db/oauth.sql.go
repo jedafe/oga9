@@ -321,9 +321,9 @@ func (q *Queries) RevokeOAuthGrant(ctx context.Context, id pgtype.UUID) error {
 	return err
 }
 
-const rotateOAuthGrant = `-- name: RotateOAuthGrant :exec
+const rotateOAuthGrant = `-- name: RotateOAuthGrant :execrows
 UPDATE oauth_grants SET session_id = $2, refresh_token_hash = $3, refresh_expires_at = $4
-WHERE id = $1 AND revoked_at IS NULL
+WHERE id = $1 AND session_id = $5 AND revoked_at IS NULL
 `
 
 type RotateOAuthGrantParams struct {
@@ -331,16 +331,21 @@ type RotateOAuthGrantParams struct {
 	SessionID        pgtype.UUID        `json:"session_id"`
 	RefreshTokenHash pgtype.Text        `json:"refresh_token_hash"`
 	RefreshExpiresAt pgtype.Timestamptz `json:"refresh_expires_at"`
+	SessionID_2      pgtype.UUID        `json:"session_id_2"`
 }
 
-func (q *Queries) RotateOAuthGrant(ctx context.Context, arg RotateOAuthGrantParams) error {
-	_, err := q.db.Exec(ctx, rotateOAuthGrant,
+func (q *Queries) RotateOAuthGrant(ctx context.Context, arg RotateOAuthGrantParams) (int64, error) {
+	result, err := q.db.Exec(ctx, rotateOAuthGrant,
 		arg.ID,
 		arg.SessionID,
 		arg.RefreshTokenHash,
 		arg.RefreshExpiresAt,
+		arg.SessionID_2,
 	)
-	return err
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const setOAuthClientStatus = `-- name: SetOAuthClientStatus :exec

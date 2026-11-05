@@ -47,9 +47,9 @@ SELECT * FROM oauth_grants WHERE session_id = $1 AND revoked_at IS NULL;
 -- name: GetOAuthGrantByID :one
 SELECT * FROM oauth_grants WHERE id = $1;
 
--- name: RotateOAuthGrant :exec
+-- name: RotateOAuthGrant :execrows
 UPDATE oauth_grants SET session_id = $2, refresh_token_hash = $3, refresh_expires_at = $4
-WHERE id = $1 AND revoked_at IS NULL;
+WHERE id = $1 AND session_id = $5 AND revoked_at IS NULL;
 
 -- name: RevokeOAuthGrant :exec
 UPDATE oauth_grants SET revoked_at = now() WHERE id = $1 AND revoked_at IS NULL;

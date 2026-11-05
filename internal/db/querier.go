@@ -1186,7 +1186,7 @@ type Querier interface {
 	// support_sessions row (explicit end must cut access, not just flag it).
 	RevokeSessionsForSupport(ctx context.Context, supportSessionID pgtype.UUID) (int64, error)
 	RoleRoster(ctx context.Context, roleID pgtype.UUID) ([]RoleRosterRow, error)
-	RotateOAuthGrant(ctx context.Context, arg RotateOAuthGrantParams) error
+	RotateOAuthGrant(ctx context.Context, arg RotateOAuthGrantParams) (int64, error)
 	// partial-patch semantics: unset timestamps keep their previous value.
 	ScheduleElection(ctx context.Context, arg ScheduleElectionParams) (int64, error)
 	// §15: a self-serve downgrade schedules at period end instead of applying

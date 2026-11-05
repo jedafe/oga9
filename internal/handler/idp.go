@@ -30,6 +30,8 @@ func idpErr(w http.ResponseWriter, err error) {
 		httpx.WriteErr(w, 404, "client_not_found", "unknown client_id")
 	case errors.Is(err, auth.ErrClientDisabled):
 		httpx.WriteErr(w, 403, "client_disabled", "client is disabled")
+	case errors.Is(err, auth.ErrBadClientState):
+		httpx.WriteErr(w, 400, "invalid_request", "status must be active or disabled")
 	case errors.Is(err, auth.ErrBadRedirectURI):
 		httpx.WriteErr(w, 400, "invalid_request", "redirect_uri not registered for this client")
 	case errors.Is(err, auth.ErrBadClientSecret):
