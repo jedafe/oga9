@@ -10,3 +10,4 @@ bin/
 apps/docs/node_modules/
 apps/docs/.svelte-kit/
 apps/docs/build/
+api
