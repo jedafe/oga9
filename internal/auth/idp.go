@@ -46,11 +46,29 @@ type OAuthClientIn struct {
 	Trusted      bool     `json:"trusted"`
 }
 
+// validRedirectURIs — codes + tokens ride these URIs: https only, except
+// localhost/127.0.0.1 for dev loops. Anything else is a downgrade vector.
+func validRedirectURIs(uris []string) bool {
+	if len(uris) == 0 {
+		return false
+	}
+	for _, u := range uris {
+		if strings.HasPrefix(u, "https://") {
+			continue
+		}
+		if strings.HasPrefix(u, "http://localhost") || strings.HasPrefix(u, "http://127.0.0.1") {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
 // CreatePlatformClient registers an ecosystem relying party (kind
 // 'platform' — no org context). Returns the row + the plaintext secret,
 // shown once and never recoverable (bcrypt at rest).
 func (s *Service) CreatePlatformClient(ctx context.Context, in OAuthClientIn) (*db.OauthClients, string, error) {
-	if in.Name == "" || len(in.RedirectURIs) == 0 {
+	if in.Name == "" || !validRedirectURIs(in.RedirectURIs) {
 		return nil, "", ErrBadRedirectURI
 	}
 	secretBytes := make([]byte, 32)
@@ -81,6 +99,9 @@ func (s *Service) ListOAuthClients(ctx context.Context) ([]db.OauthClients, erro
 }
 
 func (s *Service) UpdateOAuthClient(ctx context.Context, id uuid.UUID, in OAuthClientIn) error {
+	if in.Name == "" || !validRedirectURIs(in.RedirectURIs) {
+		return ErrBadRedirectURI
+	}
 	return s.q.UpdateOAuthClient(ctx, db.UpdateOAuthClientParams{
 		ID: toPg(id), Name: in.Name, RedirectUris: in.RedirectURIs, Trusted: in.Trusted})
 }
@@ -411,6 +432,9 @@ func (s *Service) CreateConnectorClient(ctx context.Context, orgID, connectorID 
 	conn, err := s.q.ConnectorByID(ctx, toPg(connectorID))
 	if err != nil || fromPg(conn.OrganizationID) != orgID {
 		return nil, "", ErrClientNotFound
+	}
+	if name == "" || !validRedirectURIs(redirectURIs) {
+		return nil, "", ErrBadRedirectURI
 	}
 	secretBytes := make([]byte, 32)
 	if _, err := rand.Read(secretBytes); err != nil {
