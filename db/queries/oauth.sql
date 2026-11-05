@@ -56,3 +56,12 @@ UPDATE oauth_grants SET revoked_at = now() WHERE id = $1 AND revoked_at IS NULL;
 
 -- name: RevokeClientGrants :exec
 UPDATE oauth_grants SET revoked_at = now() WHERE client_id = $1 AND revoked_at IS NULL;
+
+-- name: UpsertOAuthConsent :exec
+INSERT INTO oauth_consents (user_id, client_id) VALUES ($1, $2) ON CONFLICT DO NOTHING;
+
+-- name: GetOAuthConsent :one
+SELECT * FROM oauth_consents WHERE user_id = $1 AND client_id = $2;
+
+-- name: DeleteOAuthConsentsForClient :exec
+DELETE FROM oauth_consents WHERE client_id = $1;

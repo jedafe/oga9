@@ -5,7 +5,12 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	crand "crypto/rand"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"log"
@@ -791,6 +796,25 @@ func main() {
 	}
 	oauthH := handler.NewOAuthHandler(authSvc, vk, providers, cfg.BaseURL, cfg.AppURL, queue, cfg.JWTSecret, orgSvc)
 	idpH := handler.NewIDPHandler(authSvc, cfg.AppURL)
+	// ADR-028 OIDC provider identity: ES256 signing key for id_tokens +
+	// JWKS. OGA9_OIDC_SIGNING_KEY (PEM EC private) wins; ephemeral key
+	// otherwise (restarts rotate keys — acceptable until a KMS lands).
+	{
+		var oidcKey *ecdsa.PrivateKey
+		if pemStr := os.Getenv("OGA9_OIDC_SIGNING_KEY"); pemStr != "" {
+			if blk, _ := pem.Decode([]byte(pemStr)); blk != nil {
+				if k, err := x509.ParseECPrivateKey(blk.Bytes); err == nil {
+					oidcKey = k
+				} else if k8, err := x509.ParsePKCS8PrivateKey(blk.Bytes); err == nil {
+					oidcKey, _ = k8.(*ecdsa.PrivateKey)
+				}
+			}
+		}
+		if oidcKey == nil {
+			oidcKey, _ = ecdsa.GenerateKey(elliptic.P256(), crand.Reader)
+		}
+		authSvc.SetOIDCConfig(cfg.BaseURL, oidcKey)
+	}
 	orgH := handler.NewOrgHandler(orgSvc, entSvc)
 	// WhatsApp inbound — free phone-verification channel (service
 	// conversation): member texts "JOIN <code>" to the WABA number.
@@ -970,6 +994,8 @@ func main() {
 		r.With(middleware.OptionalAuth(authSvc, cfg.JWTSecret),
 			middleware.RateLimit(vk, "oauth_authorize", 30, time.Minute)).Get("/oauth/authorize", idpH.Authorize)
 		r.With(middleware.RateLimit(vk, "oauth_token", 30, time.Minute)).Post("/oauth/token", idpH.Token)
+		r.Get("/.well-known/openid-configuration", idpH.Discovery)
+		r.Get("/oauth/jwks.json", idpH.JWKS)
 		r.With(middleware.RateLimit(vk, "mfa", 10, time.Minute)).Post("/auth/mfa/complete", mfaH.Complete)
 		r.With(middleware.RateLimit(vk, "directory", 30, time.Minute)).Get("/directory/organizations", orgH.Directory)
 		r.With(middleware.RateLimit(vk, "directory_apply", 10, time.Minute)).Post("/directory/orgs/{slug}/apply", memberH.PublicApply)
@@ -1019,6 +1045,7 @@ func main() {
 			r.Post("/auth/logout", authH.Logout)
 			r.Get("/oauth/userinfo", idpH.Userinfo)
 			r.Post("/oauth/revoke", idpH.Revoke)
+			r.Post("/oauth/consent", idpH.Consent)
 			r.Get("/me", authH.Me)
 			r.Get("/me/sessions", authH.Sessions)
 			r.Delete("/me/sessions/{session_id}", authH.RevokeSession)
@@ -1298,6 +1325,7 @@ func main() {
 					r.Use(middleware.RequireAppActive(orgSvc, "integrations"))
 					r.With(middleware.RequireOrgPermission(orgSvc, "org.integrations.view")).Get("/orgs/{org_id}/integrations/connectors", intH.ListConnectors)
 					r.With(middleware.RequireOrgPermission(orgSvc, "org.integrations.configure")).Post("/orgs/{org_id}/integrations/connectors", intH.Configure)
+					r.With(middleware.RequireOrgPermission(orgSvc, "org.integrations.configure")).Post("/orgs/{org_id}/oauth-clients", idpH.CreateConnectorClient)
 					r.With(middleware.RequireOrgPermission(orgSvc, "org.integrations.configure")).Patch("/orgs/{org_id}/integrations/connectors/{connector_id}", intH.SetEnabled)
 					r.With(middleware.RequireOrgPermission(orgSvc, "org.integrations.view")).Get("/orgs/{org_id}/calendar.ics", intH.Calendar)
 				})

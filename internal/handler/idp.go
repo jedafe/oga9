@@ -40,6 +40,8 @@ func idpErr(w http.ResponseWriter, err error) {
 		httpx.WriteErr(w, 400, "invalid_grant", "grant invalid, expired, or consumed")
 	case errors.Is(err, auth.ErrBadPKCE):
 		httpx.WriteErr(w, 400, "invalid_grant", "PKCE verification failed")
+	case errors.Is(err, auth.ErrConsentRequired):
+		httpx.WriteErr(w, 403, "consent_required", "user consent required — POST /oauth/consent then retry")
 	case errors.Is(err, auth.ErrAccessDenied):
 		httpx.WriteErr(w, 403, "access_denied", "user is not a member of the client's organization")
 	default:
@@ -66,7 +68,8 @@ func (h *IDPHandler) Authorize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	code, err := h.svc.Authorize(r.Context(), uid, clientID, redirectURI,
-		q.Get("code_challenge"), q.Get("code_challenge_method"))
+		q.Get("code_challenge"), q.Get("code_challenge_method"),
+		q.Get("consent") == "accept")
 	if err != nil {
 		if errors.Is(err, auth.ErrAccessDenied) && redirectURI != "" {
 			sep := "?"
@@ -234,4 +237,60 @@ func (h *IDPHandler) DeleteClient(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// Consent — POST /oauth/consent {client_id}: persists the user's consent
+// decision for an untrusted client (ADR-028).
+func (h *IDPHandler) Consent(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		ClientID string `json:"client_id"`
+	}
+	if err := httpx.Decode(w, r, &body); err != nil || body.ClientID == "" {
+		httpx.WriteErr(w, 400, "invalid_request", "client_id required")
+		return
+	}
+	if err := h.svc.GrantConsent(r.Context(), middleware.UserID(r.Context()), body.ClientID); err != nil {
+		idpErr(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// Discovery — GET /.well-known/openid-configuration.
+func (h *IDPHandler) Discovery(w http.ResponseWriter, r *http.Request) {
+	httpx.WriteData(w, 200, h.svc.DiscoveryDoc())
+}
+
+// JWKS — GET /oauth/jwks.json.
+func (h *IDPHandler) JWKS(w http.ResponseWriter, r *http.Request) {
+	httpx.WriteData(w, 200, h.svc.JWKSet())
+}
+
+// CreateConnectorClient — POST /orgs/{org_id}/oauth-clients: mints an
+// org-scoped connector client bound to a connector row (§29).
+func (h *IDPHandler) CreateConnectorClient(w http.ResponseWriter, r *http.Request) {
+	oc := middleware.OrgCtx(r.Context())
+	var body struct {
+		ConnectorID  string   `json:"connector_id"`
+		Name         string   `json:"name"`
+		RedirectURIs []string `json:"redirect_uris"`
+	}
+	if err := httpx.Decode(w, r, &body); err != nil || body.ConnectorID == "" {
+		httpx.WriteErr(w, 400, "invalid_request", "connector_id required")
+		return
+	}
+	cid, err := uuid.Parse(body.ConnectorID)
+	if err != nil {
+		httpx.WriteErr(w, 400, "invalid_id", "bad connector id")
+		return
+	}
+	c, secret, err := h.svc.CreateConnectorClient(r.Context(), oc.OrgID, cid, body.Name, body.RedirectURIs)
+	if err != nil {
+		idpErr(w, err)
+		return
+	}
+	httpx.WriteData(w, 201, map[string]any{
+		"id": uuid.UUID(c.ID.Bytes), "client_id": c.ClientID, "client_secret": secret,
+		"name": c.Name, "redirect_uris": c.RedirectUris,
+	})
 }

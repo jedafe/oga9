@@ -6,6 +6,7 @@ package auth
 
 import (
 	"context"
+	"crypto/ecdsa"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -13,6 +14,8 @@ import (
 	"errors"
 	"strings"
 	"time"
+
+	"github.com/golang-jwt/jwt/v5"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -98,7 +101,10 @@ func (s *Service) SetOAuthClientStatus(ctx context.Context, id uuid.UUID, status
 			return err
 		}
 		if status == "disabled" {
-			return q.RevokeClientGrants(ctx, c.ClientID)
+			if err := q.RevokeClientGrants(ctx, c.ClientID); err != nil {
+				return err
+			}
+			return q.DeleteOAuthConsentsForClient(ctx, c.ClientID)
 		}
 		return nil
 	})
@@ -136,7 +142,7 @@ func redirectRegistered(c *db.OauthClients, uri string) bool {
 // Authorize mints a single-use authorization code for an authenticated
 // user. Connector clients additionally require membership in the client's
 // org (access_denied) — platform clients carry no org context.
-func (s *Service) Authorize(ctx context.Context, userID uuid.UUID, clientID, redirectURI, challenge, method string) (string, error) {
+func (s *Service) Authorize(ctx context.Context, userID uuid.UUID, clientID, redirectURI, challenge, method string, consented bool) (string, error) {
 	c, err := s.activeClient(ctx, clientID)
 	if err != nil {
 		return "", err
@@ -146,6 +152,20 @@ func (s *Service) Authorize(ctx context.Context, userID uuid.UUID, clientID, red
 	}
 	if challenge == "" || (method != "" && method != "S256") {
 		return "", ErrBadPKCE
+	}
+	// untrusted clients need recorded consent — a one-time
+	// consent=accept persists the decision; trusted clients skip.
+	if !c.Trusted {
+		if _, err := s.q.GetOAuthConsent(ctx, db.GetOAuthConsentParams{
+			UserID: toPg(userID), ClientID: c.ClientID}); err != nil {
+			if !consented {
+				return "", ErrConsentRequired
+			}
+			if err := s.q.UpsertOAuthConsent(ctx, db.UpsertOAuthConsentParams{
+				UserID: toPg(userID), ClientID: c.ClientID}); err != nil {
+				return "", err
+			}
+		}
 	}
 	if c.Kind == "connector" {
 		m, err := s.q.GetMembership(ctx, db.GetMembershipParams{
@@ -167,6 +187,7 @@ func (s *Service) Authorize(ctx context.Context, userID uuid.UUID, clientID, red
 type TokenResult struct {
 	AccessToken  string `json:"access_token"`
 	RefreshToken string `json:"refresh_token,omitempty"`
+	IDToken      string `json:"id_token,omitempty"`
 	ExpiresIn    int64  `json:"expires_in"`
 	TokenType    string `json:"token_type"`
 }
@@ -234,6 +255,7 @@ func (s *Service) mintGrant(ctx context.Context, c *db.OauthClients, userID uuid
 		return nil, err
 	}
 	return &TokenResult{AccessToken: token, RefreshToken: refresh,
+		IDToken:   s.signIDToken(userID, c.ClientID),
 		ExpiresIn: int64(s.tokenTTL.Seconds()), TokenType: "Bearer"}, nil
 }
 
@@ -295,6 +317,7 @@ func (s *Service) RefreshGrant(ctx context.Context, clientID, secret, refreshTok
 		}
 	}
 	return &TokenResult{AccessToken: token, RefreshToken: newRefresh,
+		IDToken:   s.signIDToken(userID, c.ClientID),
 		ExpiresIn: int64(s.tokenTTL.Seconds()), TokenType: "Bearer"}, nil
 }
 
@@ -327,11 +350,13 @@ func (s *Service) UserinfoClaims(ctx context.Context, jti uuid.UUID) (map[string
 	}
 	c, err := s.q.GetOAuthClientByClientID(ctx, g.ClientID)
 	if err == nil && c.Kind == "connector" && g.OrganizationID.Valid {
-		if m, err := s.q.GetMembership(ctx, db.GetMembershipParams{
-			OrganizationID: g.OrganizationID, UserID: g.UserID}); err == nil {
-			claims["oga9_org_id"] = fromPg(g.OrganizationID).String()
-			claims["oga9_membership_id"] = fromPg(m.ID).String()
+		m, err := s.q.GetMembership(ctx, db.GetMembershipParams{
+			OrganizationID: g.OrganizationID, UserID: g.UserID})
+		if err != nil || (m.LifecycleState != "active" && m.LifecycleState != "life_member") {
+			return nil, ErrAccessDenied // suspended/removed member loses org claims
 		}
+		claims["oga9_org_id"] = fromPg(g.OrganizationID).String()
+		claims["oga9_membership_id"] = fromPg(m.ID).String()
 	}
 	return claims, nil
 }
@@ -361,4 +386,105 @@ func (s *Service) OAuthClient(ctx context.Context, id uuid.UUID) (*db.OauthClien
 		return nil, ErrClientNotFound
 	}
 	return &c, err
+}
+
+// ---------- consent (untrusted clients) ----------
+
+var ErrConsentRequired = errors.New("consent_required")
+
+// GrantConsent records a user's consent decision for an untrusted client.
+func (s *Service) GrantConsent(ctx context.Context, userID uuid.UUID, clientID string) error {
+	c, err := s.activeClient(ctx, clientID)
+	if err != nil {
+		return err
+	}
+	return s.q.UpsertOAuthConsent(ctx, db.UpsertOAuthConsentParams{
+		UserID: toPg(userID), ClientID: c.ClientID})
+}
+
+// ---------- connector clients (org-scoped — §29) ----------
+
+// CreateConnectorClient mints an org-scoped client bound to a connector
+// row — the §29 handshake's client-issuing half. Connector clients are
+// trusted by definition (the org admin configured them).
+func (s *Service) CreateConnectorClient(ctx context.Context, orgID, connectorID uuid.UUID, name string, redirectURIs []string) (*db.OauthClients, string, error) {
+	conn, err := s.q.ConnectorByID(ctx, toPg(connectorID))
+	if err != nil || fromPg(conn.OrganizationID) != orgID {
+		return nil, "", ErrClientNotFound
+	}
+	secretBytes := make([]byte, 32)
+	if _, err := rand.Read(secretBytes); err != nil {
+		return nil, "", err
+	}
+	secret := hex.EncodeToString(secretBytes)
+	hash, err := HashPassword(secret)
+	if err != nil {
+		return nil, "", err
+	}
+	row, err := s.q.CreateOAuthClient(ctx, db.CreateOAuthClientParams{
+		Kind: "connector", ConnectorID: conn.ID, OrganizationID: conn.OrganizationID,
+		ClientID:     "oga9_wp_" + strings.ReplaceAll(uuid.NewString(), "-", ""),
+		HashedSecret: hash, RedirectUris: redirectURIs, Name: name, Trusted: true,
+	})
+	if err != nil {
+		return nil, "", err
+	}
+	return &row, secret, nil
+}
+
+// ---------- OIDC metadata: discovery + JWKS + id_token ----------
+
+// SetOIDCConfig wires the issuer (BaseURL) + ES256 signing key for
+// id_tokens/JWKS. Post-construction to keep NewService's arity stable.
+func (s *Service) SetOIDCConfig(issuer string, key *ecdsa.PrivateKey) {
+	s.oidcIssuer, s.oidcKey = issuer, key
+}
+
+// signIDToken — OIDC id_token per ADR-028's OAuth2+userinfo slice. ES256
+// so relying parties verify via /oauth/jwks.json without shared secrets.
+func (s *Service) signIDToken(userID uuid.UUID, clientID string) string {
+	if s.oidcKey == nil {
+		return ""
+	}
+	tok, err := jwt.NewWithClaims(jwt.SigningMethodES256, jwt.MapClaims{
+		"iss": s.oidcIssuer, "sub": userID.String(), "aud": clientID,
+		"iat": time.Now().Unix(), "exp": time.Now().Add(s.tokenTTL).Unix(),
+	}).SignedString(s.oidcKey)
+	if err != nil {
+		return ""
+	}
+	return tok
+}
+
+// JWKSet exposes the ES256 public key in JWKS form.
+func (s *Service) JWKSet() map[string]any {
+	if s.oidcKey == nil {
+		return map[string]any{"keys": []any{}}
+	}
+	p := s.oidcKey.PublicKey
+	sum := sha256.Sum256(append(p.X.Bytes(), p.Y.Bytes()...))
+	enc := base64.RawURLEncoding.EncodeToString
+	return map[string]any{"keys": []map[string]any{{
+		"kty": "EC", "crv": "P-256", "alg": "ES256", "use": "sig",
+		"kid": enc(sum[:8]),
+		"x":   enc(p.X.Bytes()), "y": enc(p.Y.Bytes()),
+	}}}
+}
+
+// DiscoveryDoc serves /.well-known/openid-configuration.
+func (s *Service) DiscoveryDoc() map[string]any {
+	b := s.oidcIssuer
+	return map[string]any{
+		"issuer":                                b,
+		"authorization_endpoint":                b + "/api/v1/oauth/authorize",
+		"token_endpoint":                        b + "/api/v1/oauth/token",
+		"userinfo_endpoint":                     b + "/api/v1/oauth/userinfo",
+		"revocation_endpoint":                   b + "/api/v1/oauth/revoke",
+		"jwks_uri":                              b + "/api/v1/oauth/jwks.json",
+		"response_types_supported":              []string{"code"},
+		"grant_types_supported":                 []string{"authorization_code", "refresh_token"},
+		"code_challenge_methods_supported":      []string{"S256"},
+		"subject_types_supported":               []string{"public"},
+		"id_token_signing_alg_values_supported": []string{"ES256"},
+	}
 }

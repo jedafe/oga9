@@ -40,10 +40,10 @@ func TestOIDCProviderFlow(t *testing.T) {
 	challenge := base64.RawURLEncoding.EncodeToString(sum[:])
 
 	// unregistered redirect_uri refused before code issuance
-	if _, err := svc.Authorize(ctx, uid, c.ClientID, "https://evil.example/cb", challenge, "S256"); !errors.Is(err, ErrBadRedirectURI) {
+	if _, err := svc.Authorize(ctx, uid, c.ClientID, "https://evil.example/cb", challenge, "S256", false); !errors.Is(err, ErrBadRedirectURI) {
 		t.Fatalf("unregistered redirect: %v", err)
 	}
-	code, err := svc.Authorize(ctx, uid, c.ClientID, "https://japa.to/auth/cb", challenge, "S256")
+	code, err := svc.Authorize(ctx, uid, c.ClientID, "https://japa.to/auth/cb", challenge, "S256", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -108,7 +108,103 @@ func TestOIDCProviderFlow(t *testing.T) {
 	if err := svc.SetOAuthClientStatus(ctx, uuid.UUID(c.ID.Bytes), "disabled"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := svc.Authorize(ctx, uid, c.ClientID, "https://japa.to/auth/cb", challenge, "S256"); !errors.Is(err, ErrClientDisabled) {
+	if _, err := svc.Authorize(ctx, uid, c.ClientID, "https://japa.to/auth/cb", challenge, "S256", false); !errors.Is(err, ErrClientDisabled) {
 		t.Fatalf("authorize on disabled client: %v", err)
+	}
+}
+
+// TestConnectorClientAndConsent — connector-kind clients carry org
+// context (membership-gated, org claims); untrusted platform clients
+// require recorded consent.
+func TestConnectorClientAndConsent(t *testing.T) {
+	svc := testSvc(t)
+	ctx := context.Background()
+	pool := svc.pool
+
+	var tid, oid, uid, mid, cid pgtype.UUID
+	if err := pool.QueryRow(ctx,
+		"INSERT INTO tenants (name, slug, billing_email) VALUES ('t','t-'||$1,'t@x.test') RETURNING id",
+		uuid.NewString()[:8]).Scan(&tid); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx,
+		"INSERT INTO organizations (tenant_id, name, slug, org_type) VALUES ($1,'o','o-'||$2,'association') RETURNING id",
+		tid, uuid.NewString()[:8]).Scan(&oid); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx,
+		"INSERT INTO users (email, password_hash, display_name, status, is_verified) VALUES ($1,'x','U','active',true) RETURNING id",
+		uuid.NewString()[:8]+"@x.test").Scan(&uid); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx,
+		"INSERT INTO organization_memberships (organization_id, user_id, lifecycle_state) VALUES ($1,$2,'active') RETURNING id",
+		oid, uid).Scan(&mid); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx,
+		"INSERT INTO connectors (organization_id, kind, config) VALUES ($1,'wordpress_site','{}') RETURNING id",
+		oid).Scan(&cid); err != nil {
+		t.Fatal(err)
+	}
+	orgID, userID := uuid.UUID(oid.Bytes), uuid.UUID(uid.Bytes)
+
+	c, secret, err := svc.CreateConnectorClient(ctx, orgID, uuid.UUID(cid.Bytes), "wp-site",
+		[]string{"https://wp.example/cb"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Kind != "connector" || !c.Trusted {
+		t.Fatal("connector client must be connector-kind + trusted")
+	}
+
+	verifier := "v-" + uuid.NewString()
+	sum := sha256.Sum256([]byte(verifier))
+	challenge := base64.RawURLEncoding.EncodeToString(sum[:])
+
+	// non-member denied
+	stranger := uuid.New()
+	if _, err := svc.Authorize(ctx, stranger, c.ClientID, "https://wp.example/cb", challenge, "S256", false); !errors.Is(err, ErrAccessDenied) {
+		t.Fatalf("non-member: %v", err)
+	}
+	code, err := svc.Authorize(ctx, userID, c.ClientID, "https://wp.example/cb", challenge, "S256", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = svc.ExchangeCode(ctx, c.ClientID, secret, code, "https://wp.example/cb", verifier, "1.2.3.4", "ua")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var jti pgtype.UUID
+	_ = pool.QueryRow(ctx, "SELECT jti FROM user_sessions WHERE user_id=$1 ORDER BY created_at DESC LIMIT 1", uid).Scan(&jti)
+	claims, err := svc.UserinfoClaims(ctx, uuid.UUID(jti.Bytes))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claims["oga9_org_id"] != orgID.String() || claims["oga9_membership_id"] == "" {
+		t.Fatalf("connector claims: %v", claims)
+	}
+	// suspended member loses org claims
+	if _, err := pool.Exec(ctx, "UPDATE organization_memberships SET lifecycle_state='suspended' WHERE id=$1", mid); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.UserinfoClaims(ctx, uuid.UUID(jti.Bytes)); !errors.Is(err, ErrAccessDenied) {
+		t.Fatalf("suspended member: %v", err)
+	}
+
+	// untrusted platform client → consent gate
+	pc, _, err := svc.CreatePlatformClient(ctx, OAuthClientIn{
+		Name: "untrusted", RedirectURIs: []string{"https://x.example/cb"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.Authorize(ctx, userID, pc.ClientID, "https://x.example/cb", challenge, "S256", false); !errors.Is(err, ErrConsentRequired) {
+		t.Fatalf("untrusted w/o consent: %v", err)
+	}
+	if err := svc.GrantConsent(ctx, userID, pc.ClientID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.Authorize(ctx, userID, pc.ClientID, "https://x.example/cb", challenge, "S256", false); err != nil {
+		t.Fatalf("authorize after consent: %v", err)
 	}
 }

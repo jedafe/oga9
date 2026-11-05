@@ -5,6 +5,7 @@ package auth
 
 import (
 	"context"
+	"crypto/ecdsa"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base32"
@@ -68,12 +69,14 @@ type LoginResult struct {
 }
 
 type Service struct {
-	pool      *pgxpool.Pool
-	q         *db.Queries
-	vk        valkey.Client
-	jwtSecret string
-	tokenTTL  time.Duration
-	dataKey   []byte
+	pool       *pgxpool.Pool
+	q          *db.Queries
+	vk         valkey.Client
+	jwtSecret  string
+	tokenTTL   time.Duration
+	dataKey    []byte
+	oidcIssuer string
+	oidcKey    *ecdsa.PrivateKey
 }
 
 func NewService(pool *pgxpool.Pool, vk valkey.Client, jwtSecret string, tokenTTL time.Duration, dataKey []byte) *Service {

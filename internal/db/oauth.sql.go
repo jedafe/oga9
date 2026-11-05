@@ -149,6 +149,15 @@ func (q *Queries) CreateOAuthGrant(ctx context.Context, arg CreateOAuthGrantPara
 	return i, err
 }
 
+const deleteOAuthConsentsForClient = `-- name: DeleteOAuthConsentsForClient :exec
+DELETE FROM oauth_consents WHERE client_id = $1
+`
+
+func (q *Queries) DeleteOAuthConsentsForClient(ctx context.Context, clientID string) error {
+	_, err := q.db.Exec(ctx, deleteOAuthConsentsForClient, clientID)
+	return err
+}
+
 const getOAuthClient = `-- name: GetOAuthClient :one
 SELECT id, kind, connector_id, organization_id, client_id, hashed_secret, redirect_uris, name, trusted, status, created_at, revoked_at FROM oauth_clients WHERE id = $1
 `
@@ -194,6 +203,22 @@ func (q *Queries) GetOAuthClientByClientID(ctx context.Context, clientID string)
 		&i.CreatedAt,
 		&i.RevokedAt,
 	)
+	return i, err
+}
+
+const getOAuthConsent = `-- name: GetOAuthConsent :one
+SELECT user_id, client_id, granted_at FROM oauth_consents WHERE user_id = $1 AND client_id = $2
+`
+
+type GetOAuthConsentParams struct {
+	UserID   pgtype.UUID `json:"user_id"`
+	ClientID string      `json:"client_id"`
+}
+
+func (q *Queries) GetOAuthConsent(ctx context.Context, arg GetOAuthConsentParams) (OauthConsents, error) {
+	row := q.db.QueryRow(ctx, getOAuthConsent, arg.UserID, arg.ClientID)
+	var i OauthConsents
+	err := row.Scan(&i.UserID, &i.ClientID, &i.GrantedAt)
 	return i, err
 }
 
@@ -381,5 +406,19 @@ func (q *Queries) UpdateOAuthClient(ctx context.Context, arg UpdateOAuthClientPa
 		arg.RedirectUris,
 		arg.Trusted,
 	)
+	return err
+}
+
+const upsertOAuthConsent = `-- name: UpsertOAuthConsent :exec
+INSERT INTO oauth_consents (user_id, client_id) VALUES ($1, $2) ON CONFLICT DO NOTHING
+`
+
+type UpsertOAuthConsentParams struct {
+	UserID   pgtype.UUID `json:"user_id"`
+	ClientID string      `json:"client_id"`
+}
+
+func (q *Queries) UpsertOAuthConsent(ctx context.Context, arg UpsertOAuthConsentParams) error {
+	_, err := q.db.Exec(ctx, upsertOAuthConsent, arg.UserID, arg.ClientID)
 	return err
 }

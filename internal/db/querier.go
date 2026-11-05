@@ -414,6 +414,7 @@ type Querier interface {
 	DeleteApplicationSponsors(ctx context.Context, applicationID pgtype.UUID) error
 	DeleteCredential(ctx context.Context, arg DeleteCredentialParams) (int64, error)
 	DeleteFieldGroup(ctx context.Context, arg DeleteFieldGroupParams) (int64, error)
+	DeleteOAuthConsentsForClient(ctx context.Context, clientID string) error
 	// roles delete only while no confirmed/completed signups exist (§27).
 	DeleteVolunteerRole(ctx context.Context, arg DeleteVolunteerRoleParams) (int64, error)
 	// approved → disbursed; disburser must differ from requester (the approver
@@ -617,6 +618,7 @@ type Querier interface {
 	GetNotificationForDelivery(ctx context.Context, id pgtype.UUID) (GetNotificationForDeliveryRow, error)
 	GetOAuthClient(ctx context.Context, id pgtype.UUID) (OauthClients, error)
 	GetOAuthClientByClientID(ctx context.Context, clientID string) (OauthClients, error)
+	GetOAuthConsent(ctx context.Context, arg GetOAuthConsentParams) (OauthConsents, error)
 	GetOAuthGrantByID(ctx context.Context, id pgtype.UUID) (OauthGrants, error)
 	GetOAuthGrantByRefreshHash(ctx context.Context, arg GetOAuthGrantByRefreshHashParams) (OauthGrants, error)
 	GetOAuthGrantBySession(ctx context.Context, sessionID pgtype.UUID) (OauthGrants, error)
@@ -1341,6 +1343,7 @@ type Querier interface {
 	UpsertHealthScore(ctx context.Context, arg UpsertHealthScoreParams) error
 	// committees only — the service validates org_units.type='committee'.
 	UpsertMandate(ctx context.Context, arg UpsertMandateParams) error
+	UpsertOAuthConsent(ctx context.Context, arg UpsertOAuthConsentParams) error
 	UpsertOrgRule(ctx context.Context, arg UpsertOrgRuleParams) (RuleDefinitions, error)
 	UpsertOrgSetting(ctx context.Context, arg UpsertOrgSettingParams) error
 	UpsertPlan(ctx context.Context, arg UpsertPlanParams) (Plans, error)

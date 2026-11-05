@@ -848,6 +848,12 @@ type OauthClients struct {
 	RevokedAt      pgtype.Timestamptz `json:"revoked_at"`
 }
 
+type OauthConsents struct {
+	UserID    pgtype.UUID        `json:"user_id"`
+	ClientID  string             `json:"client_id"`
+	GrantedAt pgtype.Timestamptz `json:"granted_at"`
+}
+
 type OauthGrants struct {
 	ID               pgtype.UUID        `json:"id"`
 	ClientID         string             `json:"client_id"`
