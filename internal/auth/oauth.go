@@ -77,7 +77,10 @@ func (s *Service) OAuthCallback(ctx context.Context, state, code, redirectURI st
 		"client_id":     {p.ClientID},
 		"client_secret": {p.ClientSecret},
 	}
-	req, _ := http.NewRequestWithContext(ctx, "POST", p.TokenURL, strings.NewReader(form.Encode()))
+	req, err := http.NewRequestWithContext(ctx, "POST", p.TokenURL, strings.NewReader(form.Encode()))
+	if err != nil {
+		return nil, fmt.Errorf("oauth token url: %w", err)
+	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	resp, err := oauthHTTP.Do(req)
 	if err != nil {
@@ -92,7 +95,10 @@ func (s *Service) OAuthCallback(ctx context.Context, state, code, redirectURI st
 		return nil, fmt.Errorf("oauth token exchange failed: %s", tok.Error)
 	}
 
-	ureq, _ := http.NewRequestWithContext(ctx, "GET", p.UserinfoURL, nil)
+	ureq, err := http.NewRequestWithContext(ctx, "GET", p.UserinfoURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("oauth userinfo url: %w", err)
+	}
 	ureq.Header.Set("Authorization", "Bearer "+tok.AccessToken)
 	uresp, err := oauthHTTP.Do(ureq)
 	if err != nil {

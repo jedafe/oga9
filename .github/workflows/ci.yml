@@ -35,6 +35,10 @@ jobs:
         run: test -z "$(gofmt -l cmd internal)"
       - name: vet
         run: go vet ./...
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
       - name: build
         run: go build ./...
       - name: apply migrations

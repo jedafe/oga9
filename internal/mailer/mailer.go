@@ -6,6 +6,7 @@ package mailer
 import (
 	"fmt"
 	"net/smtp"
+	"strings"
 )
 
 type Mailer struct {
@@ -24,6 +25,12 @@ func New(host string, port int, from, user, pass string) *Mailer {
 }
 
 func (m *Mailer) Send(to, subject, body string) error {
+	// header-injection guard — `to` is caller-supplied (register/forgot/
+	// invite paths) and lands in MIME headers via Sprintf; smtp.SendMail
+	// validates the envelope but not the message, so reject CR/LF here.
+	if strings.ContainsAny(to, "\r\n") || strings.ContainsAny(subject, "\r\n") {
+		return fmt.Errorf("mailer: CR/LF in header field")
+	}
 	var auth smtp.Auth
 	if m.user != "" {
 		auth = smtp.PlainAuth("", m.user, m.pass, m.host)

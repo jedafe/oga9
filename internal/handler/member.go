@@ -437,9 +437,23 @@ func (h *MemberHandler) Export(w http.ResponseWriter, r *http.Request) {
 		if m.JoinedAt.Valid {
 			joined = m.JoinedAt.Time.Format("2006-01-02")
 		}
-		cw.Write([]string{m.MemberNo.String, m.DisplayName, m.Email, m.Category, m.LifecycleState, m.DuesStanding, joined})
+		cw.Write([]string{csvSafe(m.MemberNo.String), csvSafe(m.DisplayName), csvSafe(m.Email),
+			csvSafe(m.Category), csvSafe(m.LifecycleState), csvSafe(m.DuesStanding), joined})
 	}
 	cw.Flush()
+}
+
+// csvSafe prefixes a leading formula metachar — member-controlled values
+// (display_name, email) must not eval when an admin opens the export in a
+// spreadsheet app. encoding/csv handles quoting; this handles = + - @ tab.
+func csvSafe(s string) string {
+	if s != "" {
+		switch s[0] {
+		case '=', '+', '-', '@', '\t':
+			return "'" + s
+		}
+	}
+	return s
 }
 
 // MyMemberships — GET /me/memberships (auth): all orgs for the caller.

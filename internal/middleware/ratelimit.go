@@ -63,6 +63,10 @@ func RateLimit(vk valkey.Client, bucket string, limit int64, window time.Duratio
 	}
 }
 
+// probePath — probe endpoints are exempt from every rate tier so k8s/monitor
+// hits never burn a bucket.
+func probePath(p string) bool { return p == "/health" || p == "/livez" }
+
 // RateLimitReads — the global read tier (§13.03): bounds GET/HEAD traffic
 // per IP without touching the stricter per-endpoint write/auth buckets.
 // Probes (/health) are exempt.
@@ -71,7 +75,7 @@ func RateLimitReads(vk valkey.Client, bucket string, limit int64, window time.Du
 	return func(next http.Handler) http.Handler {
 		h := limited(next)
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.URL.Path == "/health" || (r.Method != http.MethodGet && r.Method != http.MethodHead) {
+			if probePath(r.URL.Path) || (r.Method != http.MethodGet && r.Method != http.MethodHead) {
 				next.ServeHTTP(w, r)
 				return
 			}
@@ -89,7 +93,7 @@ func RateLimitWrites(vk valkey.Client, bucket string, limit int64, window time.D
 	return func(next http.Handler) http.Handler {
 		h := limited(next)
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.URL.Path == "/health" || r.Method == http.MethodGet || r.Method == http.MethodHead {
+			if probePath(r.URL.Path) || r.Method == http.MethodGet || r.Method == http.MethodHead {
 				next.ServeHTTP(w, r)
 				return
 			}

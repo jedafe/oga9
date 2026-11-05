@@ -237,8 +237,28 @@ func (s *Service) TenantsWithNode(ctx context.Context, userID uuid.UUID, node st
 // IsAppActive reports whether appID is installed+active for the tenant —
 // the §06 "deactivation disables functionality" check consumed by
 // middleware.RequireAppActive on module routes.
+// IsAppActive gates every app-scoped route group — cached at
+// oga9:app_active:{tenant}:{app} (60s; activate/deactivate write-through
+// so a flip takes effect immediately, never after the TTL).
 func (s *Service) IsAppActive(ctx context.Context, tenantID uuid.UUID, appID string) (bool, error) {
-	return s.q.IsAppActive(ctx, db.IsAppActiveParams{TenantID: toPg(tenantID), AppID: appID})
+	key := "oga9:app_active:" + tenantID.String() + ":" + appID
+	if raw, err := s.vk.Do(ctx, s.vk.B().Get().Key(key).Build()).ToString(); err == nil {
+		return raw == "1", nil
+	}
+	ok, err := s.q.IsAppActive(ctx, db.IsAppActiveParams{TenantID: toPg(tenantID), AppID: appID})
+	if err == nil {
+		v := "0"
+		if ok {
+			v = "1"
+		}
+		_ = s.vk.Do(ctx, s.vk.B().Set().Key(key).Value(v).ExSeconds(60).Build()).Error()
+	}
+	return ok, err
+}
+
+// invalidateAppActive drops the cached gate on activate/deactivate.
+func (s *Service) invalidateAppActive(ctx context.Context, tenantID uuid.UUID, appID string) {
+	_ = s.vk.Do(ctx, s.vk.B().Del().Key("oga9:app_active:"+tenantID.String()+":"+appID).Build()).Error()
 }
 
 func (s *Service) HasTenantRole(ctx context.Context, userID, tenantID uuid.UUID, slug string) bool {

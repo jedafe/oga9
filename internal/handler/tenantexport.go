@@ -6,7 +6,6 @@ package handler
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -85,7 +84,7 @@ func (h *TenantExportHandler) Create(w http.ResponseWriter, r *http.Request) {
 		PostState          string `json:"post_state"`
 		ExportPassphrase   string `json:"export_passphrase"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+	if err := httpx.Decode(w, r, &body); err != nil && !errors.Is(err, io.EOF) {
 		httpx.WriteErr(w, 400, "invalid_json", "request body is not valid JSON")
 		return
 	}
@@ -158,7 +157,7 @@ func (h *TenantExportHandler) Confirm(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		ConfirmPurge bool `json:"confirm_purge"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+	if err := httpx.Decode(w, r, &body); err != nil && !errors.Is(err, io.EOF) {
 		httpx.WriteErr(w, 400, "invalid_json", "request body is not valid JSON")
 		return
 	}

@@ -123,6 +123,11 @@ func (h *MFAHandler) Complete(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteErr(w, 401, "invalid_mfa_code", "mfa code incorrect")
 		return
 	}
+	if errors.Is(err, auth.ErrLoginThrottled) {
+		w.Header().Set("Retry-After", "900")
+		httpx.WriteErr(w, 429, "login_throttled", "too many failed attempts — try again later")
+		return
+	}
 	if err != nil {
 		httpx.WriteErr(w, 500, "internal_error", "mfa completion failed")
 		return

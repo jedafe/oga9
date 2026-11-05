@@ -1009,6 +1009,14 @@ func (s *Service) ProcessExport(ctx context.Context, exportID uuid.UUID) error {
 }
 
 func csvCell(s string) string {
+	if s != "" {
+		switch s[0] {
+		// formula-prefix escape: member-controlled values must not eval
+		// when an admin opens the CSV in a spreadsheet app.
+		case '=', '+', '-', '@', '\t':
+			s = "'" + s
+		}
+	}
 	if strings.ContainsAny(s, ",\"\n\r") {
 		return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
 	}

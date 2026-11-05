@@ -44,6 +44,7 @@ var (
 	ErrEmailNotVerified = errors.New("email_not_verified")
 	ErrMFANotEnabled    = errors.New("mfa_not_enabled")
 	ErrRegClosed        = errors.New("registration_closed")
+	ErrLoginThrottled   = errors.New("login_throttled")
 )
 
 type User struct {
@@ -188,7 +189,13 @@ func (s *Service) Login(ctx context.Context, email, password, mfaCode, deviceLab
 	if err != nil {
 		return nil, err // real DB error → 500
 	}
+	// per-account throttle: per-IP buckets can't stop a distributed grind —
+	// repeated failures on a real account lock it out for the window.
+	if s.loginThrottled(ctx, fromPg(row.ID)) {
+		return nil, ErrLoginThrottled
+	}
 	if !row.PasswordHash.Valid || !CheckPassword(row.PasswordHash.String, password) {
+		s.recordLoginFailure(ctx, fromPg(row.ID))
 		return nil, ErrBadCredentials
 	}
 	// status + verification checks run only after credentials prove out, so
@@ -222,7 +229,11 @@ func (s *Service) finishLogin(ctx context.Context, userID uuid.UUID, mfaSecret [
 			}
 			return &LoginResult{MFAToken: tok}, ErrMFARequired
 		}
+		if s.loginThrottled(ctx, userID) {
+			return nil, ErrLoginThrottled
+		}
 		if err := s.checkMFACode(ctx, userID, mfaSecret, mfaCode); err != nil {
+			s.recordLoginFailure(ctx, userID)
 			return nil, err
 		}
 	} else {
@@ -240,11 +251,38 @@ func (s *Service) finishLogin(ctx context.Context, userID uuid.UUID, mfaSecret [
 			return &LoginResult{MFAToken: tok}, ErrMFASetupRequired
 		}
 	}
+	s.clearLoginFailures(ctx, userID)
 	token, sessionID, err := s.createSession(ctx, userID, deviceLabel, ip, ua, provider)
 	if err != nil {
 		return nil, err
 	}
 	return &LoginResult{Token: token, SessionID: sessionID, UserID: userID}, nil
+}
+
+// Per-account login/MFA failure counter — oga9:loginfail:{user_id}, 15min
+// window (Rule 4 catalogued key). A distributed credential-stuffing run
+// rotates IPs; this bucket doesn't.
+const (
+	maxLoginFailures = 10
+	loginLockWindowS = 900
+)
+
+func loginFailKey(userID uuid.UUID) string { return "oga9:loginfail:" + userID.String() }
+
+func (s *Service) loginThrottled(ctx context.Context, userID uuid.UUID) bool {
+	n, err := s.vk.Do(ctx, s.vk.B().Get().Key(loginFailKey(userID)).Build()).AsInt64()
+	return err == nil && n >= maxLoginFailures
+}
+
+func (s *Service) recordLoginFailure(ctx context.Context, userID uuid.UUID) {
+	n, err := s.vk.Do(ctx, s.vk.B().Incr().Key(loginFailKey(userID)).Build()).AsInt64()
+	if err == nil && n == 1 {
+		s.vk.Do(ctx, s.vk.B().Expire().Key(loginFailKey(userID)).Seconds(loginLockWindowS).Build())
+	}
+}
+
+func (s *Service) clearLoginFailures(ctx context.Context, userID uuid.UUID) {
+	_ = s.vk.Do(ctx, s.vk.B().Del().Key(loginFailKey(userID)).Build()).Error()
 }
 
 // createSession is the shared session-issuing tail of Login/OAuthCallback:
@@ -553,9 +591,14 @@ func (s *Service) CompleteMFALogin(ctx context.Context, mfaToken, code string) (
 	if row.Status != "active" {
 		return nil, ErrUserSuspended
 	}
+	if s.loginThrottled(ctx, gate.UserID) {
+		return nil, ErrLoginThrottled
+	}
 	if err := s.checkMFACode(ctx, gate.UserID, row.MfaSecret, code); err != nil {
+		s.recordLoginFailure(ctx, gate.UserID)
 		return nil, err
 	}
+	s.clearLoginFailures(ctx, gate.UserID)
 	token, sessionID, err := s.createSession(ctx, gate.UserID, gate.DeviceLabel, gate.IP, gate.UserAgent, gate.Provider)
 	if err != nil {
 		return nil, err

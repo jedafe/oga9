@@ -93,7 +93,7 @@ func (s *Service) ActivateApp(ctx context.Context, oc *OrgCtx, ent *entitlements
 	if m.Entitlements.Feature != "" && !ent.IsEnabled(ctx, oc.TenantID, m.Entitlements.Feature) {
 		return ErrNotEntitled
 	}
-	return s.withTx(ctx, func(q *db.Queries) error {
+	err = s.withTx(ctx, func(q *db.Queries) error {
 		// Dependency closure is re-checked inside the tx so a concurrent
 		// deactivate can't slip between check and upsert.
 		active, err := q.ListActiveApps(ctx, toPg(oc.TenantID))
@@ -119,6 +119,10 @@ func (s *Service) ActivateApp(ctx context.Context, oc *OrgCtx, ent *entitlements
 		return events.Emit(ctx, q, oc.TenantID, oc.OrgID, "AppActivated", "app_installation", uuid.UUID(iid.Bytes), oc.UserID, true,
 			map[string]any{"tenant_id": oc.TenantID, "app_id": appID, "org_id": oc.OrgID})
 	})
+	if err == nil {
+		s.invalidateAppActive(ctx, oc.TenantID, appID)
+	}
+	return err
 }
 
 // DeactivateApp rejects while an ACTIVE app depends on this one (§06).
@@ -134,7 +138,7 @@ func (s *Service) DeactivateApp(ctx context.Context, oc *OrgCtx, appID string) e
 	if row.MvpRequired {
 		return ErrAppRequired
 	}
-	return s.withTx(ctx, func(q *db.Queries) error {
+	err = s.withTx(ctx, func(q *db.Queries) error {
 		// Dependents + install state are re-checked inside the tx — a
 		// concurrent activate(dependent)/deactivate(base) race otherwise
 		// breaks the dependency graph (FOR UPDATE serializes the check).
@@ -171,6 +175,10 @@ func (s *Service) DeactivateApp(ctx context.Context, oc *OrgCtx, appID string) e
 		return events.Emit(ctx, q, oc.TenantID, oc.OrgID, "AppDeactivated", "app_installation", uuid.UUID(iid.Bytes), oc.UserID, true,
 			map[string]any{"tenant_id": oc.TenantID, "app_id": appID, "org_id": oc.OrgID})
 	})
+	if err == nil {
+		s.invalidateAppActive(ctx, oc.TenantID, appID)
+	}
+	return err
 }
 
 // ScaffoldTenant prepares a control-plane-provisioned tenant for its first

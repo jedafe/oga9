@@ -79,9 +79,14 @@ func (g *Gateway) ServeWS(w http.ResponseWriter, r *http.Request) {
 				return
 			case <-tick.C:
 				subsMu.Lock()
-				for _, mid := range subs {
+				for cid, mid := range subs {
 					g.vk.Do(ctx, g.vk.B().Set().Key("oga9:presence:"+mid.String()).
 						Value("1").Ex(90*time.Second).Build())
+					// re-validate the grant — a member removed mid-session
+					// must not keep receiving this channel's fan-out.
+					if !g.chat.CanSubscribe(ctx, cid, mid, userID) {
+						delete(subs, cid)
+					}
 				}
 				subsMu.Unlock()
 			}

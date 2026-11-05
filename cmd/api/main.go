@@ -138,9 +138,45 @@ func main() {
 		asynq.RedisClientOpt{Addr: cfg.ValkeyAddr},
 		&asynq.SchedulerOpts{},
 	)
+	// §08: asynq's scheduler has no leader election — every replica would
+	// re-enqueue every periodic task. One instance holds the
+	// oga9:scheduler:leader lease (60s, renewed); losers poll and take
+	// over on expiry. Tasks are idempotent, so a handover overlap is
+	// benign; a hard split would only waste work, never double-apply.
 	go func() {
-		if err := scheduler.Run(); err != nil {
-			log.Printf("asynq scheduler: %v", err)
+		id := uuid.NewString()
+		key := "oga9:scheduler:leader"
+		for {
+			won, err := vk.Do(ctx, vk.B().Set().Key(key).Value(id).Nx().ExSeconds(60).Build()).AsBool()
+			if err == nil && won {
+				stop := make(chan struct{})
+				go func() {
+					t := time.NewTicker(30 * time.Second)
+					defer t.Stop()
+					for {
+						select {
+						case <-stop:
+							return
+						case <-ctx.Done():
+							return
+						case <-t.C:
+							vk.Do(ctx, vk.B().Eval().
+								Script(`if redis.call("get",KEYS[1])==ARGV[1] then return redis.call("set",KEYS[1],ARGV[1],"EX",60) else return 0 end`).
+								Numkeys(1).Key(key).Arg(id).Build())
+						}
+					}
+				}()
+				if err := scheduler.Run(); err != nil {
+					log.Printf("asynq scheduler: %v", err)
+				}
+				close(stop)
+				return
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(15 * time.Second):
+			}
 		}
 	}()
 
@@ -151,6 +187,9 @@ func main() {
 		r.Use(sentryhttp.New(sentryhttp.Options{Repanic: true}).Handle)
 	}
 	r.Use(chimiddleware.Recoverer)
+	// header baseline: nosniff/no-frame/no-referrer/no-store; HSTS only
+	// once TLS is real (production).
+	r.Use(middleware.SecurityHeaders(cfg.IsProduction()))
 	// resolved client IP must land in ctx BEFORE obs logging and every
 	// rate-limit bucket — otherwise the proxy's addr is what gets counted.
 	r.Use(middleware.ResolveIP(cfg.TrustedProxies))
@@ -165,6 +204,12 @@ func main() {
 	r.Use(middleware.RateLimitReads(vk, "read", 240, time.Minute))
 	r.Use(middleware.RateLimitWrites(vk, "write", 120, time.Minute))
 
+	// liveness: process is up — no dependency checks, so a DB/Valkey blip
+	// can't restart-loop the pod (readiness stays on /health).
+	r.Get("/livez", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"status":"alive"}`))
+	})
 	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
 		if err := pool.Ping(r.Context()); err != nil {
 			w.WriteHeader(http.StatusServiceUnavailable)

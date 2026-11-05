@@ -3,6 +3,47 @@
 All notable changes to the OGA9 platform. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 entries reference engineering phases in `.oos/roadmaps/ROADMAP-BACKEND.md`.
 
+## Tenant portability E2E — oga9-admin import fixes (15.13 closeout)
+
+### Fixed
+- **`oga9-admin import` could not complete on the current schema** — the
+  post-import outbox guard updated `domain_events.published_at`, a column
+  renamed to `dispatched_at` in 000045; the import now stamps
+  `dispatched_at`.
+- **Nested blob keys failed to restore** — `files/` entries under
+  subdirectories (e.g. `e2e/doc.txt`) errored on `os.Create`; the importer
+  now `MkdirAll`s the blob's parent directory. Verified end-to-end:
+  signed+encrypted export → verified import into a fresh install →
+  confirm → `readonly_grace` post-state, plus crash-recovery re-run
+  (conflict-skip + blob resume).
+
+## Security & reliability hardening pass
+
+### Added
+- **Per-account login/MFA throttling** — `oga9:loginfail:{user_id}` counter
+  (10 failures / 15 min) on password + TOTP paths; repeated failures
+  return 429 + `Retry-After` even when the attacking IPs rotate.
+- **Response security-header baseline** (`middleware.SecurityHeaders`) —
+  nosniff, DENY framing, no-referrer, no-store, deny-all CSP; HSTS in
+  production only.
+- **`GET /livez` liveness probe** — dependency-free; probes are exempt
+  from every rate-limit tier and request logging.
+- **Asynq scheduler leader lease** (`oga9:scheduler:leader`, 60s
+  self-renewed SET NX) — only one replica enqueues periodic tasks.
+- **`oga9:app_active:{tenant}:{app}` gate cache** (60s TTL,
+  write-through invalidation on activate/deactivate).
+- **govulncheck** in CI.
+
+### Fixed
+- **CSV formula injection** — member/tenant exports prefix `= + - @ \t`
+  so member-controlled values can't eval in spreadsheet apps.
+- **WS channel grants re-validated** on the presence tick — a member
+  removed mid-session stops receiving that channel's fan-out.
+- **OAuth callback** — token/userinfo request construction errors are no
+  longer silently dropped.
+- **bcrypt cost 10 → 12** for new password hashes; **mailer** rejects
+  CR/LF in `to`/`subject` (header-injection guard).
+
 ## Post-MVP app capabilities — plan seeding gap fix
 
 ### Fixed

@@ -121,6 +121,11 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteErr(w, 401, "invalid_credentials", "email or password incorrect")
 		return
 	}
+	if errors.Is(err, auth.ErrLoginThrottled) {
+		w.Header().Set("Retry-After", "900")
+		httpx.WriteErr(w, 429, "login_throttled", "too many failed attempts — try again later")
+		return
+	}
 	if errors.Is(err, auth.ErrTenantSuspended) {
 		httpx.WriteErr(w, 403, "tenant_suspended", "organization account is suspended")
 		return

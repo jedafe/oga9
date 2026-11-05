@@ -31,7 +31,7 @@ func routePattern(r *http.Request) string {
 }
 
 // probe paths — k8s/monitor hits flood logs and skew latency stats.
-func isProbe(r *http.Request) bool { return r.URL.Path == "/health" }
+func isProbe(r *http.Request) bool { return r.URL.Path == "/health" || r.URL.Path == "/livez" }
 
 // RequestLog emits one structured line per request. The route is the chi
 // template (/orgs/{org_id}/...) — never the raw path, so logs carry no
