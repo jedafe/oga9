@@ -192,7 +192,11 @@ func TestFinanceFlow(t *testing.T) {
 	if err := svc.CloseDrive(ctx, oc, did); err != nil {
 		t.Fatal(err)
 	}
-	if err := svc.DisburseDrive(ctx, oc, did, "handed to family"); err != nil {
+	// SoD: the opener can't disburse — a different member releases funds.
+	if err := svc.DisburseDrive(ctx, oc, did, "handed to family"); err != ErrSeparation {
+		t.Fatalf("opener disburse should fail, got %v", err)
+	}
+	if err := svc.DisburseDrive(ctx, payerOC, did, "handed to family"); err != nil {
 		t.Fatal(err)
 	}
 	var disbursed string
@@ -279,7 +283,7 @@ func TestFinanceGuards(t *testing.T) {
 	if err := svc.CloseDrive(ctx, oc, did); err != nil {
 		t.Fatal(err)
 	}
-	if err := svc.DisburseDrive(ctx, oc, did, "out"); err != nil {
+	if err := svc.DisburseDrive(ctx, payerOC, did, "out"); err != nil {
 		t.Fatal(err)
 	}
 	if err := svc.ConfirmPayment(ctx, oc, pid); err != ErrInvalidTransition {

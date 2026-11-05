@@ -148,8 +148,24 @@ func TestApprovalTiers(t *testing.T) {
 	if _, err := svc.Decide(ctx, app, hi, true, 500000, "NGN", ""); !errors.Is(err, ErrDuplicate) {
 		t.Fatalf("same approver twice: %v", err)
 	}
-	third := &tenant.OrgCtx{OrgID: oc.OrgID, TenantID: oc.TenantID, UserID: oc.UserID,
-		MembershipID: oc.MembershipID, State: "active"}
+	// SoD: the claimant may never decide their own case.
+	if _, err := svc.Decide(ctx, oc, hi, true, 500000, "NGN", ""); !errors.Is(err, ErrSelfAction) {
+		t.Fatalf("claimant deciding own case: %v", err)
+	}
+	// a genuinely third member completes the two-approver tier.
+	var uid3, mid3 pgtype.UUID
+	if err := pool.QueryRow(ctx,
+		`INSERT INTO users (email, password_hash, display_name, status) VALUES ($1,'x','U3','active') RETURNING id`,
+		uuid.NewString()[:8]+"@x.test").Scan(&uid3); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx,
+		`INSERT INTO organization_memberships (organization_id, user_id, category, lifecycle_state)
+		 VALUES ($1,$2,'regular','active') RETURNING id`, oc.OrgID, uid3).Scan(&mid3); err != nil {
+		t.Fatal(err)
+	}
+	third := &tenant.OrgCtx{OrgID: oc.OrgID, TenantID: oc.TenantID, UserID: uuid.UUID(uid3.Bytes),
+		MembershipID: uuid.UUID(mid3.Bytes), State: "active"}
 	ok, err = svc.Decide(ctx, third, hi, true, 500000, "NGN", "")
 	if err != nil || !ok {
 		t.Fatalf("second approver: %v %v", ok, err)
@@ -176,7 +192,11 @@ func TestDisburse(t *testing.T) {
 	if _, err := svc.Decide(ctx, app, cid, true, 1000, "NGN", ""); err != nil {
 		t.Fatal(err)
 	}
-	bid, err := svc.Disburse(ctx, oc, cid, "cash", 1000, "NGN")
+	// claimant can't disburse their own grant — the approver releases it.
+	if _, err := svc.Disburse(ctx, oc, cid, "cash", 1000, "NGN"); !errors.Is(err, ErrSelfAction) {
+		t.Fatalf("claimant disbursing own grant: %v", err)
+	}
+	bid, err := svc.Disburse(ctx, app, cid, "cash", 1000, "NGN")
 	if err != nil || bid == uuid.Nil {
 		t.Fatalf("disburse: %v %v", bid, err)
 	}

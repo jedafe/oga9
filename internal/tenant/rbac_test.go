@@ -63,8 +63,12 @@ func TestScopedAppointmentResolution(t *testing.T) {
 	if _, err := svc.AppointOfficer(ctx, oc, termID, pos, memberID, branch, uuid.Nil, now); err != ErrMemberNotActive {
 		t.Fatalf("applied member should be rejected, got %v", err)
 	}
-	if _, err := pool.Exec(ctx, "UPDATE organization_memberships SET lifecycle_state='active' WHERE id=$1", memberID); err != nil {
-		t.Fatal(err)
+	// walk the real pipeline — 'active' via TransitionMember is where the
+	// member role (and its org.members.* nodes) lands (ADR-014).
+	for _, action := range []string{"screen", "approve", "register", "activate"} {
+		if err := svc.TransitionMember(ctx, oc, memberID, action); err != nil {
+			t.Fatalf("activate member (%s): %v", action, err)
+		}
 	}
 
 	// out-of-window start is rejected against the term's dates

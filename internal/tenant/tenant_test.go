@@ -138,8 +138,18 @@ func TestOrgLifecycleFlow(t *testing.T) {
 	if moc.OrgID != org.ID {
 		t.Fatal("member ctx org mismatch")
 	}
+	// an invite vouches for intake only — at 'applied' the member resolves
+	// ctx but holds no nodes until an officer completes the lifecycle.
+	if svc.HasPermission(ctx, member, org.ID, "org.members.view") {
+		t.Fatal("applied member should hold no nodes")
+	}
+	for _, action := range []string{"screen", "approve", "register", "activate"} {
+		if err := svc.TransitionMember(ctx, oc, moc.MembershipID, action); err != nil {
+			t.Fatalf("transition %s: %v", action, err)
+		}
+	}
 	if !svc.HasPermission(ctx, member, org.ID, "org.members.view") {
-		t.Fatal("accepted member missing org.members.view")
+		t.Fatal("active member missing org.members.view")
 	}
 	if svc.HasPermission(ctx, member, org.ID, "org.structure.manage") {
 		t.Fatal("member should not have admin node")
