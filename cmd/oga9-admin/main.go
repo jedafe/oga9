@@ -184,9 +184,9 @@ func runImport(args []string) error {
 		return err
 	}
 	// imported outbox rows keep their history but must never re-fire —
-	// a published_at IS NULL row would be claimed by the dispatcher.
+	// a dispatched_at IS NULL row would be claimed by the dispatcher.
 	if _, err := tx.Exec(ctx,
-		"UPDATE domain_events SET published_at = now() WHERE published_at IS NULL"); err != nil {
+		"UPDATE domain_events SET dispatched_at = now() WHERE dispatched_at IS NULL"); err != nil {
 		return err
 	}
 	if m.IncludeCredentials {
@@ -211,7 +211,11 @@ func runImport(args []string) error {
 			return nil
 		}
 		key := filepath.Clean("/" + strings.ReplaceAll(strings.TrimPrefix(path, "files/"), "..", ""))
-		dst, err := os.Create(filepath.Join(*uploads, key))
+		dstPath := filepath.Join(*uploads, key)
+		if err := os.MkdirAll(filepath.Dir(dstPath), 0o755); err != nil {
+			return err
+		}
+		dst, err := os.Create(dstPath)
 		if err != nil {
 			return err
 		}
