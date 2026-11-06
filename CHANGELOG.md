@@ -3,6 +3,67 @@
 All notable changes to the OGA9 platform. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 entries reference engineering phases in `.oos/roadmaps/ROADMAP-BACKEND.md`.
 
+## Static-analysis hardening sweep (15.16)
+
+### Added
+- **`gosec -quiet -exclude-generated` in `make lint`** — joins gofmt +
+  `go vet`; govulncheck already runs in CI.
+- **`os.Root` confinement (Go 1.24+)** — the local blob store
+  (`internal/storage`) and `file:` credential_ref resolution
+  (`internal/secrets`) now refuse `..` traversal AND symlink escapes; a
+  planted link inside `OGA9_UPLOADS_DIR`/`OGA9_SECRETS_DIR` can't pivot
+  to `/etc` or `/proc`.
+- **Upload bodies bounded before multipart spill** — handlers wrap
+  `r.Body` in `http.MaxBytesReader` at the resolved upload cap
+  (`limit.storage.mb` entitlement, `OGA9_UPLOAD_MAX_MB` fallback, 512
+  MiB hard ceiling when unset) + 1 MiB form overhead; oversize → 413
+  `upload_too_large` before `ParseMultipartForm` can spill to tmpfs.
+- **`httpx.I32` int64→int32 clamp + `?page` ≤ 1,000,000** — adversarial
+  pagination can't wrap sqlc's int32 offsets negative.
+
+### Fixed
+- **OAuth upstream decode bound** — provider token/userinfo responses
+  decode under a 4 MiB cap; a misbehaving provider can't stream memory.
+- **Password ceiling 72 bytes** — bcrypt's own input limit; over-length
+  input is rejected at validation instead of erroring inside the hash.
+- **Scheduler lease re-contention** — an asynq scheduler error no longer
+  retires the instance's candidacy for `oga9:scheduler:leader`; the loop
+  re-contends until shutdown.
+- **Tenant-scoped api keys on `GET /me/entitlements`** — the key is the
+  tenant's credential (Rule 24); it binds to its own tenant instead of
+  an `org.admin.billing` lookup that could only resolve empty.
+- **WS typing fan-out race** — the per-connection `subs` map is read
+  under its mutex on the typing path.
+- **ES256 JWKS fixed-width points** — `x`/`y` encode from the 65-byte
+  SEC1 uncompressed point; `big.Int.Bytes()` could drop leading zeros
+  and break signature verification on rare coordinates.
+- **Graceful-shutdown error logged**; dir perms tightened to 0o750;
+  `math/rand` → `math/rand/v2`; dead `createOAuthUser`/`voiceEnabled`
+  removed.
+
+## IdP conformance follow-ups (15.15)
+
+### Added
+- **RFC 8414 discovery mount** — `/.well-known/openid-configuration`
+  moved to app root so clients can derive it from the issuer; JWKS
+  stays under `/api/v1` (explicit in the doc).
+- **RFC 7009 `POST /oauth/revoke {token}`** — revokes the grant owning
+  the presented refresh token; callers only reach their own grants
+  (another user's token → `invalid_grant`, unknown → 204, no existence
+  leaks); the bound session is denylisted. No `token` → revokes the
+  caller's own session grant.
+- **`POST /platform/oauth-clients/{cid}/rotate-secret`** — rotates the
+  client secret; the old one dies immediately, the new plaintext shows
+  once.
+
+### Fixed
+- **`redirect_uris` restricted to https** — enforced at platform
+  create/update AND connector mint; `http://localhost`/`127.0.0.1`
+  exempt for dev loops. Codes and tokens ride these URIs — plaintext
+  http to arbitrary hosts is a downgrade vector.
+- **Consent lookup error split** — real DB errors are no longer masked
+  as `consent_required`.
+
 ## Ecosystem identity provider (ADR-028) — OGA9 as IdP
 
 ### Added
