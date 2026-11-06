@@ -123,7 +123,7 @@ func (h *CommsHandler) RetractAnnouncement(w http.ResponseWriter, r *http.Reques
 func (h *CommsHandler) MyNotifications(w http.ResponseWriter, r *http.Request) {
 	page, per := httpx.PageParams(r)
 	list, total, err := h.svc.MyNotificationsPage(r.Context(), middleware.UserID(r.Context()),
-		r.URL.Query().Get("unread") == "true", int32(per), int32((page-1)*per))
+		r.URL.Query().Get("unread") == "true", httpx.I32(int64(per)), httpx.I32(int64((page-1)*per)))
 	if err != nil {
 		commsErr(w, err)
 		return
@@ -180,7 +180,15 @@ func (h *CommsHandler) SetPrefs(w http.ResponseWriter, r *http.Request) {
 // title, visibility, unit_id). Enqueues documents:process_upload.
 func (h *CommsHandler) UploadDocument(w http.ResponseWriter, r *http.Request) {
 	oc := middleware.OrgCtx(r.Context())
-	if err := r.ParseMultipartForm(32 << 20); err != nil {
+	// Bound the body BEFORE ParseMultipartForm spills it to tmpfs/disk —
+	// the tenant's storage cap plus form overhead (413 on oversize).
+	r.Body = http.MaxBytesReader(w, r.Body, h.svc.UploadMaxBytes(r.Context(), oc.TenantID))
+	if err := r.ParseMultipartForm(32 << 20); err != nil { // #nosec G120 -- MaxBytesReader bounds body at UploadMaxBytes
+		var mbErr *http.MaxBytesError
+		if errors.As(err, &mbErr) {
+			httpx.WriteErr(w, 413, "upload_too_large", "file exceeds the upload limit")
+			return
+		}
 		httpx.WriteErr(w, 400, "validation_failed", "multipart body expected")
 		return
 	}
@@ -189,7 +197,7 @@ func (h *CommsHandler) UploadDocument(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteErr(w, 400, "validation_failed", "file required")
 		return
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	uid, ok := httpx.OptUUID(w, r.FormValue("unit_id"))
 	if !ok {
 		return
@@ -238,7 +246,7 @@ func (h *CommsHandler) DownloadDocument(w http.ResponseWriter, r *http.Request) 
 		commsErr(w, err)
 		return
 	}
-	defer rc.Close()
+	defer func() { _ = rc.Close() }()
 	fname := strings.Map(func(r rune) rune {
 		if r == '"' || r == '\r' || r == '\n' {
 			return -1
@@ -294,7 +302,13 @@ func (h *CommsHandler) NewVersion(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteErr(w, 400, "invalid_id", "malformed identifier")
 		return
 	}
-	if err := r.ParseMultipartForm(32 << 20); err != nil {
+	r.Body = http.MaxBytesReader(w, r.Body, h.svc.UploadMaxBytes(r.Context(), oc.TenantID))
+	if err := r.ParseMultipartForm(32 << 20); err != nil { // #nosec G120 -- MaxBytesReader bounds body at UploadMaxBytes
+		var mbErr *http.MaxBytesError
+		if errors.As(err, &mbErr) {
+			httpx.WriteErr(w, 413, "upload_too_large", "file exceeds the upload limit")
+			return
+		}
 		httpx.WriteErr(w, 400, "validation_failed", "multipart body expected")
 		return
 	}
@@ -303,7 +317,7 @@ func (h *CommsHandler) NewVersion(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteErr(w, 400, "validation_failed", "file required")
 		return
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	ver, err := h.svc.NewVersion(r.Context(), oc, did, f)
 	if err != nil {
 		commsErr(w, err)

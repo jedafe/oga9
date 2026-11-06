@@ -214,7 +214,7 @@ func (h *BillingHandler) Invoices(w http.ResponseWriter, r *http.Request) {
 	}
 	page, per := httpx.PageParams(r)
 	rows, total, err := h.svc.ListInvoices(r.Context(), tid,
-		r.URL.Query().Get("state"), int32(per), int32((page-1)*per))
+		r.URL.Query().Get("state"), httpx.I32(int64(per)), httpx.I32(int64((page-1)*per)))
 	if err != nil {
 		httpx.WriteErr(w, 500, "internal_error", "invoice lookup failed")
 		return
@@ -226,6 +226,18 @@ func (h *BillingHandler) Invoices(w http.ResponseWriter, r *http.Request) {
 // Same org.admin.billing node gate as the rest of the /billing surface —
 // a delegated billing admin (node, no org_admin role) sees this too.
 func (h *BillingHandler) Entitlements(w http.ResponseWriter, r *http.Request) {
+	// Tenant-scoped api key: the key IS the tenant's credential (Rule 24) —
+	// it carries no user, so bind it to its own tenant instead of an
+	// org.admin.billing role lookup that can only resolve to empty.
+	if tid := middleware.TenantID(r.Context()); tid != uuid.Nil {
+		set, err := h.ent.Set(r.Context(), tid)
+		if err != nil {
+			httpx.WriteErr(w, 500, "internal_error", "entitlement resolution failed")
+			return
+		}
+		httpx.WriteData(w, 200, map[string]any{tid.String(): set})
+		return
+	}
 	userID := middleware.UserID(r.Context())
 	admins, err := h.orgSvc.TenantsWithNode(r.Context(), userID, "org.admin.billing")
 	if err != nil {
@@ -484,7 +496,7 @@ func (h *BillingHandler) Webhook(w http.ResponseWriter, r *http.Request) {
 	t, terr := tasks.NewProcessWebhookTask(id.String())
 	if terr == nil {
 		if _, err := h.queue.EnqueueContext(context.WithoutCancel(r.Context()), t); err != nil {
-			log.Printf("webhook enqueue failed (%s): %v", id, err)
+			log.Printf("webhook enqueue failed (%s): %v", id, err) // #nosec G706 -- uuid cannot contain newlines
 		}
 	}
 	httpx.WriteData(w, 202, map[string]uuid.UUID{"raw_event_id": id})

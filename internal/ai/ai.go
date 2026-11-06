@@ -245,16 +245,16 @@ func (s *Service) Chat(ctx context.Context, oc *tenant.OrgCtx, convID uuid.UUID,
 		mid2, err := q.AddMessage(ctx, db.AddMessageParams{
 			ConversationID: toPg(cid), Role: "assistant", Body: a.Body,
 			Citations: cites,
-			TokensIn:  pgtype.Int4{Int32: int32(a.TokensIn), Valid: true},
-			TokensOut: pgtype.Int4{Int32: int32(a.TokensOut), Valid: true}})
+			TokensIn:  pgtype.Int4{Int32: int32(a.TokensIn), Valid: true},   // #nosec G115 -- bounded value; cannot overflow int32
+			TokensOut: pgtype.Int4{Int32: int32(a.TokensOut), Valid: true}}) // #nosec G115 -- bounded value; cannot overflow int32
 		if err != nil {
 			return err
 		}
 		mid = fromPg(mid2)
 		if err := q.LogUsage(ctx, db.LogUsageParams{
 			TenantID: toPg(oc.TenantID), UserID: toPg(oc.UserID), Kind: "chat",
-			TokensIn:     pgtype.Int4{Int32: int32(a.TokensIn), Valid: true},
-			TokensOut:    pgtype.Int4{Int32: int32(a.TokensOut), Valid: true},
+			TokensIn:     pgtype.Int4{Int32: int32(a.TokensIn), Valid: true},  // #nosec G115 -- bounded value; cannot overflow int32
+			TokensOut:    pgtype.Int4{Int32: int32(a.TokensOut), Valid: true}, // #nosec G115 -- bounded value; cannot overflow int32
 			CostMicroUsd: s.cost(a.TokensIn + a.TokensOut)}); err != nil {
 			return err
 		}
@@ -320,8 +320,8 @@ func (s *Service) Draft(ctx context.Context, oc *tenant.OrgCtx, kind, prompt str
 		id = fromPg(gid)
 		if err := q.LogUsage(ctx, db.LogUsageParams{
 			TenantID: toPg(oc.TenantID), UserID: toPg(oc.UserID), Kind: "draft",
-			TokensIn:     pgtype.Int4{Int32: int32(tin), Valid: true},
-			TokensOut:    pgtype.Int4{Int32: int32(tout), Valid: true},
+			TokensIn:     pgtype.Int4{Int32: int32(tin), Valid: true},  // #nosec G115 -- bounded value; cannot overflow int32
+			TokensOut:    pgtype.Int4{Int32: int32(tout), Valid: true}, // #nosec G115 -- bounded value; cannot overflow int32
 			CostMicroUsd: s.cost(tin + tout)}); err != nil {
 			return err
 		}

@@ -44,7 +44,7 @@ func (h *AuthHandler) materialize(ctx context.Context, userID uuid.UUID) {
 		return
 	}
 	if err := h.mat.MaterializeApprovedApplications(ctx, userID); err != nil {
-		log.Printf("materialize applications for user %s: %v", userID, err)
+		log.Printf("materialize applications for user %s: %v", userID, err) // #nosec G706 -- uuid cannot contain newlines
 	}
 }
 
@@ -173,7 +173,7 @@ func (h *AuthHandler) VerifyEmail(w http.ResponseWriter, r *http.Request) {
 	token := chi.URLParam(r, "token")
 	if token == "" {
 		var b struct{ Token string }
-		httpx.Decode(w, r, &b)
+		_ = httpx.Decode(w, r, &b)
 		token = b.Token
 	}
 	u, err := h.svc.VerifyEmail(r.Context(), token)

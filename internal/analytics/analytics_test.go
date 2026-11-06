@@ -96,7 +96,7 @@ func TestHealthCompute(t *testing.T) {
 		t.Fatalf("health: %+v", h)
 	}
 	var crossed bool
-	svc.pool.QueryRow(ctx,
+	_ = svc.pool.QueryRow(ctx,
 		`SELECT EXISTS(SELECT 1 FROM domain_events WHERE event_type='KPIThresholdCrossed' AND organization_id=$1)`, oc.OrgID).Scan(&crossed)
 	if !crossed {
 		t.Fatal("expected KPIThresholdCrossed (attendance=0 < 10)")

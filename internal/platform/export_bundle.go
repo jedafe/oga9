@@ -198,7 +198,7 @@ func (s *Service) buildBundle(ctx context.Context, tenantID uuid.UUID, opts Expo
 	if err != nil {
 		return nil, nil, err
 	}
-	cleanup := func() { tmp.Close(); os.Remove(tmp.Name()) }
+	cleanup := func() { _ = tmp.Close(); _ = os.Remove(tmp.Name()) }
 	fail := func(err error) (*os.File, func(), error) {
 		cleanup()
 		return nil, nil, err
@@ -283,7 +283,7 @@ func (s *Service) buildBundle(ctx context.Context, tenantID uuid.UUID, opts Expo
 				continue
 			}
 			_ = w.AddBlob(key, size, rc)
-			rc.Close()
+			_ = rc.Close()
 		}
 	}
 	if err := w.Close(s.signKey()); err != nil {
@@ -301,7 +301,7 @@ func (s *Service) buildBundle(ctx context.Context, tenantID uuid.UUID, opts Expo
 	if err != nil {
 		return fail(err)
 	}
-	cleanupEnc := func() { enc.Close(); os.Remove(enc.Name()) }
+	cleanupEnc := func() { _ = enc.Close(); _ = os.Remove(enc.Name()) }
 	if err := tenantexport.Encrypt(enc, tmp, passphrase); err != nil {
 		cleanup()
 		cleanupEnc()

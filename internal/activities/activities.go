@@ -73,7 +73,7 @@ func int4ptr(p *int) pgtype.Int4 {
 	if p == nil {
 		return pgtype.Int4{}
 	}
-	return pgtype.Int4{Int32: int32(*p), Valid: true}
+	return pgtype.Int4{Int32: int32(*p), Valid: true} // #nosec G115 -- bounded value; cannot overflow int32
 }
 
 func (s *Service) withTx(ctx context.Context, fn func(*db.Queries) error) error {
@@ -81,7 +81,7 @@ func (s *Service) withTx(ctx context.Context, fn func(*db.Queries) error) error 
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 	if err := fn(s.q.WithTx(tx)); err != nil {
 		return err
 	}
@@ -159,12 +159,12 @@ func (s *Service) CreateActivity(ctx context.Context, oc *tenant.OrgCtx, in Acti
 			}
 		}
 		if qp != nil {
-			quorum = pgtype.Int4{Int32: int32(*qp), Valid: true}
+			quorum = pgtype.Int4{Int32: int32(*qp), Valid: true} // #nosec G115 -- bounded value; cannot overflow int32
 		}
 	}
 	var capacity pgtype.Int4
 	if in.Kind == "event" && in.Capacity != nil {
-		capacity = pgtype.Int4{Int32: int32(*in.Capacity), Valid: true}
+		capacity = pgtype.Int4{Int32: int32(*in.Capacity), Valid: true} // #nosec G115 -- bounded value; cannot overflow int32
 	}
 	warn := false
 	if in.Kind == "meeting" {
@@ -940,10 +940,10 @@ func (s *Service) GenerateRecurrences(ctx context.Context, horizonDays int) (int
 				}
 				var qp, cap pgtype.Int4
 				if tpl.QuorumPct != nil {
-					qp = pgtype.Int4{Int32: int32(*tpl.QuorumPct), Valid: true}
+					qp = pgtype.Int4{Int32: int32(*tpl.QuorumPct), Valid: true} // #nosec G115 -- bounded value; cannot overflow int32
 				}
 				if tpl.Capacity != nil {
-					cap = pgtype.Int4{Int32: int32(*tpl.Capacity), Valid: true}
+					cap = pgtype.Int4{Int32: int32(*tpl.Capacity), Valid: true} // #nosec G115 -- bounded value; cannot overflow int32
 				}
 				row, err := q.CreateRecurrenceInstance(ctx, db.CreateRecurrenceInstanceParams{
 					OrganizationID: rc.OrganizationID, Kind: rc.Kind, Title: tpl.Title,

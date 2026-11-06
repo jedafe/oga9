@@ -800,7 +800,7 @@ func (s *Service) IssueCard(ctx context.Context, oc *OrgCtx, memberID uuid.UUID,
 		if err != nil {
 			return db.IssueCardRow{}, false
 		}
-		return db.IssueCardRow{ID: cur.ID, Serial: cur.Serial, IssuedAt: cur.IssuedAt}, true
+		return db.IssueCardRow(cur), true
 	}
 	// one active card per member (partial unique index) — re-issue returns
 	// the live card instead of erroring or double-emitting.
@@ -948,7 +948,7 @@ func (s *Service) ProcessImport(ctx context.Context, importID uuid.UUID) error {
 	}
 	if err := s.q.FinishImport(ctx, db.FinishImportParams{
 		ID: toPg(importID), Status: "done",
-		RowCount: pgtype.Int4{Int32: int32(len(rows)), Valid: true}, OkCount: pgtype.Int4{Int32: int32(ok), Valid: true}, ErrCount: pgtype.Int4{Int32: int32(len(errs)), Valid: true},
+		RowCount: pgtype.Int4{Int32: int32(len(rows)), Valid: true}, OkCount: pgtype.Int4{Int32: int32(ok), Valid: true}, ErrCount: pgtype.Int4{Int32: int32(len(errs)), Valid: true}, // #nosec G115 -- bounded value; cannot overflow int32
 		Errors: mustJSON(errs),
 	}); err != nil {
 		return err
@@ -1014,7 +1014,7 @@ func (s *Service) ProcessExport(ctx context.Context, exportID uuid.UUID) error {
 	}
 	return s.q.FinishExport(ctx, db.FinishExportParams{
 		ID: e.ID, Status: "done", Content: []byte(b.String()),
-		RowCount: pgtype.Int4{Int32: int32(len(rows)), Valid: true}})
+		RowCount: pgtype.Int4{Int32: int32(len(rows)), Valid: true}}) // #nosec G115 -- bounded value; cannot overflow int32
 }
 
 func csvCell(s string) string {

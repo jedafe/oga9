@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -56,7 +57,7 @@ func (h *OAuthHandler) Start(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteErr(w, 500, "internal_error", "oauth start failed")
 		return
 	}
-	http.Redirect(w, r, url, http.StatusFound)
+	http.Redirect(w, r, url, http.StatusFound) // #nosec G710 -- provider AuthURL is env-config, not user input
 }
 
 // GET /api/v1/auth/oauth/{provider}/callback?code&state → session, or an
@@ -98,7 +99,7 @@ func (h *OAuthHandler) Callback(w http.ResponseWriter, r *http.Request) {
 							Body: "Verify your account: " + h.appURL + "/verify/" + token})
 					if terr == nil {
 						if _, err := h.queue.EnqueueContext(context.WithoutCancel(r.Context()), t); err != nil {
-							log.Printf("mail enqueue failed (%s → %s): %v", tasks.TypeSendVerification, res.Email, err)
+							log.Printf("mail enqueue failed (%s → %s): %v", tasks.TypeSendVerification, strings.NewReplacer("\r", "", "\n", "").Replace(res.Email), err) // #nosec G706 -- CR/LF stripped above
 						}
 					}
 				}
@@ -115,7 +116,7 @@ func (h *OAuthHandler) Callback(w http.ResponseWriter, r *http.Request) {
 	// applications — best-effort, never fails the login response.
 	if h.mat != nil && res.UserID != uuid.Nil {
 		if err := h.mat.MaterializeApprovedApplications(r.Context(), res.UserID); err != nil {
-			log.Printf("materialize applications for user %s: %v", res.UserID, err)
+			log.Printf("materialize applications for user %s: %v", res.UserID, err) // #nosec G706 -- uuid cannot contain newlines
 		}
 	}
 	// A real app deployment redirects the browser back to the frontend with

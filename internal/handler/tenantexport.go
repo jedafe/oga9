@@ -135,7 +135,7 @@ func (h *TenantExportHandler) Get(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteData(w, 202, map[string]any{"export_id": eid, "status": status})
 		return
 	}
-	defer blob.Close()
+	defer func() { _ = blob.Close() }()
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Disposition", `attachment; filename="tenant-export-`+eid.String()+`.oga9exp"`)
 	w.WriteHeader(200)

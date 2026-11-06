@@ -275,7 +275,7 @@ func (s *Service) withTx(ctx context.Context, fn func(*db.Queries) error) error 
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 	if err := fn(s.q.WithTx(tx)); err != nil {
 		return err
 	}

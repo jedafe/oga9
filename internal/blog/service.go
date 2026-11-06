@@ -37,9 +37,8 @@ func NewService(pool *pgxpool.Pool) *Service {
 	return &Service{pool: pool, q: db.New(pool)}
 }
 
-func toPg(u uuid.UUID) pgtype.UUID   { return pgtype.UUID{Bytes: u, Valid: u != uuid.Nil} }
-func pgText(s string) pgtype.Text    { return pgtype.Text{String: s, Valid: s != ""} }
-func fromPg(p pgtype.UUID) uuid.UUID { u, _ := uuid.FromBytes(p.Bytes[:]); return u }
+func toPg(u uuid.UUID) pgtype.UUID { return pgtype.UUID{Bytes: u, Valid: u != uuid.Nil} }
+func pgText(s string) pgtype.Text  { return pgtype.Text{String: s, Valid: s != ""} }
 
 // ---------- public reads ----------
 

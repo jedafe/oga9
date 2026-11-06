@@ -83,7 +83,7 @@ func TestCustodyTermFlag(t *testing.T) {
 		t.Fatalf("expected 1 flagged, got %d %v", n, err)
 	}
 	var flagged bool
-	pool.QueryRow(ctx,
+	_ = pool.QueryRow(ctx,
 		`SELECT EXISTS(SELECT 1 FROM domain_events WHERE event_type='CustodyHandoverFlagged' AND organization_id=$1)`, oc.OrgID).Scan(&flagged)
 	if !flagged {
 		t.Fatal("CustodyHandoverFlagged not emitted")

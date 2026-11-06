@@ -33,16 +33,15 @@ func projectErr(w http.ResponseWriter, err error) {
 		httpx.WriteErr(w, 409, "bad_project_state", "project is not in a state for that action")
 	case errors.Is(err, projects.ErrNoResolution):
 		httpx.WriteErr(w, 409, "resolution_required", "a passed resolution is required for this transition")
-	default:
-		log.Printf("projects: %v", err)
-		httpx.WriteErr(w, 500, "internal_error", "request failed")
-
 	case errors.Is(err, projects.ErrOverBudget):
 		httpx.WriteErr(w, 409, "over_project_budget", "spend exceeds the project budget")
 	case errors.Is(err, projects.ErrOverMandate):
 		httpx.WriteErr(w, 409, "over_mandate_limit", "spend exceeds the committee mandate")
 	case errors.Is(err, projects.ErrBadPayment):
 		httpx.WriteErr(w, 422, "payment_not_found", "payment must be a real confirmed payment")
+	default:
+		log.Printf("projects: %v", err)
+		httpx.WriteErr(w, 500, "internal_error", "request failed")
 	}
 }
 

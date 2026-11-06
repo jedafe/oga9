@@ -95,7 +95,7 @@ func TestMemberLifecycleFlow(t *testing.T) {
 		t.Fatalf("member_no looks wrong: %q", memberNo)
 	}
 	var sponsors int
-	pool.QueryRow(ctx, "SELECT count(*) FROM member_sponsors WHERE membership_id=$1", mid).Scan(&sponsors)
+	_ = pool.QueryRow(ctx, "SELECT count(*) FROM member_sponsors WHERE membership_id=$1", mid).Scan(&sponsors)
 	if sponsors != 1 {
 		t.Fatalf("expected sponsor link, got %d", sponsors)
 	}
@@ -115,7 +115,7 @@ func TestMemberLifecycleFlow(t *testing.T) {
 	}
 	// joined_at stamps on activation
 	var joined bool
-	pool.QueryRow(ctx, "SELECT joined_at IS NOT NULL FROM organization_memberships WHERE id=$1", mid).Scan(&joined)
+	_ = pool.QueryRow(ctx, "SELECT joined_at IS NOT NULL FROM organization_memberships WHERE id=$1", mid).Scan(&joined)
 	if !joined {
 		t.Fatal("joined_at not stamped on activation")
 	}
@@ -200,7 +200,7 @@ func TestMemberLifecycleFlow(t *testing.T) {
 		t.Fatal(err)
 	}
 	var rmid pgtype.UUID
-	pool.QueryRow(ctx, "SELECT id FROM organization_memberships WHERE organization_id=$1 AND user_id=$2", org.ID, resigner).Scan(&rmid)
+	_ = pool.QueryRow(ctx, "SELECT id FROM organization_memberships WHERE organization_id=$1 AND user_id=$2", org.ID, resigner).Scan(&rmid)
 	rctx := &OrgCtx{OrgID: org.ID, UserID: resigner, MembershipID: fromPg(rmid), TenantID: org.TenantID}
 	if _, err := pool.Exec(ctx, "UPDATE organization_memberships SET lifecycle_state='active' WHERE id=$1", rmid); err != nil {
 		t.Fatal(err)
@@ -209,7 +209,7 @@ func TestMemberLifecycleFlow(t *testing.T) {
 		t.Fatalf("self-resign: %v", err)
 	}
 	var rst string
-	pool.QueryRow(ctx, "SELECT lifecycle_state FROM organization_memberships WHERE id=$1", rmid).Scan(&rst)
+	_ = pool.QueryRow(ctx, "SELECT lifecycle_state FROM organization_memberships WHERE id=$1", rmid).Scan(&rst)
 	if rst != "resigned" {
 		t.Fatalf("expected resigned, got %s", rst)
 	}
@@ -219,7 +219,7 @@ func TestMemberLifecycleFlow(t *testing.T) {
 		t.Fatalf("deceased: %v", err)
 	}
 	var revoked bool
-	pool.QueryRow(ctx, "SELECT revoked_at IS NOT NULL FROM membership_cards WHERE id=$1", card.ID).Scan(&revoked)
+	_ = pool.QueryRow(ctx, "SELECT revoked_at IS NOT NULL FROM membership_cards WHERE id=$1", card.ID).Scan(&revoked)
 	if !revoked {
 		t.Fatal("deceased member's card not revoked")
 	}
@@ -256,18 +256,18 @@ func TestMemberImport(t *testing.T) {
 	}
 	var okN, errN int
 	var status string
-	pool.QueryRow(ctx, "SELECT status, ok_count, err_count FROM member_imports WHERE id=$1", impID).Scan(&status, &okN, &errN)
+	_ = pool.QueryRow(ctx, "SELECT status, ok_count, err_count FROM member_imports WHERE id=$1", impID).Scan(&status, &okN, &errN)
 	if status != "done" || okN != 2 || errN != 1 {
 		t.Fatalf("import result %s ok=%d err=%d", status, okN, errN)
 	}
 	var apps int
-	pool.QueryRow(ctx, "SELECT count(*) FROM membership_applications WHERE organization_id=$1", org.ID).Scan(&apps)
+	_ = pool.QueryRow(ctx, "SELECT count(*) FROM membership_applications WHERE organization_id=$1", org.ID).Scan(&apps)
 	if apps != 2 {
 		t.Fatalf("expected 2 applications, got %d", apps)
 	}
 	// imports create applications, never memberships
 	var mems int
-	pool.QueryRow(ctx, "SELECT count(*) FROM organization_memberships WHERE organization_id=$1 AND user_id IS NOT NULL", org.ID).Scan(&mems)
+	_ = pool.QueryRow(ctx, "SELECT count(*) FROM organization_memberships WHERE organization_id=$1 AND user_id IS NOT NULL", org.ID).Scan(&mems)
 	if mems != 1 { // only the owner
 		t.Fatalf("imports must not create members directly, got %d", mems)
 	}
@@ -275,7 +275,7 @@ func TestMemberImport(t *testing.T) {
 	if err := svc.ProcessImport(ctx, impID); err != nil {
 		t.Fatal(err)
 	}
-	pool.QueryRow(ctx, "SELECT count(*) FROM membership_applications WHERE organization_id=$1", org.ID).Scan(&apps)
+	_ = pool.QueryRow(ctx, "SELECT count(*) FROM membership_applications WHERE organization_id=$1", org.ID).Scan(&apps)
 	if apps != 2 {
 		t.Fatalf("replayed import minted duplicates, got %d", apps)
 	}
@@ -286,7 +286,7 @@ func TestSponsorWorkflow(t *testing.T) {
 	svc, pool := testSvc(t)
 	ctx := context.Background()
 	owner := mkUser(t, pool, "sw"+uuid.NewString()[:8]+"@test.oga9")
-	sp2user := mkUser(t, pool, "s2"+uuid.NewString()[:8]+"@test.oga9")
+	_ = mkUser(t, pool, "s2"+uuid.NewString()[:8]+"@test.oga9")
 	cand := mkUser(t, pool, "cd"+uuid.NewString()[:8]+"@test.oga9")
 	wd := mkUser(t, pool, "wd"+uuid.NewString()[:8]+"@test.oga9")
 
@@ -300,7 +300,7 @@ func TestSponsorWorkflow(t *testing.T) {
 	}
 	// bring sp2user in as a second active member (sponsor #2)
 	sp2Email := "s2" + uuid.NewString()[:8] + "@test.oga9"
-	sp2user = mkUser(t, pool, sp2Email)
+	sp2user := mkUser(t, pool, sp2Email)
 	inv, err := svc.CreateInvitation(ctx, oc, sp2Email, "", "", "floor")
 	if err != nil {
 		t.Fatal(err)
@@ -344,7 +344,7 @@ func TestSponsorWorkflow(t *testing.T) {
 		t.Fatalf("2-sponsor approve: %v", err)
 	}
 	var n int64
-	pool.QueryRow(ctx,
+	_ = pool.QueryRow(ctx,
 		"SELECT count(*) FROM member_sponsors ms JOIN organization_memberships m ON m.id=ms.membership_id WHERE m.user_id=$1 AND m.organization_id=$2",
 		cand, org.ID).Scan(&n)
 	if n != 2 {
@@ -369,7 +369,7 @@ func TestSponsorWorkflow(t *testing.T) {
 		t.Fatalf("decide-time sponsors should satisfy the count, got %v", err)
 	}
 	var pn int64
-	pool.QueryRow(ctx,
+	_ = pool.QueryRow(ctx,
 		"SELECT count(*) FROM member_sponsors ms JOIN membership_applications a ON a.id=$1 WHERE ms.application_id=$1",
 		publicApp).Scan(&pn)
 	if pn != 0 {
@@ -390,7 +390,7 @@ func TestSponsorWorkflow(t *testing.T) {
 		t.Fatalf("own withdraw: %v", err)
 	}
 	var st string
-	pool.QueryRow(ctx, "SELECT status FROM membership_applications WHERE id=$1", wa).Scan(&st)
+	_ = pool.QueryRow(ctx, "SELECT status FROM membership_applications WHERE id=$1", wa).Scan(&st)
 	if st != "withdrawn" {
 		t.Fatalf("expected withdrawn, got %s", st)
 	}
@@ -437,7 +437,7 @@ func TestIntakeDeadEnds(t *testing.T) {
 	}
 	var memberNo string
 	var state string
-	pool.QueryRow(ctx, "SELECT member_no, lifecycle_state FROM organization_memberships WHERE id=$1", moc.MembershipID).
+	_ = pool.QueryRow(ctx, "SELECT member_no, lifecycle_state FROM organization_memberships WHERE id=$1", moc.MembershipID).
 		Scan(&memberNo, &state)
 	if state != "approved" || memberNo == "" {
 		t.Fatalf("invited approve should mint member_no, got %q %q", memberNo, state)
@@ -448,7 +448,7 @@ func TestIntakeDeadEnds(t *testing.T) {
 	if err := svc.TransitionMember(ctx, oc, moc.MembershipID, "activate"); err != nil {
 		t.Fatalf("activate: %v", err)
 	}
-	pool.QueryRow(ctx, "SELECT lifecycle_state FROM organization_memberships WHERE id=$1", moc.MembershipID).Scan(&state)
+	_ = pool.QueryRow(ctx, "SELECT lifecycle_state FROM organization_memberships WHERE id=$1", moc.MembershipID).Scan(&state)
 	if state != "active" {
 		t.Fatalf("invited member never reached active, got %q", state)
 	}
@@ -467,14 +467,14 @@ func TestIntakeDeadEnds(t *testing.T) {
 		t.Fatalf("pre-signup approve: %v", err)
 	}
 	var n int64
-	pool.QueryRow(ctx, "SELECT count(*) FROM organization_memberships WHERE organization_id=$1 AND user_id=$2", org.ID, pubUser).Scan(&n)
+	_ = pool.QueryRow(ctx, "SELECT count(*) FROM organization_memberships WHERE organization_id=$1 AND user_id=$2", org.ID, pubUser).Scan(&n)
 	if n != 0 {
 		t.Fatal("pre-signup approve should not materialize a membership yet")
 	}
 	if err := svc.MaterializeApprovedApplications(ctx, pubUser); err != nil {
 		t.Fatalf("materialize: %v", err)
 	}
-	pool.QueryRow(ctx, "SELECT lifecycle_state FROM organization_memberships WHERE organization_id=$1 AND user_id=$2", org.ID, pubUser).Scan(&state)
+	_ = pool.QueryRow(ctx, "SELECT lifecycle_state FROM organization_memberships WHERE organization_id=$1 AND user_id=$2", org.ID, pubUser).Scan(&state)
 	if state != "approved" {
 		t.Fatalf("materialized membership should be 'approved', got %q", state)
 	}
@@ -482,7 +482,7 @@ func TestIntakeDeadEnds(t *testing.T) {
 	if err := svc.MaterializeApprovedApplications(ctx, pubUser); err != nil {
 		t.Fatal(err)
 	}
-	pool.QueryRow(ctx, "SELECT count(*) FROM organization_memberships WHERE organization_id=$1 AND user_id=$2", org.ID, pubUser).Scan(&n)
+	_ = pool.QueryRow(ctx, "SELECT count(*) FROM organization_memberships WHERE organization_id=$1 AND user_id=$2", org.ID, pubUser).Scan(&n)
 	if n != 1 {
 		t.Fatalf("materialize replay minted %d memberships", n)
 	}

@@ -47,7 +47,7 @@ func blogErr(w http.ResponseWriter, err error) {
 func (h *BlogHandler) Posts(w http.ResponseWriter, r *http.Request) {
 	page, per := httpx.PageParams(r)
 	rows, total, err := h.svc.ListPublished(r.Context(),
-		r.URL.Query().Get("tag"), int32(per), int32((page-1)*per))
+		r.URL.Query().Get("tag"), httpx.I32(int64(per)), httpx.I32(int64((page-1)*per)))
 	if err != nil {
 		blogErr(w, err)
 		return
@@ -88,12 +88,12 @@ func (h *BlogHandler) RSS(w http.ResponseWriter, r *http.Request) {
 		items = append(items, it)
 	}
 	w.Header().Set("Content-Type", "application/rss+xml; charset=utf-8")
-	fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?><rss version="2.0"><channel><title>OGA9 Blog</title><link>%s/blog</link><description>OGA9 platform blog</description>`, h.baseURL)
+	_, _ = fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?><rss version="2.0"><channel><title>OGA9 Blog</title><link>%s/blog</link><description>OGA9 platform blog</description>`, h.baseURL)
 	enc := xml.NewEncoder(w)
 	for _, it := range items {
 		_ = enc.Encode(it)
 	}
-	fmt.Fprint(w, `</channel></rss>`)
+	_, _ = fmt.Fprint(w, `</channel></rss>`)
 }
 
 // ---------- admin (platform.blog.manage) ----------
@@ -101,7 +101,7 @@ func (h *BlogHandler) RSS(w http.ResponseWriter, r *http.Request) {
 func (h *BlogHandler) AdminList(w http.ResponseWriter, r *http.Request) {
 	page, per := httpx.PageParams(r)
 	rows, total, err := h.svc.ListAll(r.Context(),
-		r.URL.Query().Get("state"), int32(per), int32((page-1)*per))
+		r.URL.Query().Get("state"), httpx.I32(int64(per)), httpx.I32(int64((page-1)*per)))
 	if err != nil {
 		blogErr(w, err)
 		return

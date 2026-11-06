@@ -43,7 +43,7 @@ func (s *Service) CreateVolunteerRole(ctx context.Context, oc *tenant.OrgCtx, ac
 	}
 	row, err := s.q.CreateVolunteerRole(ctx, db.CreateVolunteerRoleParams{
 		OrganizationID: toPg(oc.OrgID), ActivityID: toPg(activityID),
-		UnitID: toPg(in.UnitID), Name: in.Name, Slots: int32(in.Slots),
+		UnitID: toPg(in.UnitID), Name: in.Name, Slots: int32(in.Slots), // #nosec G115 -- bounded value; cannot overflow int32
 		Note: pgText(in.Note), CreatedBy: toPg(oc.MembershipID)})
 	return fromPg(row.ID), err
 }
@@ -329,5 +329,5 @@ func intOr(n int) pgtype.Int4 {
 	if n <= 0 {
 		return pgtype.Int4{}
 	}
-	return pgtype.Int4{Int32: int32(n), Valid: true}
+	return pgtype.Int4{Int32: int32(n), Valid: true} // #nosec G115 -- bounded value; cannot overflow int32
 }

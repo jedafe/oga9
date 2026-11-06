@@ -83,7 +83,7 @@ func (s *Service) EraseUser(ctx context.Context, userID uuid.UUID) error {
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 	uid := pgtype.UUID{Bytes: userID, Valid: true}
 	// audit FIRST — a failed audit write aborts the erasure (Rule 10 spirit).
 	if err := audit.Log(ctx, tx, audit.Entry{

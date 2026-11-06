@@ -109,7 +109,7 @@ func TestActivitiesFlow(t *testing.T) {
 		t.Fatalf("minutes v2: %v %d", err, v2)
 	}
 	var minutesID uuid.UUID
-	pool.QueryRow(ctx, "SELECT id FROM minutes WHERE activity_id=$1 AND version=2", mid).Scan(&minutesID)
+	_ = pool.QueryRow(ctx, "SELECT id FROM minutes WHERE activity_id=$1 AND version=2", mid).Scan(&minutesID)
 	if err := svc.ApproveMinutes(ctx, oc, mid, minutesID); err != nil {
 		t.Fatalf("approve: %v", err)
 	}
@@ -126,7 +126,7 @@ func TestActivitiesFlow(t *testing.T) {
 		t.Fatalf("overdue sweep: %v %d", err, n)
 	}
 	var st string
-	pool.QueryRow(ctx, "SELECT state FROM action_items WHERE id=$1", itemID).Scan(&st)
+	_ = pool.QueryRow(ctx, "SELECT state FROM action_items WHERE id=$1", itemID).Scan(&st)
 	if st != "overdue" {
 		t.Fatalf("expected overdue, got %s", st)
 	}
@@ -143,7 +143,7 @@ func TestActivitiesFlow(t *testing.T) {
 		t.Fatal(err)
 	}
 	var fines int
-	pool.QueryRow(ctx,
+	_ = pool.QueryRow(ctx,
 		`SELECT count(*) FROM obligations WHERE organization_id=$1 AND membership_id=$2
 		   AND amount_minor=500`, orgID, m1).Scan(&fines)
 	if fines != 1 {
@@ -166,7 +166,7 @@ func TestActivitiesFlow(t *testing.T) {
 		t.Fatal(err)
 	}
 	var rst string
-	pool.QueryRow(ctx, "SELECT status FROM event_registrations WHERE activity_id=$1 AND membership_id=$2", eid, m1).Scan(&rst)
+	_ = pool.QueryRow(ctx, "SELECT status FROM event_registrations WHERE activity_id=$1 AND membership_id=$2", eid, m1).Scan(&rst)
 	if rst != "checked_in" {
 		t.Fatalf("expected checked_in, got %s", rst)
 	}
@@ -174,7 +174,7 @@ func TestActivitiesFlow(t *testing.T) {
 	// Rule 24: another org's IDs must not be readable/writable from oc
 	oc2user := "act-o2-" + uuid.NewString()[:6] + "@t.co"
 	var u2 uuid.UUID
-	pool.QueryRow(ctx,
+	_ = pool.QueryRow(ctx,
 		`INSERT INTO users (email, display_name, password_hash, status) VALUES ($1,'u','x','active')
 		 ON CONFLICT (email) DO UPDATE SET email=$1 RETURNING id`, oc2user).Scan(&u2)
 	o2, err := orgSvc.CreateOrg(ctx, u2, "Other Org", "o2"+uuid.NewString()[:6], "union", "union", "NG", "Jos", "o@t.co", uuid.Nil, nil)
@@ -182,8 +182,12 @@ func TestActivitiesFlow(t *testing.T) {
 		t.Fatal(err)
 	}
 	oc2, _ := orgSvc.ResolveOrgCtx(ctx, u2, o2.ID)
-	if _, err := svc.Minutes(ctx, oc2, mid); err == nil {
-		// org B asking for org A's minutes must see zero rows, not the list
+	got, err := svc.Minutes(ctx, oc2, mid)
+	if err != nil {
+		t.Fatalf("org B minutes: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("org B sees %d of org A's minutes — cross-org leak", len(got))
 	}
 	list2, _ := svc.Minutes(ctx, oc2, mid)
 	if len(list2) != 0 {
@@ -209,7 +213,7 @@ func TestActivitiesFlow(t *testing.T) {
 	// generated instances link back via recurrence_id — the (recurrence_id,
 	// starts_at) unique dedupes a replayed sweep atomically.
 	var inst int
-	pool.QueryRow(ctx, `SELECT count(*) FROM activities WHERE organization_id=$1 AND recurrence_id IS NOT NULL`, orgID).Scan(&inst)
+	_ = pool.QueryRow(ctx, `SELECT count(*) FROM activities WHERE organization_id=$1 AND recurrence_id IS NOT NULL`, orgID).Scan(&inst)
 	if inst < 3 {
 		t.Fatalf("expected ≥3 generated instances, got %d", inst)
 	}

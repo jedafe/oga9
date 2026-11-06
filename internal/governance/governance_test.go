@@ -78,8 +78,8 @@ func TestMotionResolution(t *testing.T) {
 		t.Fatal(err)
 	}
 	var outcome, mstate string
-	pool.QueryRow(ctx, "SELECT outcome FROM resolutions WHERE id=$1", rid).Scan(&outcome)
-	pool.QueryRow(ctx, "SELECT state FROM motions WHERE id=$1", mid).Scan(&mstate)
+	_ = pool.QueryRow(ctx, "SELECT outcome FROM resolutions WHERE id=$1", rid).Scan(&outcome)
+	_ = pool.QueryRow(ctx, "SELECT state FROM motions WHERE id=$1", mid).Scan(&mstate)
 	if outcome != "passed" || mstate != "voted" {
 		t.Fatalf("outcome=%s state=%s", outcome, mstate)
 	}
@@ -141,10 +141,10 @@ func TestMandateCommitteeOnly(t *testing.T) {
 	oc := mk(t, pool)
 
 	var branchID, commID uuid.UUID
-	pool.QueryRow(ctx,
+	_ = pool.QueryRow(ctx,
 		`INSERT INTO org_units (organization_id, type, name, slug) VALUES ($1,'branch','b','b1') RETURNING id`,
 		oc.OrgID).Scan(&branchID)
-	pool.QueryRow(ctx,
+	_ = pool.QueryRow(ctx,
 		`INSERT INTO org_units (organization_id, type, name, slug) VALUES ($1,'committee','c','c1') RETURNING id`,
 		oc.OrgID).Scan(&commID)
 

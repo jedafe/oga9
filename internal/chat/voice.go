@@ -205,7 +205,7 @@ func (s *Service) LiveRooms(ctx context.Context, oc *tenant.OrgCtx) ([]db.VoiceR
 // (server crash, never ended) still accept joiners; close them and stamp
 // every open participant row, emitting VoiceRoomEnded per room.
 func (s *Service) RoomSweep(ctx context.Context, maxAgeHours int) error {
-	rooms, err := s.q.StaleLiveVoiceRooms(ctx, int32(maxAgeHours))
+	rooms, err := s.q.StaleLiveVoiceRooms(ctx, int32(maxAgeHours)) // #nosec G115 -- bounded value; cannot overflow int32
 	if err != nil {
 		return err
 	}

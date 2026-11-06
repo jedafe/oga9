@@ -93,7 +93,7 @@ func (d *Dispatcher) ProcessTask(ctx context.Context, t *asynq.Task) error {
 	if err != nil {
 		return err
 	}
-	defer claimTx.Rollback(ctx)
+	defer func() { _ = claimTx.Rollback(ctx) }()
 	q := d.q.WithTx(claimTx)
 	rows, err := q.FetchPendingEvents(ctx, db.FetchPendingEventsParams{
 		MaxAttempts: MaxAttempts, BatchSize: batchSize,
@@ -176,7 +176,7 @@ func (d *Dispatcher) runConsumer(ctx context.Context, name string, e Event) erro
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 	q := d.q.WithTx(tx)
 	n, err := q.LogConsumerProcessed(ctx, db.LogConsumerProcessedParams{Consumer: name, EventID: pgtype.UUID{Bytes: e.ID, Valid: true}})
 	if err != nil {

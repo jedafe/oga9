@@ -286,7 +286,7 @@ func (s *Service) ComputeHealthScores(ctx context.Context) (int, error) {
 		}
 		raw, _ := json.Marshal(components)
 		if err := s.q.UpsertHealthScore(ctx, db.UpsertHealthScoreParams{
-			OrgID: toPg(orgID), Period: period, Score: int32(score),
+			OrgID: toPg(orgID), Period: period, Score: int32(score), // #nosec G115 -- bounded value; cannot overflow int32
 			Components: raw, FormulaVersion: healthFormulaVersion}); err != nil {
 			return n, err
 		}

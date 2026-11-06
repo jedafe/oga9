@@ -134,7 +134,7 @@ func (s *Service) CreateCase(ctx context.Context, oc *tenant.OrgCtx, kind, title
 	var repeatNote string
 	if days := s.settingInt(ctx, oc.OrgID, "org.welfare.once_per."+kind+"_days", 0); days > 0 {
 		if _, err := s.q.PriorCaseInWindow(ctx, db.PriorCaseInWindowParams{
-			MembershipID: toPg(oc.MembershipID), Kind: kind, Days: int32(days)}); err == nil {
+			MembershipID: toPg(oc.MembershipID), Kind: kind, Days: int32(days)}); err == nil { // #nosec G115 -- bounded value; cannot overflow int32
 			repeatNote = fmt.Sprintf("repeat request inside %dd window", days)
 		}
 	}

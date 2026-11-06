@@ -726,7 +726,7 @@ func schedulerTick(redisAddr string, pool *pgxpool.Pool) asynq.HandlerFunc {
 	q := db.New(pool)
 	return func(ctx context.Context, t *asynq.Task) error {
 		ins := asynq.NewInspector(asynq.RedisClientOpt{Addr: redisAddr})
-		defer ins.Close()
+		defer func() { _ = ins.Close() }()
 		queues, err := ins.Queues()
 		if err != nil {
 			return err

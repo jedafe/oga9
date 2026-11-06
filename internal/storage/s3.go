@@ -108,7 +108,7 @@ func (s *S3Store) do(ctx context.Context, method, key string, body io.Reader) (*
 	}
 	if resp.StatusCode >= 300 {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		return nil, fmt.Errorf("s3 %s %s: %d %s", method, key, resp.StatusCode, strings.TrimSpace(string(b)))
 	}
 	return resp, nil
@@ -123,7 +123,7 @@ func (s *S3Store) Put(ctx context.Context, key string, r io.Reader) error {
 	if err != nil {
 		return err
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	return nil
 }
 
@@ -140,7 +140,7 @@ func (s *S3Store) Stat(ctx context.Context, key string) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	return resp.ContentLength, nil
 }
 
@@ -149,7 +149,7 @@ func (s *S3Store) Remove(ctx context.Context, key string) error {
 	if err != nil {
 		return err
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	return nil
 }
 

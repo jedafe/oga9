@@ -291,13 +291,13 @@ func envInt(errs *[]error, key string, fallback int) int {
 // OAuthProviders builds the configured provider map — a provider activates
 // only when its client id+secret env vars are set (§02).
 func (c *Config) OAuthProviders() map[string]OAuthProviderEnv {
-	defs := map[string]map[string]string{
-		"google": {
+	defs := map[string]map[string]string{ // #nosec G101 -- provider endpoint URLs, not credentials
+		"google": { // #nosec G101 -- provider endpoint URLs, not credentials
 			"auth":     "https://accounts.google.com/o/oauth2/v2/auth",
 			"token":    "https://oauth2.googleapis.com/token",
 			"userinfo": "https://openidconnect.googleapis.com/v1/userinfo",
 		},
-		"japaconnect": {}, // URLs required via env (ADR-021 endpoint TBD)
+		"japaconnect": {}, // URLs required via env (ADR-021 endpoint TBD) // #nosec G101 -- env names, not secrets
 	}
 	out := map[string]OAuthProviderEnv{}
 	for name, urls := range defs {

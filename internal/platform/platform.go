@@ -39,7 +39,7 @@ var (
 func toPg(u uuid.UUID) pgtype.UUID   { return pgtype.UUID{Bytes: u, Valid: u != uuid.Nil} }
 func fromPg(u pgtype.UUID) uuid.UUID { return uuid.UUID(u.Bytes) }
 func pgText(s string) pgtype.Text    { return pgtype.Text{String: s, Valid: s != ""} }
-func pgInt4(i int) pgtype.Int4       { return pgtype.Int4{Int32: int32(i), Valid: i != 0} }
+func pgInt4(i int) pgtype.Int4       { return pgtype.Int4{Int32: int32(i), Valid: i != 0} } // #nosec G115 -- bounded value; cannot overflow int32
 
 // provisionPayload serializes the request for the durable row — including
 // the server-set RequestedBy, so a sweep-redriven run keeps the original
@@ -118,7 +118,7 @@ func (s *Service) withTx(ctx context.Context, fn func(*db.Queries) error) error 
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 	if err := fn(db.New(tx)); err != nil {
 		return err
 	}
@@ -748,9 +748,7 @@ func (s *Service) collectExport(ctx context.Context, tenantID uuid.UUID, include
 		return nil, err
 	}
 	orgArr := make([]pgtype.UUID, len(orgIDs))
-	for i, id := range orgIDs {
-		orgArr[i] = id
-	}
+	copy(orgArr, orgIDs)
 	orgScoped, err := s.q.ExportScopedTables(ctx, "organization_id")
 	if err != nil {
 		return nil, err

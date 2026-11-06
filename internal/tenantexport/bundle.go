@@ -331,12 +331,12 @@ func (a *Archive) walk(fn func(string, io.Reader, int64) error) error {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	gz, err := gzip.NewReader(f)
 	if err != nil {
 		return fmt.Errorf("bundle: not a gzip archive: %w", err)
 	}
-	defer gz.Close()
+	defer func() { _ = gz.Close() }()
 	tr := tar.NewReader(gz)
 	for {
 		h, err := tr.Next()
@@ -415,7 +415,7 @@ func Encrypt(w io.Writer, r io.Reader, passphrase string) error {
 		n, rerr := io.ReadFull(r, buf)
 		if n > 0 {
 			ct := aead.Seal(nil, chunkNonce(nonce, counter), buf[:n], nil)
-			binary.BigEndian.PutUint32(lenBuf[:], uint32(len(ct)))
+			binary.BigEndian.PutUint32(lenBuf[:], uint32(len(ct))) // #nosec G115 -- bounded value; cannot overflow int32
 			if _, err := w.Write(lenBuf[:]); err != nil {
 				return err
 			}
@@ -459,8 +459,8 @@ func decryptToTemp(r io.Reader, passphrase string) (string, error) {
 		return "", err
 	}
 	fail := func(err error) (string, error) {
-		f.Close()
-		os.Remove(f.Name())
+		_ = f.Close()
+		_ = os.Remove(f.Name())
 		return "", err
 	}
 	var counter uint32
@@ -494,7 +494,7 @@ func decryptToTemp(r io.Reader, passphrase string) (string, error) {
 	// the spool convention keeps one temp per archive — hand the open
 	// file's path over and let Close() remove it.
 	path := f.Name()
-	f.Close()
+	_ = f.Close()
 	return path, nil
 }
 

@@ -298,7 +298,7 @@ func (h *PlatformHandler) ExportTenant(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=oga9-tenant-%s.json", tid))
 	w.WriteHeader(200)
-	_, _ = w.Write(data)
+	_, _ = w.Write(data) // #nosec G705 -- application/json export body, not HTML
 }
 
 // StartTenantExport — POST /platform/tenants/{tid}/export: audits,
@@ -352,7 +352,7 @@ func (h *PlatformHandler) DownloadTenantExport(w http.ResponseWriter, r *http.Re
 		httpx.WriteData(w, 202, map[string]any{"export_id": eid, "status": status})
 		return
 	}
-	defer blob.Close()
+	defer func() { _ = blob.Close() }()
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=oga9-tenant-%s.oga9exp", tid))
 	_, _ = io.Copy(w, blob)

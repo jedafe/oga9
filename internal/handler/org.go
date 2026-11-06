@@ -365,7 +365,7 @@ func (h *OrgHandler) WhatsAppVerify(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "text/plain")
 	w.WriteHeader(200)
-	_, _ = w.Write([]byte(r.URL.Query().Get("hub.challenge")))
+	_, _ = w.Write([]byte(r.URL.Query().Get("hub.challenge"))) // #nosec G705 -- Meta challenge echo, text/plain + verified token
 }
 
 // WhatsAppWebhook — POST /webhooks/whatsapp: Meta pushes inbound messages.

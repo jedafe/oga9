@@ -546,7 +546,7 @@ func (h *FinanceHandler) Ledger(w http.ResponseWriter, r *http.Request) {
 	}
 	page, per := httpx.PageParams(r)
 	list, total, err := h.svc.LedgerPage(r.Context(), oc, r.URL.Query().Get("account"),
-		int32(per), int32((page-1)*per))
+		httpx.I32(int64(per)), httpx.I32(int64((page-1)*per)))
 	if err != nil {
 		finErr(w, err)
 		return

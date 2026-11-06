@@ -95,8 +95,10 @@ func pgText(s string) pgtype.Text { return pgtype.Text{String: s, Valid: s != ""
 var dummyHash, _ = HashPassword("oga9-timing-equalizer")
 
 // ValidatePassword — §02 policy: min 8 chars, at least one letter + one digit.
+// 72-byte ceiling is bcrypt's own input limit — over it, HashPassword
+// errors and a signup would 500 on a legitimate (if long) password.
 func ValidatePassword(pw string) error {
-	if len(pw) < 8 {
+	if len(pw) < 8 || len(pw) > 72 {
 		return ErrWeakPassword
 	}
 	var letter, digit bool
@@ -119,7 +121,7 @@ func (s *Service) withTx(ctx context.Context, fn func(*db.Queries) error) error 
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 	if err := fn(s.q.WithTx(tx)); err != nil {
 		return err
 	}
@@ -782,14 +784,6 @@ func (s *Service) LinkOAuthProvider(ctx context.Context, userID uuid.UUID, provi
 
 func (s *Service) userByOAuthSubject(ctx context.Context, provider, subject string) (uuid.UUID, error) {
 	id, err := s.q.GetUserByOAuthSubject(ctx, db.GetUserByOAuthSubjectParams{Provider: provider, ProviderSubject: subject})
-	if err != nil {
-		return uuid.Nil, err
-	}
-	return fromPg(id), nil
-}
-
-func (s *Service) createOAuthUser(ctx context.Context, email, displayName string, verified bool) (uuid.UUID, error) {
-	id, err := s.q.CreateOAuthUser(ctx, db.CreateOAuthUserParams{Email: email, DisplayName: displayName, IsVerified: verified})
 	if err != nil {
 		return uuid.Nil, err
 	}

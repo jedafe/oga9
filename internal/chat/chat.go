@@ -76,7 +76,7 @@ func (s *Service) withTx(ctx context.Context, fn func(*db.Queries) error) error 
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 	if err := fn(s.q.WithTx(tx)); err != nil {
 		return err
 	}
@@ -280,7 +280,7 @@ func (s *Service) PostMessage(ctx context.Context, oc *tenant.OrgCtx, cid uuid.U
 		row, err = q.PostMessage(ctx, db.PostMessageParams{
 			ChannelID: toPg(cid), MembershipID: toPg(oc.MembershipID), Kind: kind,
 			Body:    pgtype.Text{String: body, Valid: body != ""},
-			MediaID: toPg(mediaID), VoiceDurationMs: pgtype.Int4{Int32: int32(voiceMs), Valid: voiceMs > 0},
+			MediaID: toPg(mediaID), VoiceDurationMs: pgtype.Int4{Int32: int32(voiceMs), Valid: voiceMs > 0}, // #nosec G115 -- bounded value; cannot overflow int32
 			ReplyToID: toPg(replyTo)})
 		if err != nil {
 			return err
@@ -487,6 +487,5 @@ func (s *Service) RetentionSweep(ctx context.Context) error {
 
 // voice is the LiveKit provider config (SetVoiceProvider); pgText lives
 // here because voice.go uses it for the optional title.
-func (s *Service) voiceEnabled() bool { return s.voice != nil && s.voice.apiKey != "" }
 
 func pgText(v string) pgtype.Text { return pgtype.Text{String: v, Valid: v != ""} }

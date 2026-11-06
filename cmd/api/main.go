@@ -175,7 +175,12 @@ func main() {
 					log.Printf("asynq scheduler: %v", err)
 				}
 				close(stop)
-				return
+				// A scheduler error must not retire this instance's
+				// candidacy — loop and re-contend for the lease; a
+				// graceful shutdown exits through ctx.Done() below.
+				if ctx.Err() != nil {
+					return
+				}
 			}
 			select {
 			case <-ctx.Done():
@@ -213,7 +218,7 @@ func main() {
 	// can't restart-loop the pod (readiness stays on /health).
 	r.Get("/livez", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"status":"alive"}`))
+		_, _ = w.Write([]byte(`{"status":"alive"}`))
 	})
 	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
 		if err := pool.Ping(r.Context()); err != nil {
@@ -225,12 +230,12 @@ func main() {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"status":"ok"}`))
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
 	})
 	// §02 identity: auth service + handlers
 	mail := mailer.New(cfg.SMTPHost, cfg.SMTPPort, cfg.MailFrom, cfg.SMTPUser, cfg.SMTPPass)
 	queue := asynq.NewClient(asynq.RedisClientOpt{Addr: cfg.ValkeyAddr})
-	defer queue.Close()
+	defer func() { _ = queue.Close() }()
 	entSvc := entitlements.NewService(pool, vk)
 	billSvc := billing.NewService(pool, cfg.LicenseSignKey, cfg.WebhookSecret)
 	orgSvc := tenant.NewService(pool, vk)
@@ -266,7 +271,7 @@ func main() {
 			if err != nil {
 				return err
 			}
-			defer resp.Body.Close()
+			defer func() { _ = resp.Body.Close() }()
 			if resp.StatusCode >= 300 {
 				return fmt.Errorf("sms gateway: %d", resp.StatusCode)
 			}
@@ -562,7 +567,7 @@ func main() {
 		if err != nil {
 			return err
 		}
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 		if resp.StatusCode >= 300 {
 			return fmt.Errorf("locator ingestion %d", resp.StatusCode)
 		}
@@ -979,7 +984,7 @@ func main() {
 	r.Route("/api/v1", func(r chi.Router) {
 		r.Get("/", func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
-			w.Write([]byte(`{"data":{"service":"oga9","version":"0.0.1"}}`))
+			_, _ = w.Write([]byte(`{"data":{"service":"oga9","version":"0.0.1"}}`))
 		})
 
 		// public auth — Valkey fixed-window rate limits (ADR-020 baseline)
@@ -1543,5 +1548,7 @@ func main() {
 	defer shutdownCancel()
 	srv.Shutdown()
 	scheduler.Shutdown()
-	httpSrv.Shutdown(shutdownCtx)
+	if err := httpSrv.Shutdown(shutdownCtx); err != nil {
+		log.Printf("http shutdown: %v", err)
+	}
 }

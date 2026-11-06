@@ -47,7 +47,7 @@ func (g *Gateway) ServeWS(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
-	defer c.Close(websocket.StatusNormalClosure, "")
+	defer func() { _ = c.Close(websocket.StatusNormalClosure, "") }()
 
 	userID := middleware.UserID(ctx) // session middleware ran before upgrade
 
@@ -122,7 +122,10 @@ func (g *Gateway) ServeWS(w http.ResponseWriter, r *http.Request) {
 			// ephemeral, never stored (§24).
 			if m.Typing != "" {
 				if cid, err := uuid.Parse(m.Typing); err == nil {
-					if mid, ok := subs[cid]; ok {
+					subsMu.Lock()
+					mid, ok := subs[cid]
+					subsMu.Unlock()
+					if ok {
 						if b, err := json.Marshal(map[string]any{"type": "typing",
 							"channel_id": cid, "membership_id": mid}); err == nil {
 							g.vk.Do(ctx, g.vk.B().Publish().Channel(chat.BusKey).Message(string(b)).Build())
@@ -190,13 +193,13 @@ func (g *Gateway) ServeWS(w http.ResponseWriter, r *http.Request) {
 func (g *Gateway) Ticket(w http.ResponseWriter, r *http.Request) {
 	uid := middleware.UserID(r.Context())
 	if uid == uuid.Nil {
-		http.Error(w, `{"error":{"code":"unauthorized","message":"session required","status":401}}`, 401)
+		http.Error(w, `{"error":{"code":"unauthorized","message":"session required","status":401}}`, http.StatusUnauthorized)
 		return
 	}
 	if g.vk == nil {
 		// no store → the nonce couldn't verify at upgrade; fail honestly
 		// instead of minting a dead ticket.
-		http.Error(w, `{"error":{"code":"unavailable","message":"realtime unavailable","status":503}}`, 503)
+		http.Error(w, `{"error":{"code":"unavailable","message":"realtime unavailable","status":503}}`, http.StatusServiceUnavailable)
 		return
 	}
 	nonce := uuid.NewString()
@@ -206,5 +209,5 @@ func (g *Gateway) Ticket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	w.Write([]byte(`{"data":{"ticket":"` + nonce + `","expires_in":60}}`))
+	_, _ = w.Write([]byte(`{"data":{"ticket":"` + nonce + `","expires_in":60}}`))
 }

@@ -84,7 +84,7 @@ func TestWebhookSignature(t *testing.T) {
 		t.Fatalf("bad webhook should reject: %v %v", ok, err)
 	}
 	var receipt bool
-	svc.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM webhook_receipts WHERE id=$1 AND NOT signature_ok)`, rid2).Scan(&receipt)
+	_ = svc.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM webhook_receipts WHERE id=$1 AND NOT signature_ok)`, rid2).Scan(&receipt)
 	if !receipt {
 		t.Fatal("rejected webhook receipt not persisted")
 	}
@@ -132,7 +132,7 @@ func TestJapaDedupe(t *testing.T) {
 		t.Fatal(err)
 	}
 	var jobs int
-	svc.pool.QueryRow(ctx, `SELECT count(*) FROM sync_jobs sj JOIN connectors c ON c.id=sj.connector_id WHERE c.organization_id=$1`, oc.OrgID).Scan(&jobs)
+	_ = svc.pool.QueryRow(ctx, `SELECT count(*) FROM sync_jobs sj JOIN connectors c ON c.id=sj.connector_id WHERE c.organization_id=$1`, oc.OrgID).Scan(&jobs)
 	if jobs != 1 {
 		t.Fatalf("expected 1 push job, got %d", jobs)
 	}
@@ -140,7 +140,7 @@ func TestJapaDedupe(t *testing.T) {
 	if err := svc.JapaPushConsumer(ctx, svc.q, e); err != nil {
 		t.Fatal(err)
 	}
-	svc.pool.QueryRow(ctx, `SELECT count(*) FROM sync_jobs sj JOIN connectors c ON c.id=sj.connector_id WHERE c.organization_id=$1`, oc.OrgID).Scan(&jobs)
+	_ = svc.pool.QueryRow(ctx, `SELECT count(*) FROM sync_jobs sj JOIN connectors c ON c.id=sj.connector_id WHERE c.organization_id=$1`, oc.OrgID).Scan(&jobs)
 	if jobs != 1 {
 		t.Fatalf("dedupe failed: %d jobs", jobs)
 	}

@@ -81,7 +81,7 @@ func (h *IDPHandler) Authorize(w http.ResponseWriter, r *http.Request) {
 			if state != "" {
 				loc += "&state=" + url.QueryEscape(state)
 			}
-			http.Redirect(w, r, loc, http.StatusFound)
+			http.Redirect(w, r, loc, http.StatusFound) // #nosec G710 -- redirect_uri validated against registered URIs
 			return
 		}
 		idpErr(w, err)
@@ -98,7 +98,7 @@ func (h *IDPHandler) Authorize(w http.ResponseWriter, r *http.Request) {
 		qq.Set("state", state)
 	}
 	u.RawQuery = qq.Encode()
-	http.Redirect(w, r, u.String(), http.StatusFound)
+	http.Redirect(w, r, u.String(), http.StatusFound) // #nosec G710 -- redirect_uri validated against registered URIs
 }
 
 type tokenReq struct {

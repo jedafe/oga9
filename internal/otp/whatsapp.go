@@ -63,7 +63,7 @@ func WhatsAppSender(phoneNumberID, token, templateName, lang, buttonSubType stri
 		if err != nil {
 			return err
 		}
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 		if resp.StatusCode >= 300 {
 			return fmt.Errorf("whatsapp api: %d", resp.StatusCode)
 		}

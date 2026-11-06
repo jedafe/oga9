@@ -21,7 +21,7 @@ func Metrics(valkeyAddr string, pool *pgxpool.Pool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		queues := map[string]any{}
 		ins := asynq.NewInspector(asynq.RedisClientOpt{Addr: valkeyAddr})
-		defer ins.Close()
+		defer func() { _ = ins.Close() }()
 		if names, err := ins.Queues(); err == nil {
 			for _, name := range names {
 				if qi, err := ins.GetQueueInfo(name); err == nil {

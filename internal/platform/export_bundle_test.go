@@ -46,7 +46,7 @@ func TestTenantExportBundleAndConfirm(t *testing.T) {
 		t.Fatalf("download: %v %s", err, status)
 	}
 	data, _ := io.ReadAll(blob)
-	blob.Close()
+	_ = blob.Close()
 
 	a, err := tenantexport.Open(bytes.NewReader(data), "")
 	if err != nil {
@@ -64,7 +64,7 @@ func TestTenantExportBundleAndConfirm(t *testing.T) {
 	tables := map[string]bool{}
 	_ = a.Walk(func(path string, r io.Reader, _ int64) error {
 		tables[path] = true
-		io.Copy(io.Discard, r)
+		_, _ = io.Copy(io.Discard, r)
 		return nil
 	})
 	for _, want := range []string{"data/tenants.jsonl", "data/organizations.jsonl", "data/users.jsonl", "data/organization_memberships.jsonl"} {
@@ -74,7 +74,7 @@ func TestTenantExportBundleAndConfirm(t *testing.T) {
 	}
 	// users projection is credential-free by default (ADR-020).
 	var users []map[string]any
-	err = a.Walk(func(path string, r io.Reader, _ int64) error {
+	_ = a.Walk(func(path string, r io.Reader, _ int64) error {
 		if path == "data/users.jsonl" {
 			b, _ := io.ReadAll(r)
 			for _, line := range bytes.Split(b, []byte("\n")) {
@@ -85,7 +85,7 @@ func TestTenantExportBundleAndConfirm(t *testing.T) {
 				}
 			}
 		}
-		io.Copy(io.Discard, r)
+		_, _ = io.Copy(io.Discard, r)
 		return nil
 	})
 	for _, u := range users {
@@ -184,7 +184,7 @@ func TestTenantExportCredentialsNeedPassphrase(t *testing.T) {
 	if err != nil || status != "done" {
 		t.Fatalf("download: %v %s", err, status)
 	}
-	defer blob.Close()
+	defer func() { _ = blob.Close() }()
 	data, err := io.ReadAll(blob)
 	if err != nil {
 		t.Fatal(err)

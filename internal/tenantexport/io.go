@@ -16,14 +16,14 @@ func spoolTemp(r io.Reader) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	if _, err := io.Copy(f, r); err != nil {
-		os.Remove(f.Name())
+		_ = os.Remove(f.Name())
 		return "", err
 	}
 	return f.Name(), nil
 }
 
-func openTemp(path string) (*os.File, error) { return os.Open(path) }
+func openTemp(path string) (*os.File, error) { return os.Open(path) } // #nosec G304 -- internal temp path from spoolTemp only
 
 func removeTemp(path string) { _ = os.Remove(path) }

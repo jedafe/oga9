@@ -259,7 +259,7 @@ func (s *Service) CompleteMilestone(ctx context.Context, oc *tenant.OrgCtx, pid,
 		}
 		pct := int32(0)
 		if pr.Total > 0 {
-			pct = int32(pr.Done * 100 / pr.Total)
+			pct = int32(pr.Done * 100 / pr.Total) // #nosec G115 -- bounded value; cannot overflow int32
 		}
 		if err := q.SetProjectProgress(ctx, db.SetProjectProgressParams{ID: p.ID, ProgressPct: pct}); err != nil {
 			return err

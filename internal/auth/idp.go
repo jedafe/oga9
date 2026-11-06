@@ -490,12 +490,19 @@ func (s *Service) JWKSet() map[string]any {
 		return map[string]any{"keys": []any{}}
 	}
 	p := s.oidcKey.PublicKey
-	sum := sha256.Sum256(append(p.X.Bytes(), p.Y.Bytes()...))
+	// Uncompressed SEC1 encoding: 0x04 || X(32) || Y(32). Slicing the
+	// fixed-width point keeps x/y at the 32 bytes JWKS requires —
+	// big.Int.Bytes() would drop leading zeros on rare coordinates.
+	raw, err := p.Bytes()
+	if err != nil || len(raw) != 65 {
+		return map[string]any{"keys": []any{}}
+	}
+	sum := sha256.Sum256(raw[1:])
 	enc := base64.RawURLEncoding.EncodeToString
 	return map[string]any{"keys": []map[string]any{{
 		"kty": "EC", "crv": "P-256", "alg": "ES256", "use": "sig",
 		"kid": enc(sum[:8]),
-		"x":   enc(p.X.Bytes()), "y": enc(p.Y.Bytes()),
+		"x":   enc(raw[1:33]), "y": enc(raw[33:65]),
 	}}}
 }
 

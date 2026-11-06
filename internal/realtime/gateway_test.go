@@ -46,7 +46,7 @@ func TestGatewaySubscribeFlow(t *testing.T) {
 
 	// org + owner + general channel
 	var uid uuid.UUID
-	pool.QueryRow(ctx,
+	_ = pool.QueryRow(ctx,
 		`INSERT INTO users (email, password_hash, display_name, status) VALUES ($1,'x','u','active')
 		 ON CONFLICT (email) DO UPDATE SET email=$1 RETURNING id`,
 		"ws-"+uuid.NewString()[:6]+"@t.co").Scan(&uid)
@@ -68,7 +68,7 @@ func TestGatewaySubscribeFlow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer c.CloseNow()
+	defer func() { _ = c.CloseNow() }()
 
 	sub, _ := json.Marshal(map[string]string{
 		"subscribe": cid.String(), "membership": oc.MembershipID.String()})
@@ -103,7 +103,7 @@ func TestGatewaySubscribeFlow(t *testing.T) {
 	// subscribing as a different member is refused
 	other, _ := json.Marshal(map[string]string{
 		"subscribe": cid.String(), "membership": uuid.NewString()})
-	c.Write(ctx, websocket.MessageText, other)
+	_ = c.Write(ctx, websocket.MessageText, other)
 	_, frame, err := c.Read(wctx)
 	if err != nil {
 		t.Fatal(err)
@@ -116,7 +116,7 @@ func TestGatewaySubscribeFlow(t *testing.T) {
 	var ef struct {
 		Error string `json:"error"`
 	}
-	json.Unmarshal(frame, &ef)
+	_ = json.Unmarshal(frame, &ef)
 	if ef.Error != "not_a_channel_member" {
 		t.Fatalf("expected not_a_channel_member, got %s", frame)
 	}

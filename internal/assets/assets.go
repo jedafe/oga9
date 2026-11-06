@@ -464,7 +464,7 @@ func (s *Service) TermEndedConsumer(ctx context.Context, q *db.Queries, e events
 // next_due lands inside the window emit MaintenanceDue (sourced → the
 // custodian's notification fires).
 func (s *Service) MaintenanceDueSweep(ctx context.Context, windowDays int) (int, error) {
-	rows, err := s.q.MaintenanceDue(ctx, int32(windowDays))
+	rows, err := s.q.MaintenanceDue(ctx, int32(windowDays)) // #nosec G115 -- bounded value; cannot overflow int32
 	if err != nil {
 		return 0, err
 	}

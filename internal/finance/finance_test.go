@@ -155,7 +155,7 @@ func TestFinanceFlow(t *testing.T) {
 		t.Fatal(err)
 	}
 	var debits int64
-	pool.QueryRow(ctx, "SELECT count(*) FROM ledger_entries WHERE payment_id=$1 AND direction='debit'", pid).Scan(&debits)
+	_ = pool.QueryRow(ctx, "SELECT count(*) FROM ledger_entries WHERE payment_id=$1 AND direction='debit'", pid).Scan(&debits)
 	if debits != 1 {
 		t.Fatalf("expected 1 reversing entry, got %d", debits)
 	}
@@ -171,7 +171,7 @@ func TestFinanceFlow(t *testing.T) {
 		t.Fatalf("confirm claim: %v", err)
 	}
 	var cpCount int64
-	pool.QueryRow(ctx, "SELECT count(*) FROM payments WHERE claim_id=$1 AND status='confirmed'", cid).Scan(&cpCount)
+	_ = pool.QueryRow(ctx, "SELECT count(*) FROM payments WHERE claim_id=$1 AND status='confirmed'", cid).Scan(&cpCount)
 	if cpCount != 1 {
 		t.Fatalf("confirmed claim should produce a payment, got %d", cpCount)
 	}
@@ -200,7 +200,7 @@ func TestFinanceFlow(t *testing.T) {
 		t.Fatal(err)
 	}
 	var disbursed string
-	pool.QueryRow(ctx, "SELECT state FROM contribution_drives WHERE id=$1", did).Scan(&disbursed)
+	_ = pool.QueryRow(ctx, "SELECT state FROM contribution_drives WHERE id=$1", did).Scan(&disbursed)
 	if disbursed != "disbursed" {
 		t.Fatalf("drive state: %s", disbursed)
 	}
@@ -238,7 +238,7 @@ func TestFinanceGuards(t *testing.T) {
 	// claim dedupe: same ref twice → ErrAlreadyClaimed (was a 500 via ErrNoRows)
 	// receipt_media_id FKs into documents (g11) — a real row is required.
 	var docID uuid.UUID
-	pool.QueryRow(ctx,
+	_ = pool.QueryRow(ctx,
 		`INSERT INTO documents (organization_id, kind, title, storage_key, uploaded_by)
 		 VALUES ($1,'photo','proof','k',$2) RETURNING id`, org.ID, payerOC.MembershipID).Scan(&docID)
 	in := PaymentIn{AmountMinor: 1000, Currency: "NGN", Channel: "transfer", ExternalRef: "REF-" + uuid.NewString()[:8]}
@@ -302,7 +302,7 @@ func TestFinanceGuards(t *testing.T) {
 		t.Fatal(err)
 	}
 	var hasEnd bool
-	pool.QueryRow(ctx, "SELECT ends_on IS NOT NULL FROM dues_schedules WHERE id=$1", sid).Scan(&hasEnd)
+	_ = pool.QueryRow(ctx, "SELECT ends_on IS NOT NULL FROM dues_schedules WHERE id=$1", sid).Scan(&hasEnd)
 	if hasEnd {
 		t.Fatal("ends_on:null should clear the end date")
 	}

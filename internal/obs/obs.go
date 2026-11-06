@@ -5,7 +5,7 @@ package obs
 
 import (
 	"log/slog"
-	"math/rand"
+	"math/rand/v2"
 	"net/http"
 	"os"
 	"sort"
@@ -66,7 +66,6 @@ type routeStats struct {
 var (
 	mu     sync.Mutex
 	routes = map[string]*routeStats{}
-	rng    = rand.New(rand.NewSource(time.Now().UnixNano()))
 )
 
 func record(route string, ms float64, status int) {
@@ -85,8 +84,8 @@ func record(route string, ms float64, status int) {
 	}
 	if len(st.samples) < reservoir {
 		st.samples = append(st.samples, ms)
-	} else if j := rng.Int63n(int64(st.count)); j < reservoir {
-		st.samples[j] = ms
+	} else if n := int64(st.count); n > 0 && rand.Int64N(n) < reservoir { // #nosec G115 G404 -- bounded reservoir sampling for metrics, not secrets
+		st.samples[rand.Int64N(int64(reservoir))] = ms // #nosec G404 -- metrics sampling
 	}
 }
 

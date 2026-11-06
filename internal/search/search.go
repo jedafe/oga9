@@ -60,7 +60,7 @@ func (s *Service) req(ctx context.Context, method, path string, body any) error 
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode >= 300 {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
 		return fmt.Errorf("meilisearch %s %s: %d %s", method, path, resp.StatusCode, string(b))

@@ -68,7 +68,7 @@ func setup(t *testing.T, e *env) (*tenant.OrgCtx, uuid.UUID, *tenant.OrgCtx) {
 		t.Fatal(err)
 	}
 	oc2, _ := e.org.ResolveOrgCtx(ctx, u3, org.ID)
-	e.pool.Exec(ctx, "UPDATE organization_memberships SET lifecycle_state='active' WHERE id IN (SELECT id FROM organization_memberships WHERE organization_id=$1)", org.ID)
+	_, _ = e.pool.Exec(ctx, "UPDATE organization_memberships SET lifecycle_state='active' WHERE id IN (SELECT id FROM organization_memberships WHERE organization_id=$1)", org.ID)
 	return oc, org.ID, oc2
 }
 
@@ -83,7 +83,7 @@ func TestAnnouncementFlow(t *testing.T) {
 		t.Fatal(err)
 	}
 	var st string
-	e.pool.QueryRow(ctx, "SELECT state FROM announcements WHERE id=$1", aid).Scan(&st)
+	_ = e.pool.QueryRow(ctx, "SELECT state FROM announcements WHERE id=$1", aid).Scan(&st)
 	if st != "draft" {
 		t.Fatalf("draft, got %s", st)
 	}
@@ -101,12 +101,12 @@ func TestAnnouncementFlow(t *testing.T) {
 	// every active member got an in_app row (owner + member); each opted-in
 	// member also has a channel='email' row tracking delivered_at.
 	var n int
-	e.pool.QueryRow(ctx, "SELECT count(*) FROM notifications WHERE organization_id=$1 AND kind='announcement' AND channel='in_app'", orgID).Scan(&n)
+	_ = e.pool.QueryRow(ctx, "SELECT count(*) FROM notifications WHERE organization_id=$1 AND kind='announcement' AND channel='in_app'", orgID).Scan(&n)
 	if n != 2 {
 		t.Fatalf("expected 2 in_app notifications, got %d", n)
 	}
 	var ne int
-	e.pool.QueryRow(ctx, "SELECT count(*) FROM notifications WHERE organization_id=$1 AND kind='announcement' AND channel='email'", orgID).Scan(&ne)
+	_ = e.pool.QueryRow(ctx, "SELECT count(*) FROM notifications WHERE organization_id=$1 AND kind='announcement' AND channel='email'", orgID).Scan(&ne)
 	if ne != 2 {
 		t.Fatalf("expected 2 email tracking rows, got %d", ne)
 	}
@@ -134,14 +134,14 @@ func TestAnnouncementFlow(t *testing.T) {
 	}
 	// read + read-event; retract CAS
 	var nid uuid.UUID
-	e.pool.QueryRow(ctx, "SELECT id FROM notifications WHERE user_id=$1 AND kind='announcement' LIMIT 1", oc2.UserID).Scan(&nid)
+	_ = e.pool.QueryRow(ctx, "SELECT id FROM notifications WHERE user_id=$1 AND kind='announcement' LIMIT 1", oc2.UserID).Scan(&nid)
 	if err := e.svc.MarkRead(ctx, oc2.UserID, nid); err != nil {
 		t.Fatal(err)
 	}
 	if err := e.svc.Retract(ctx, oc, aid); err != nil {
 		t.Fatal(err)
 	}
-	e.pool.QueryRow(ctx, "SELECT state FROM announcements WHERE id=$1", aid).Scan(&st)
+	_ = e.pool.QueryRow(ctx, "SELECT state FROM announcements WHERE id=$1", aid).Scan(&st)
 	if st != "retracted" {
 		t.Fatalf("expected retracted, got %s", st)
 	}
@@ -164,15 +164,15 @@ func TestDocumentFlow(t *testing.T) {
 	if err != nil || d.Title != "Bylaws" {
 		t.Fatalf("download: %v", err)
 	}
-	rc.Close()
+	_ = rc.Close()
 	// public listing sees it — addressed by slug, and only while the
 	// org is directory-opted-in (§03 opt-in honored by the docs surface)
 	var slug string
-	e.pool.QueryRow(ctx, "SELECT slug FROM organizations WHERE id=$1", d.OrganizationID).Scan(&slug)
+	_ = e.pool.QueryRow(ctx, "SELECT slug FROM organizations WHERE id=$1", d.OrganizationID).Scan(&slug)
 	if none, _ := e.svc.PublicDocs(ctx, slug); len(none) != 0 {
 		t.Fatal("non-listed org must not expose a public docs listing")
 	}
-	e.pool.Exec(ctx, "UPDATE organizations SET is_public_listed=true WHERE id=$1", d.OrganizationID)
+	_, _ = e.pool.Exec(ctx, "UPDATE organizations SET is_public_listed=true WHERE id=$1", d.OrganizationID)
 	pub, err := e.svc.PublicDocs(ctx, slug)
 	if err != nil || len(pub) != 1 {
 		t.Fatalf("public docs: %v %d", err, len(pub))
@@ -184,7 +184,7 @@ func TestDocumentFlow(t *testing.T) {
 		t.Fatal(err)
 	}
 	var deleted bool
-	e.pool.QueryRow(ctx, "SELECT deleted_at IS NOT NULL FROM documents WHERE id=$1", bad).Scan(&deleted)
+	_ = e.pool.QueryRow(ctx, "SELECT deleted_at IS NOT NULL FROM documents WHERE id=$1", bad).Scan(&deleted)
 	if !deleted {
 		t.Fatal("executable upload should have been soft-deleted")
 	}
@@ -212,7 +212,7 @@ func TestChatFlow(t *testing.T) {
 		t.Fatal(err)
 	}
 	var chCount int
-	e.pool.QueryRow(ctx, "SELECT count(*) FROM chat_channels WHERE organization_id=$1", orgID).Scan(&chCount)
+	_ = e.pool.QueryRow(ctx, "SELECT count(*) FROM chat_channels WHERE organization_id=$1", orgID).Scan(&chCount)
 	chans, err := e.chat.Channels(ctx, oc2)
 	if err != nil || len(chans) == 0 {
 		t.Fatal("member should see the general channel")
@@ -260,14 +260,14 @@ func TestChatFlow(t *testing.T) {
 	}
 	// dm caps at two members
 	dmID, _ := e.chat.CreateChannel(ctx, oc, "dm", "pair", uuid.Nil)
-	e.chat.AddMember(ctx, oc, dmID, oc2.MembershipID, "member")
+	_ = e.chat.AddMember(ctx, oc, dmID, oc2.MembershipID, "member")
 	var third uuid.UUID
-	e.pool.QueryRow(ctx,
+	_ = e.pool.QueryRow(ctx,
 		`INSERT INTO users (email,password_hash,display_name,status) VALUES ($1,'x','t','active')
 		 RETURNING id`, "dm3"+uuid.NewString()[:8]+"@t.co").Scan(&third)
 	inv3, _ := e.org.CreateInvitation(ctx, oc, "dm3x"+uuid.NewString()[:8]+"@t.co", "", "", "floor")
 	u3 := mkUser(t, e.pool, inv3.Email)
-	e.org.AcceptInvitation(ctx, u3, inv3.Token, "")
+	_, _ = e.org.AcceptInvitation(ctx, u3, inv3.Token, "")
 	oc3, _ := e.org.ResolveOrgCtx(ctx, u3, oc.OrgID)
 	if err := e.chat.AddMember(ctx, oc, dmID, oc3.MembershipID, "member"); err != chat.ErrBadValue {
 		t.Fatalf("third dm member should be refused, got %v", err)
@@ -296,7 +296,7 @@ func TestDocumentVersionsV1(t *testing.T) {
 		did).Scan(&v1key); err != nil {
 		t.Fatalf("v1 row missing — original blob orphaned: %v", err)
 	}
-	e.pool.QueryRow(ctx, "SELECT storage_key FROM documents WHERE id=$1", did).Scan(&headkey)
+	_ = e.pool.QueryRow(ctx, "SELECT storage_key FROM documents WHERE id=$1", did).Scan(&headkey)
 	if headkey == v1key {
 		t.Fatal("head still points at v1 key after bump")
 	}
@@ -310,7 +310,7 @@ func TestDocumentVersionsV1(t *testing.T) {
 	}
 	var v int
 	var alive bool
-	e.pool.QueryRow(ctx,
+	_ = e.pool.QueryRow(ctx,
 		"SELECT version, deleted_at IS NULL FROM documents WHERE id=$1", did).Scan(&v, &alive)
 	if v != 2 || !alive {
 		t.Fatalf("poisoned v3 must drop only the version row (doc alive at v2), got v%d alive=%v", v, alive)

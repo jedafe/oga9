@@ -151,7 +151,7 @@ func TestSecrecyAndGuards(t *testing.T) {
 	}
 	// secrecy: no vote row carries a member/ballot link
 	var leak bool
-	pool.QueryRow(ctx, `SELECT EXISTS(
+	_ = pool.QueryRow(ctx, `SELECT EXISTS(
 		SELECT 1 FROM information_schema.columns
 		WHERE table_name='votes' AND column_name IN ('membership_id','ballot_id','user_id','member_id'))`).Scan(&leak)
 	if leak {

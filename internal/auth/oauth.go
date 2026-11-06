@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -86,12 +87,13 @@ func (s *Service) OAuthCallback(ctx context.Context, state, code, redirectURI st
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	var tok struct {
 		AccessToken string `json:"access_token"`
 		Error       string `json:"error"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&tok); err != nil || tok.AccessToken == "" {
+	// bound the decode — a misbehaving provider can't stream memory
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&tok); err != nil || tok.AccessToken == "" {
 		return nil, fmt.Errorf("oauth token exchange failed: %s", tok.Error)
 	}
 
@@ -104,12 +106,12 @@ func (s *Service) OAuthCallback(ctx context.Context, state, code, redirectURI st
 	if err != nil {
 		return nil, err
 	}
-	defer uresp.Body.Close()
+	defer func() { _ = uresp.Body.Close() }()
 	if uresp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("oauth userinfo returned %d", uresp.StatusCode)
 	}
 	var info oidcUserinfo
-	if err := json.NewDecoder(uresp.Body).Decode(&info); err != nil || info.Sub == "" {
+	if err := json.NewDecoder(io.LimitReader(uresp.Body, 4<<20)).Decode(&info); err != nil || info.Sub == "" {
 		return nil, errors.New("oauth userinfo failed")
 	}
 

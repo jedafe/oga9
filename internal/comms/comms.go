@@ -115,7 +115,7 @@ func (s *Service) withTx(ctx context.Context, fn func(*db.Queries) error) error 
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 	if err := fn(s.q.WithTx(tx)); err != nil {
 		return err
 	}
@@ -316,12 +316,13 @@ func (s *Service) DispatchAnnouncement(ctx context.Context, announcementID uuid.
 		prefOn[key] = p.Enabled
 	}
 	haveInApp := map[string]bool{}
-	var emailRow map[string]db.NotifExistingByRefRow = map[string]db.NotifExistingByRefRow{}
+	emailRow := map[string]db.NotifExistingByRefRow{}
 	for _, n := range existing {
 		uid := uuid.UUID(n.UserID.Bytes).String()
-		if n.Channel == "in_app" {
+		switch n.Channel {
+		case "in_app":
 			haveInApp[uid] = true
-		} else if n.Channel == "email" {
+		case "email":
 			emailRow[uid] = n
 		}
 	}

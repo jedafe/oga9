@@ -487,7 +487,7 @@ func (s *Service) MarkInvitePhoneVerified(ctx context.Context, senderPhone, join
 		return false, nil // too short to be a token prefix — ignore
 	}
 	for _, r := range code {
-		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f')) {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
 			return false, nil // not a uuid prefix — also keeps LIKE honest
 		}
 	}

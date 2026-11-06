@@ -84,7 +84,7 @@ func (h *MemberHandler) Members(w http.ResponseWriter, r *http.Request) {
 	}
 	page, per := httpx.PageParams(r)
 	rows, total, err := h.svc.MembersPage(r.Context(), oc, r.URL.Query().Get("category"),
-		r.URL.Query().Get("state"), unitID, int32(per), int32((page-1)*per))
+		r.URL.Query().Get("state"), unitID, httpx.I32(int64(per)), httpx.I32(int64((page-1)*per)))
 	if err != nil {
 		memberErr(w, err)
 		return
@@ -247,7 +247,7 @@ func (h *MemberHandler) Card(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Design json.RawMessage `json:"design"`
 	}
-	httpx.Decode(w, r, &req) // design optional
+	_ = httpx.Decode(w, r, &req) // design optional
 	card, err := h.svc.IssueCard(r.Context(), middleware.OrgCtx(r.Context()), mid, req.Design)
 	if err != nil {
 		memberErr(w, err)
@@ -431,13 +431,13 @@ func (h *MemberHandler) Export(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/csv")
 	w.Header().Set("Content-Disposition", `attachment; filename="members.csv"`)
 	cw := csv.NewWriter(w)
-	cw.Write([]string{"member_no", "display_name", "email", "category", "lifecycle_state", "dues_standing", "joined_at"})
+	_ = cw.Write([]string{"member_no", "display_name", "email", "category", "lifecycle_state", "dues_standing", "joined_at"})
 	for _, m := range rows {
 		joined := ""
 		if m.JoinedAt.Valid {
 			joined = m.JoinedAt.Time.Format("2006-01-02")
 		}
-		cw.Write([]string{csvSafe(m.MemberNo.String), csvSafe(m.DisplayName), csvSafe(m.Email),
+		_ = cw.Write([]string{csvSafe(m.MemberNo.String), csvSafe(m.DisplayName), csvSafe(m.Email),
 			csvSafe(m.Category), csvSafe(m.LifecycleState), csvSafe(m.DuesStanding), joined})
 	}
 	cw.Flush()
@@ -560,7 +560,7 @@ func (h *MemberHandler) ExportDownload(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/csv")
 	fname := sanitizeHeaderValue(e.Filename)
 	w.Header().Set("Content-Disposition", `attachment; filename="`+fname+`"`)
-	w.Write(e.Content)
+	_, _ = w.Write(e.Content) // #nosec G705 -- text/csv attachment; not rendered as HTML
 }
 
 // sanitizeHeaderValue strips quote/CR/LF — a filename or title must

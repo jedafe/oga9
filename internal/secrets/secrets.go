@@ -84,13 +84,25 @@ func Resolve(ctx context.Context, ref string) (string, error) {
 		if p != root && !strings.HasPrefix(p, root+string(filepath.Separator)) {
 			return "", fmt.Errorf("secret file %q escapes the configured secrets directory", truncate(rest))
 		}
-		b, err := os.ReadFile(p)
+		rel, err := filepath.Rel(root, p)
+		if err != nil || strings.HasPrefix(rel, "..") {
+			return "", fmt.Errorf("secret file %q escapes the configured secrets directory", truncate(rest))
+		}
+		// os.Root confines the open to the secrets dir AND refuses symlink
+		// escapes — a planted link inside OGA9_SECRETS_DIR can't pivot to
+		// /etc or /proc the way a plain os.ReadFile would.
+		fsroot, err := os.OpenRoot(root)
+		if err != nil {
+			return "", fmt.Errorf("secrets dir %q: %w", root, err)
+		}
+		defer func() { _ = fsroot.Close() }()
+		b, err := fsroot.ReadFile(rel)
 		if err != nil {
 			return "", fmt.Errorf("secret file %q: %w", truncate(rest), err)
 		}
 		return strings.TrimSpace(string(b)), nil
 	default:
-		return "", fmt.Errorf("unsupported credential_ref scheme %q — use env: or file:", scheme)
+		return "", fmt.Errorf("unsupported credential_ref scheme %q — expected env:NAME or file:PATH", scheme)
 	}
 }
 

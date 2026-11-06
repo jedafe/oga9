@@ -65,7 +65,7 @@ func (s *Service) CreateBudget(ctx context.Context, oc *tenant.OrgCtx, in Budget
 		var err error
 		row, err = q.CreateBudget(ctx, db.CreateBudgetParams{
 			OrganizationID: toPg(oc.OrgID), TermID: toPg(in.TermID),
-			FiscalYear: int32(in.FiscalYear), Name: in.Name})
+			FiscalYear: int32(in.FiscalYear), Name: in.Name}) // #nosec G115 -- bounded value; cannot overflow int32
 		if err != nil {
 			return err
 		}
@@ -112,7 +112,7 @@ func (s *Service) PatchBudget(ctx context.Context, oc *tenant.OrgCtx, bid uuid.U
 		if err != nil {
 			return err
 		}
-		if lines != nil {
+		if len(lines) > 0 {
 			for _, l := range lines {
 				if l.ID != uuid.Nil {
 					// draft-only edit of an existing line (label/allocation);

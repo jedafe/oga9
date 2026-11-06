@@ -98,7 +98,7 @@ func (h *AnalyticsHandler) DownloadReport(w http.ResponseWriter, r *http.Request
 		analyticsErr(w, err)
 		return
 	}
-	defer rc.Close()
+	defer func() { _ = rc.Close() }()
 	w.Header().Set("Content-Disposition", `attachment; filename="`+name+`"`)
 	w.Header().Set("Content-Type", "application/octet-stream")
 	_, _ = io.Copy(w, rc)

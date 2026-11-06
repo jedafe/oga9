@@ -747,9 +747,7 @@ func (s *Service) ResolveHost(ctx context.Context, host, baseDomain string) (str
 		}
 		return head, "subdomain", nil
 	}
-	if strings.HasPrefix(host, "www.") {
-		host = host[4:] // www-alias resolves to the bare custom domain
-	}
+	host = strings.TrimPrefix(host, "www.") // www-alias resolves to the bare custom domain
 	r, err := s.q.OrgByCustomDomain(ctx, host)
 	if err != nil {
 		return "", "", err

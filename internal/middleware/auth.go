@@ -20,8 +20,8 @@ const (
 	CtxUserID       ctxKey = "user_id"
 	CtxSessionJTI   ctxKey = "session_jti"
 	CtxMFAGate      ctxKey = "mfa_gate"
-	CtxTenantID     ctxKey = "tenant_id"
-	CtxAPIKeyScopes ctxKey = "api_key_scopes"
+	CtxTenantID     ctxKey = "tenant_id"      // #nosec G101 -- context key name, not a credential
+	CtxAPIKeyScopes ctxKey = "api_key_scopes" // #nosec G101 -- context key name, not a credential
 )
 
 func bearerToken(r *http.Request) (string, bool) {
@@ -155,7 +155,7 @@ func APIKeyScopes(ctx context.Context) []string {
 // node match or "*".
 func ScopeAllows(ctx context.Context, node string) bool {
 	sc := APIKeyScopes(ctx)
-	if sc == nil || len(sc) == 0 {
+	if len(sc) == 0 {
 		return true
 	}
 	for _, s := range sc {

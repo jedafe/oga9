@@ -34,13 +34,13 @@ func mkCtx(t *testing.T, pool *pgxpool.Pool) *tenant.OrgCtx {
 	ctx := context.Background()
 	suffix := uuid.NewString()[:8]
 	var tid, oid, uid, mid pgtype.UUID
-	pool.QueryRow(ctx, `INSERT INTO tenants (name,slug,billing_email,status) VALUES ($1,$2,$3,'active') RETURNING id`,
+	_ = pool.QueryRow(ctx, `INSERT INTO tenants (name,slug,billing_email,status) VALUES ($1,$2,$3,'active') RETURNING id`,
 		"t-"+suffix, "t-"+suffix, "t-"+suffix+"@x.test").Scan(&tid)
-	pool.QueryRow(ctx, `INSERT INTO organizations (tenant_id,name,slug,org_type) VALUES ($1,$2,$3,'association') RETURNING id`,
+	_ = pool.QueryRow(ctx, `INSERT INTO organizations (tenant_id,name,slug,org_type) VALUES ($1,$2,$3,'association') RETURNING id`,
 		tid, "o-"+suffix, "o-"+suffix).Scan(&oid)
-	pool.QueryRow(ctx, `INSERT INTO users (email,password_hash,display_name,status) VALUES ($1,'x','u','active') RETURNING id`,
+	_ = pool.QueryRow(ctx, `INSERT INTO users (email,password_hash,display_name,status) VALUES ($1,'x','u','active') RETURNING id`,
 		"u-"+suffix+"@x.test").Scan(&uid)
-	pool.QueryRow(ctx, `INSERT INTO organization_memberships (organization_id,user_id,category,lifecycle_state) VALUES ($1,$2,'regular','active') RETURNING id`,
+	_ = pool.QueryRow(ctx, `INSERT INTO organization_memberships (organization_id,user_id,category,lifecycle_state) VALUES ($1,$2,'regular','active') RETURNING id`,
 		oid, uid).Scan(&mid)
 	return &tenant.OrgCtx{OrgID: uuid.UUID(oid.Bytes), TenantID: uuid.UUID(tid.Bytes),
 		UserID: uuid.UUID(uid.Bytes), MembershipID: uuid.UUID(mid.Bytes)}
@@ -68,7 +68,7 @@ func TestQuota(t *testing.T) {
 		t.Fatalf("second call should hit quota: %v", err)
 	}
 	var qe bool
-	svc.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM domain_events WHERE event_type='AIQuotaExceeded' AND tenant_id=$1)`, oc.TenantID).Scan(&qe)
+	_ = svc.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM domain_events WHERE event_type='AIQuotaExceeded' AND tenant_id=$1)`, oc.TenantID).Scan(&qe)
 	if !qe {
 		t.Fatal("AIQuotaExceeded not emitted")
 	}

@@ -12,34 +12,62 @@ import (
 	"strings"
 )
 
-type Store struct{ dir string }
+// Store confines every key inside dir via os.Root — traversal segments
+// AND symlink escapes can't reach outside the uploads root (Go 1.24+).
+type Store struct {
+	dir  string
+	root *os.Root
+}
 
-func New(dir string) *Store { _ = os.MkdirAll(dir, 0o755); return &Store{dir: dir} }
+func New(dir string) *Store {
+	_ = os.MkdirAll(dir, 0o750)
+	root, _ := os.OpenRoot(dir) // nil only when dir is unusable — ops fail then too
+	return &Store{dir: dir, root: root}
+}
 
-// Put writes the blob; keys are generated uuids — we clean the input
-// anyway so a stray ../ can never escape the root.
+// cleanKey anchors the key: os.Root rejects ".." itself, but cleaning
+// also collapses redundant separators so Stat/Remove hit the same file
+// a Put wrote.
+func cleanKey(key string) string {
+	return strings.TrimPrefix(filepath.Clean("/"+key), "/")
+}
+
 func (s *Store) Put(ctx context.Context, key string, r io.Reader) error {
-	key = filepath.Clean("/" + strings.ReplaceAll(key, "..", ""))
-	dst := filepath.Join(s.dir, key)
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-		return err
+	key = cleanKey(key)
+	if s.root == nil {
+		return s.putJoined(ctx, key, r)
 	}
-	f, err := os.Create(dst)
+	if dir := filepath.Dir(key); dir != "." {
+		if err := s.root.MkdirAll(dir, 0o750); err != nil {
+			return err
+		}
+	}
+	f, err := s.root.Create(key)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	_, err = io.Copy(f, r)
 	return err
 }
 
 func (s *Store) Open(ctx context.Context, key string) (io.ReadCloser, error) {
-	key = filepath.Clean("/" + strings.ReplaceAll(key, "..", ""))
-	return os.Open(filepath.Join(s.dir, key))
+	key = cleanKey(key)
+	if s.root == nil {
+		return os.Open(filepath.Join(s.dir, key)) // #nosec G304 -- fallback when os.Root unavailable; cleanKey strips traversal
+	}
+	return s.root.Open(key)
 }
 
 func (s *Store) Stat(ctx context.Context, key string) (int64, error) {
-	st, err := os.Stat(filepath.Join(s.dir, filepath.Clean("/"+strings.ReplaceAll(key, "..", ""))))
+	key = cleanKey(key)
+	var st os.FileInfo
+	var err error
+	if s.root == nil {
+		st, err = os.Stat(filepath.Join(s.dir, key))
+	} else {
+		st, err = s.root.Stat(key)
+	}
 	if err != nil {
 		return 0, err
 	}
@@ -49,6 +77,25 @@ func (s *Store) Stat(ctx context.Context, key string) (int64, error) {
 // Remove deletes a key — used when an upload is rejected after the blob
 // landed (over-cap, failed validation).
 func (s *Store) Remove(ctx context.Context, key string) error {
-	key = filepath.Clean("/" + strings.ReplaceAll(key, "..", ""))
-	return os.Remove(filepath.Join(s.dir, key))
+	key = cleanKey(key)
+	if s.root == nil {
+		return os.Remove(filepath.Join(s.dir, key))
+	}
+	return s.root.Remove(key)
+}
+
+// putJoined is the fallback for a dir os.Root couldn't open — the join
+// still stays under s.dir because cleanKey strips traversal.
+func (s *Store) putJoined(ctx context.Context, key string, r io.Reader) error {
+	dst := filepath.Join(s.dir, key)
+	if err := os.MkdirAll(filepath.Dir(dst), 0o750); err != nil {
+		return err
+	}
+	f, err := os.Create(dst) // #nosec G304 -- fallback when os.Root unavailable; cleanKey strips traversal
+	if err != nil {
+		return err
+	}
+	defer func() { _ = f.Close() }()
+	_, err = io.Copy(f, r)
+	return err
 }

@@ -30,13 +30,13 @@ func TestVoiceRoomLifecycle(t *testing.T) {
 
 	suffix := uuid.NewString()[:8]
 	var tid, oid, uid, mid pgtype.UUID
-	pool.QueryRow(ctx, `INSERT INTO tenants (name,slug,billing_email,status) VALUES ($1,$2,$3,'active') RETURNING id`,
+	_ = pool.QueryRow(ctx, `INSERT INTO tenants (name,slug,billing_email,status) VALUES ($1,$2,$3,'active') RETURNING id`,
 		"t-"+suffix, "t-"+suffix, "t-"+suffix+"@x.test").Scan(&tid)
-	pool.QueryRow(ctx, `INSERT INTO organizations (tenant_id,name,slug,org_type) VALUES ($1,$2,$3,'association') RETURNING id`,
+	_ = pool.QueryRow(ctx, `INSERT INTO organizations (tenant_id,name,slug,org_type) VALUES ($1,$2,$3,'association') RETURNING id`,
 		tid, "o-"+suffix, "o-"+suffix).Scan(&oid)
-	pool.QueryRow(ctx, `INSERT INTO users (email,password_hash,display_name,status) VALUES ($1,'x','u','active') RETURNING id`,
+	_ = pool.QueryRow(ctx, `INSERT INTO users (email,password_hash,display_name,status) VALUES ($1,'x','u','active') RETURNING id`,
 		"u-"+suffix+"@x.test").Scan(&uid)
-	pool.QueryRow(ctx, `INSERT INTO organization_memberships (organization_id,user_id,category,lifecycle_state) VALUES ($1,$2,'regular','active') RETURNING id`,
+	_ = pool.QueryRow(ctx, `INSERT INTO organization_memberships (organization_id,user_id,category,lifecycle_state) VALUES ($1,$2,'regular','active') RETURNING id`,
 		oid, uid).Scan(&mid)
 	oc := &tenant.OrgCtx{OrgID: uuid.UUID(oid.Bytes), TenantID: uuid.UUID(tid.Bytes),
 		UserID: uuid.UUID(uid.Bytes), MembershipID: uuid.UUID(mid.Bytes)}
@@ -58,12 +58,12 @@ func TestVoiceRoomLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	var state string
-	pool.QueryRow(ctx, `SELECT state FROM voice_rooms WHERE id=$1`, rid).Scan(&state)
+	_ = pool.QueryRow(ctx, `SELECT state FROM voice_rooms WHERE id=$1`, rid).Scan(&state)
 	if state != "ended" {
 		t.Fatalf("state: %s", state)
 	}
 	var left bool
-	pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM voice_room_participants WHERE room_id=$1 AND left_at IS NOT NULL)`, rid).Scan(&left)
+	_ = pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM voice_room_participants WHERE room_id=$1 AND left_at IS NOT NULL)`, rid).Scan(&left)
 	if !left {
 		t.Fatal("participants not closed out on end")
 	}
@@ -96,24 +96,24 @@ func TestRoomSweep(t *testing.T) {
 	ctx := context.Background()
 	suffix := uuid.NewString()[:8]
 	var tid, oid, uid, mid pgtype.UUID
-	pool.QueryRow(ctx, `INSERT INTO tenants (name,slug,billing_email,status) VALUES ($1,$2,$3,'active') RETURNING id`,
+	_ = pool.QueryRow(ctx, `INSERT INTO tenants (name,slug,billing_email,status) VALUES ($1,$2,$3,'active') RETURNING id`,
 		"t-"+suffix, "t-"+suffix, "t-"+suffix+"@x.test").Scan(&tid)
-	pool.QueryRow(ctx, `INSERT INTO organizations (tenant_id,name,slug,org_type) VALUES ($1,$2,$3,'association') RETURNING id`,
+	_ = pool.QueryRow(ctx, `INSERT INTO organizations (tenant_id,name,slug,org_type) VALUES ($1,$2,$3,'association') RETURNING id`,
 		tid, "o-"+suffix, "o-"+suffix).Scan(&oid)
-	pool.QueryRow(ctx, `INSERT INTO users (email,password_hash,display_name,status) VALUES ($1,'x','u','active') RETURNING id`,
+	_ = pool.QueryRow(ctx, `INSERT INTO users (email,password_hash,display_name,status) VALUES ($1,'x','u','active') RETURNING id`,
 		"u-"+suffix+"@x.test").Scan(&uid)
-	pool.QueryRow(ctx, `INSERT INTO organization_memberships (organization_id,user_id,category,lifecycle_state) VALUES ($1,$2,'regular','active') RETURNING id`,
+	_ = pool.QueryRow(ctx, `INSERT INTO organization_memberships (organization_id,user_id,category,lifecycle_state) VALUES ($1,$2,'regular','active') RETURNING id`,
 		oid, uid).Scan(&mid)
 	// orphaned 'live' room older than the max age → sweep ends it
 	var rid pgtype.UUID
-	pool.QueryRow(ctx, `INSERT INTO voice_rooms (organization_id, title, room_name, started_by, state, started_at)
+	_ = pool.QueryRow(ctx, `INSERT INTO voice_rooms (organization_id, title, room_name, started_by, state, started_at)
 		VALUES ($1,'stale',$2,$3,'live',now()-interval '25 hours') RETURNING id`,
 		oid, "stale-"+suffix, mid).Scan(&rid)
 	if err := svc.RoomSweep(ctx, 24); err != nil {
 		t.Fatal(err)
 	}
 	var state string
-	pool.QueryRow(ctx, `SELECT state FROM voice_rooms WHERE id=$1`, rid).Scan(&state)
+	_ = pool.QueryRow(ctx, `SELECT state FROM voice_rooms WHERE id=$1`, rid).Scan(&state)
 	if state != "ended" {
 		t.Fatalf("orphan room not swept: %s", state)
 	}

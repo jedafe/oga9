@@ -87,7 +87,7 @@ func runImport(args []string) error {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	a, err := tenantexport.Open(f, *passphrase)
 	if err != nil {
 		return err
@@ -131,7 +131,7 @@ func runImport(args []string) error {
 	if err != nil {
 		return err
 	}
-	defer conn.Close(ctx)
+	defer func() { _ = conn.Close(ctx) }()
 	// Self-hosted is single-tenant — a different tenant already on this
 	// install means this bundle does not belong here.
 	var existingID string
@@ -146,7 +146,7 @@ func runImport(args []string) error {
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 	// FK triggers off — bundle tables carry no topological order.
 	if _, err := tx.Exec(ctx, "SET LOCAL session_replication_role = 'replica'"); err != nil {
 		return fmt.Errorf("disabling FK checks needs a superuser connection: %w", err)
@@ -203,7 +203,7 @@ func runImport(args []string) error {
 	// blobs land only after the data tx commits — a failed import must
 	// not half-populate the uploads dir.
 	var nFiles int
-	if err := os.MkdirAll(*uploads, 0o755); err != nil {
+	if err := os.MkdirAll(*uploads, 0o750); err != nil {
 		return err
 	}
 	err = a.Walk(func(path string, r io.Reader, _ int64) error {
@@ -212,14 +212,14 @@ func runImport(args []string) error {
 		}
 		key := filepath.Clean("/" + strings.ReplaceAll(strings.TrimPrefix(path, "files/"), "..", ""))
 		dstPath := filepath.Join(*uploads, key)
-		if err := os.MkdirAll(filepath.Dir(dstPath), 0o755); err != nil {
+		if err := os.MkdirAll(filepath.Dir(dstPath), 0o750); err != nil {
 			return err
 		}
-		dst, err := os.Create(dstPath)
+		dst, err := os.Create(dstPath) // #nosec G304 -- operator-supplied output dir in a local admin CLI
 		if err != nil {
 			return err
 		}
-		defer dst.Close()
+		defer func() { _ = dst.Close() }()
 		if _, err := io.Copy(dst, r); err != nil {
 			return err
 		}

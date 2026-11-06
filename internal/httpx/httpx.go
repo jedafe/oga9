@@ -5,6 +5,7 @@ package httpx
 
 import (
 	"encoding/json"
+	"math"
 	"net/http"
 	"strconv"
 
@@ -14,7 +15,7 @@ import (
 func WriteData(w http.ResponseWriter, status int, data any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(map[string]any{"data": data})
+	_ = json.NewEncoder(w).Encode(map[string]any{"data": data})
 }
 
 func WriteErr(w http.ResponseWriter, status int, code, msg string) {
@@ -28,7 +29,7 @@ func WriteErrDetails(w http.ResponseWriter, status int, code, msg string, detail
 	if details != nil {
 		e["details"] = details
 	}
-	json.NewEncoder(w).Encode(map[string]any{"error": e})
+	_ = json.NewEncoder(w).Encode(map[string]any{"error": e})
 }
 
 // Decode reads a JSON body with a 1 MiB cap — enough for any current route.
@@ -56,10 +57,28 @@ func OptUUID(w http.ResponseWriter, raw string) (uuid.UUID, bool) {
 func WritePage(w http.ResponseWriter, status int, data any, page, perPage int, total int64) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(map[string]any{
+	_ = json.NewEncoder(w).Encode(map[string]any{
 		"data": data,
 		"meta": map[string]any{"page": page, "per_page": perPage, "total": total},
 	})
+}
+
+// maxPage keeps (page-1)*per_page inside int32 at every call site —
+// handlers pass the offset as int32 to sqlc, so an absurd ?page= must
+// clamp before it can wrap negative.
+const maxPage = 1_000_000
+
+// I32 clamps an int64 into int32 range — for bounded page/count values
+// the clamp is unreachable; for adversarial input it degrades to the
+// largest sane offset instead of silently wrapping negative.
+func I32(n int64) int32 {
+	if n > math.MaxInt32 {
+		return math.MaxInt32
+	}
+	if n < math.MinInt32 {
+		return math.MinInt32
+	}
+	return int32(n)
 }
 
 // PageParams parses ?page= & ?per_page= with defaults (page≥1, per_page
@@ -68,6 +87,9 @@ func PageParams(r *http.Request) (int, int) {
 	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
 	if page < 1 {
 		page = 1
+	}
+	if page > maxPage {
+		page = maxPage
 	}
 	per, _ := strconv.Atoi(r.URL.Query().Get("per_page"))
 	if per < 1 {

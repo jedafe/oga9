@@ -97,7 +97,7 @@ func (s *Service) withTx(ctx context.Context, fn func(*db.Queries) error) error 
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 	if err := fn(s.q.WithTx(tx)); err != nil {
 		return err
 	}
@@ -1106,7 +1106,7 @@ func (s *Service) DisburseDrive(ctx context.Context, oc *tenant.OrgCtx, did uuid
 // overdue (per-org org.finance.grace_days via the query), recomputes
 // dues_standing for affected members, and flags defaulters for comms.
 func (s *Service) OverdueSweep(ctx context.Context, graceDays int) (int, error) {
-	rows, err := s.q.MarkObligationsOverdue(ctx, int32(graceDays))
+	rows, err := s.q.MarkObligationsOverdue(ctx, int32(graceDays)) // #nosec G115 -- bounded value; cannot overflow int32
 	if err != nil {
 		return 0, err
 	}

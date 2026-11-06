@@ -45,6 +45,33 @@ func (s *Service) PreviewURL(d db.Documents) string {
 	return ""
 }
 
+// uploadBodyHardCap bounds multipart request bodies when neither the
+// plan entitlement nor the env fallback sets a storage limit — without
+// it ParseMultipartForm spills an unbounded body to tmpfs/disk.
+const uploadBodyHardCap = 512 << 20 // 512 MiB
+
+// UploadMaxBytes resolves the HTTP-layer body ceiling for uploads: the
+// tenant's limit.storage.mb entitlement (or env fallback) plus 1 MiB of
+// multipart form overhead. Uncapped installs get the hard ceiling.
+// Handlers wrap r.Body in http.MaxBytesReader with this value so the
+// request is rejected before the blob cap even runs.
+func (s *Service) UploadMaxBytes(ctx context.Context, tenantID uuid.UUID) int64 {
+	mb := int64(0)
+	if s.limitFn != nil {
+		mb = s.limitFn(ctx, tenantID, "limit.storage.mb")
+	}
+	if mb <= 0 {
+		mb = s.fallbackMB
+	}
+	if mb <= 0 {
+		return uploadBodyHardCap
+	}
+	if mb > 1<<30 {
+		mb = 1 << 30 // absurd entitlements can't overflow the <<20 shift
+	}
+	return (mb << 20) + (1 << 20)
+}
+
 // putCapped writes the blob enforcing limit.storage.mb (Rule 25) — the
 // env fallback (OGA9_UPLOAD_MAX_MB) covers dev/new plans; neither is
 // hardcoded. Streams at most cap+1 so an over-cap file can't grow the disk.
@@ -58,6 +85,9 @@ func (s *Service) putCapped(ctx context.Context, tenantID uuid.UUID, key string,
 	}
 	if mb <= 0 {
 		return s.store.Put(ctx, key, r)
+	}
+	if mb > 1<<30 {
+		mb = 1 << 30
 	}
 	max := mb << 20
 	if err := s.store.Put(ctx, key, io.LimitReader(r, max+1)); err != nil {
@@ -318,7 +348,7 @@ func (s *Service) ProcessUpload(ctx context.Context, docID uuid.UUID) error {
 	if err != nil {
 		return err
 	}
-	defer rc.Close()
+	defer func() { _ = rc.Close() }()
 	head := make([]byte, 512)
 	n, _ := rc.Read(head)
 	if !executable(head[:n], http.DetectContentType(head[:n])) {

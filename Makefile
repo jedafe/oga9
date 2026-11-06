@@ -27,6 +27,7 @@ build:
 lint:
 	test -z "$$(gofmt -l cmd internal)"
 	go vet ./...
+	gosec -quiet -exclude-generated ./...
 
 # §09/§14.01 release bundle — versioned image + self-host package with
 # pinned manifest and the migration set it upgrades through. Usage:

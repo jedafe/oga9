@@ -94,7 +94,7 @@ func TestProvisionReplay(t *testing.T) {
 	svc.SetOrgBootstrap(func(_ context.Context, _ uuid.UUID, _, _, _, _, _, _, _ string, tid uuid.UUID) (uuid.UUID, error) {
 		boot++
 		var orgID uuid.UUID
-		pool.QueryRow(context.Background(),
+		_ = pool.QueryRow(context.Background(),
 			"INSERT INTO organizations (id, tenant_id, name, slug, org_type) VALUES ($1,$2,$3,$4,'association') RETURNING id",
 			uuid.New(), tid, "Boot", "b-"+uuid.NewString()[:8]).Scan(&orgID)
 		return orgID, nil
@@ -111,7 +111,7 @@ func TestProvisionReplay(t *testing.T) {
 		t.Fatalf("bootstrap ran %d times — replay must not re-run", boot)
 	}
 	var n int
-	pool.QueryRow(ctx, "SELECT count(*) FROM tenant_provisions WHERE request_id=$1", req.RequestID).Scan(&n)
+	_ = pool.QueryRow(ctx, "SELECT count(*) FROM tenant_provisions WHERE request_id=$1", req.RequestID).Scan(&n)
 	if n != 1 {
 		t.Fatalf("%d provision rows for one request_id", n)
 	}
@@ -136,7 +136,7 @@ func TestProvisionResumeAfterFailure(t *testing.T) {
 			return uuid.Nil, errors.New("boom")
 		}
 		var orgID uuid.UUID
-		pool.QueryRow(context.Background(),
+		_ = pool.QueryRow(context.Background(),
 			"INSERT INTO organizations (id, tenant_id, name, slug, org_type) VALUES ($1,$2,$3,$4,'association') RETURNING id",
 			uuid.New(), tid, "Boot", "b-"+uuid.NewString()[:8]).Scan(&orgID)
 		return orgID, nil
@@ -154,7 +154,7 @@ func TestProvisionResumeAfterFailure(t *testing.T) {
 		t.Fatalf("resume must reuse tenant: %v %v", tid1, tid2)
 	}
 	var tenants int
-	pool.QueryRow(ctx, "SELECT count(*) FROM tenants WHERE slug=$1", slug).Scan(&tenants)
+	_ = pool.QueryRow(ctx, "SELECT count(*) FROM tenants WHERE slug=$1", slug).Scan(&tenants)
 	if tenants != 1 {
 		t.Fatalf("%d tenants for one provision — retry duplicated", tenants)
 	}
@@ -221,7 +221,7 @@ func TestSuspendIdempotent(t *testing.T) {
 		}
 	}
 	var n int
-	pool.QueryRow(ctx, "SELECT count(*) FROM audit_events WHERE action='tenant.suspend' AND tenant_id=$1", tid).Scan(&n)
+	_ = pool.QueryRow(ctx, "SELECT count(*) FROM audit_events WHERE action='tenant.suspend' AND tenant_id=$1", tid).Scan(&n)
 	if n != 1 {
 		t.Fatalf("repeat suspend wrote %d audit rows", n)
 	}
